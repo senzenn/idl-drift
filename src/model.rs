@@ -1,29 +1,8 @@
-//! IDL data model — flat semantic view used by the diff engine.
+//! The flat IDL model that both tools work on.
 //!
-//! **On-disk input is Codama-first.** Yellowstone Shipstern's `include_shipstern_parser!`
-//! deserializes a Codama `RootNode` (`kind: "rootNode"`, `standard: "codama"`)
-//! via `codama-nodes`. [`Idl::from_json`] detects that shape, runs the same
-//! string-error-code coercion Shipstern does, and normalizes into this flat model
-//! (see [`crate::codama_convert`]).
-//!
-//! Codama → flat field map (the shapes that differ from Anchor/Solana IDL spec):
-//! | Codama | Flat `Idl` |
-//! |---|---|
-//! | `program.publicKey` | `address` |
-//! | `program.name` / `program.version` | `metadata.{name,version}` |
-//! | `program.definedTypes` | `types` |
-//! | `program.events[]` (`eventNode`) | `events[]` (`Event`) |
-//! | `instruction.arguments` | `instruction.args` |
-//! | `isWritable` / `isSigner` / `isOptional` | `writable` / `signer` / `optional` |
-//! | `numberTypeNode{format}` etc. | `Type::{U64,Pubkey,…}` |
-//! | disc nodes + `bytesValueNode` | `discriminator: Vec<u8>` |
-//!
-//! Anchor / Solana IDL-spec JSON (test fixtures, `anchor idl fetch`) still
-//! deserializes directly into these structs.
-//!
-//! The key property: every optional/default field uses `#[serde(default)]`
-//! and the structs derive `PartialEq`. So an IDL that omits `writable: false`
-//! and one that writes it explicitly deserialize to *identical* values.
+//! [`Idl::from_json`] reads Anchor JSON (0.30 spec and legacy) and Codama `rootNode` JSON
+//! into the same structs. Every optional field defaults, so an IDL that omits
+//! `writable: false` and one that spells it out compare equal.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -38,15 +17,28 @@ pub struct Idl {
     pub instructions: Vec<Instruction>,
     #[serde(default)]
     pub accounts: Vec<NamedDisc>,
-    /// Top-level event list (Codama: `program.events`). Each entry carries a
-    /// content discriminator plus an optional self-CPI envelope (Shipstern's
-    /// `cpi_event_discriminator` / `cpi_event_payload_offset`).
+    /// Events, each with a content discriminator and an optional self-CPI envelope.
     #[serde(default)]
     pub events: Vec<Event>,
     #[serde(default)]
     pub errors: Vec<ErrorCode>,
     #[serde(default)]
     pub types: Vec<TypeDef>,
+    /// The file format this came from, which sets the naming convention.
+    #[serde(skip)]
+    pub format: Format,
+}
+
+/// Where an IDL came from. Each names things its own way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Format {
+    /// Anchor 0.30 spec: `snake_case` instructions and fields, `PascalCase` types.
+    #[default]
+    Anchor,
+    /// Pre-0.30 Anchor: `camelCase` instructions and fields, `PascalCase` types.
+    LegacyAnchor,
+    /// Codama: `camelCase` everything.
+    Codama,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -60,21 +52,20 @@ pub struct Metadata {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Instruction {
     pub name: String,
-    /// Discriminator bytes. Optional because native / SPL-style programs
-    /// dispatch by a 1-byte tag or by data length and may omit it entirely
-    /// (as Agave's own `transaction-status` parsers and the SPL token parser
-    /// do). Anchor uses 8 bytes; Quasar uses 1. Empty means "no explicit
-    /// discriminator — dispatch is by convention."
+    /// Anchor uses 8 bytes, Quasar 1. Empty for native programs that dispatch by tag or
+    /// data length.
     #[serde(default)]
     pub discriminator: Discriminator,
+    /// Where the discriminator starts in the data (Codama only; Anchor's is at 0).
+    #[serde(default)]
+    pub discriminator_offset: usize,
     #[serde(default)]
     pub accounts: Vec<AccountItem>,
     #[serde(default)]
     pub args: Vec<Field>,
 }
 
-/// Accounts can be a single account or a nested composite group (untagged:
-/// distinguished by the presence of an `accounts` array).
+/// A single account, or a composite group (told apart by its `accounts` array).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum AccountItem {
@@ -94,44 +85,43 @@ pub struct Account {
     pub signer: bool,
     #[serde(default)]
     pub optional: bool,
+    /// Fixed address (a program or sysvar). Not part of the positional diff.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
-/// Account types: a name + a discriminator.
-/// The discriminator is optional (native/SPL account types may lack one and
-/// be distinguished by data length, as Agave's SPL parser does via
-/// `SplMint::LEN` / `SplAccount::LEN`).
+/// An account type. Native programs may give no discriminator and tell types apart by size.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct NamedDisc {
     pub name: String,
     #[serde(default)]
     pub discriminator: Discriminator,
+    /// Where the discriminator starts in the data (Codama only; Anchor's is at 0).
+    #[serde(default)]
+    pub discriminator_offset: usize,
+    /// Declared account size in bytes, discriminator included (Codama `size`).
+    #[serde(default)]
+    pub size: Option<usize>,
 }
 
-/// A program event. Content discriminator identifies the event payload; the
-/// optional envelope models Shipstern's self-CPI wrap (Anchor's 8-byte event-ix
-/// tag vs Pinocchio's 1-byte custom envelope). Empty envelope fields mean
-/// "not specified in the IDL" and are skipped by the envelope diff rule.
+/// A program event. The envelope is the self-CPI wrap around the payload: Anchor's 8-byte
+/// event tag or Pinocchio's 1-byte one. Empty envelope fields mean the IDL doesn't say.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Event {
     pub name: String,
-    /// Event content discriminator (e.g. Anchor event sighash).
+    /// Content discriminator, such as Anchor's event sighash.
     #[serde(default)]
     pub discriminator: Discriminator,
-    /// Self-CPI instruction envelope discriminator bytes
-    /// (`cpi_event_discriminator`). Anchor default is 8 bytes; Pinocchio
-    /// programs often use 1. Empty = unspecified.
+    /// Shipstern's `cpi_event_discriminator`.
     #[serde(default)]
     pub envelope_discriminator: Discriminator,
-    /// Byte offset where event payload decoding starts
-    /// (`cpi_event_payload_offset`). `None` = unspecified (Shipstern defaults it
-    /// to `envelope_discriminator.len()` when the envelope is set).
+    /// Shipstern's `cpi_event_payload_offset`: where payload decoding starts.
     #[serde(default)]
     pub envelope_payload_offset: Option<usize>,
 }
 
 impl Event {
-    /// Effective payload offset: explicit value, else envelope length when
-    /// an envelope is present.
+    /// The explicit payload offset, else the envelope length when there is an envelope.
     #[must_use]
     pub fn effective_payload_offset(&self) -> Option<usize> {
         self.envelope_payload_offset
@@ -160,12 +150,85 @@ pub struct TypeDef {
     pub name: String,
     #[serde(default = "default_serialization")]
     pub serialization: String,
+    /// Memory representation, which sets the layout of zero-copy types.
+    #[serde(default)]
+    pub repr: Option<Repr>,
+    #[serde(default)]
+    pub generics: Vec<GenericParam>,
     #[serde(rename = "type")]
     pub ty: TypeDefTy,
 }
 
 fn default_serialization() -> String {
     "borsh".to_string()
+}
+
+impl TypeDef {
+    /// `true` for Anchor `zero_copy` types, which are cast from account bytes instead of
+    /// Borsh-decoded.
+    #[must_use]
+    pub fn is_zero_copy(&self) -> bool {
+        matches!(self.serialization.as_str(), "bytemuck" | "bytemuckunsafe")
+    }
+}
+
+/// `#[repr]` of a type, as the Solana IDL spec records it.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub struct Repr {
+    pub kind: ReprKind,
+    #[serde(default)]
+    pub packed: bool,
+    #[serde(default)]
+    pub align: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReprKind {
+    Rust,
+    C,
+    Transparent,
+}
+
+impl std::fmt::Display for Repr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            ReprKind::Rust => "Rust",
+            ReprKind::C => "C",
+            ReprKind::Transparent => "transparent",
+        };
+        write!(f, "repr({kind}")?;
+        if self.packed {
+            f.write_str(", packed")?;
+        }
+        if let Some(n) = self.align {
+            write!(f, ", align({n})")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// A generic parameter declared on a type definition.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum GenericParam {
+    Type {
+        name: String,
+    },
+    Const {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+    },
+}
+
+impl GenericParam {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Type { name } | Self::Const { name, .. } => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -178,6 +241,9 @@ pub enum TypeDefTy {
     Enum {
         #[serde(default)]
         variants: Vec<EnumVariant>,
+        /// Integer type of the variant tag (Codama `size`); Borsh's `u8` when absent.
+        #[serde(default)]
+        tag: Option<Type>,
     },
     /// A type alias, e.g. `{ "kind": "type", "alias": "u64" }`.
     Type { alias: Type },
@@ -190,13 +256,22 @@ pub struct EnumVariant {
     /// (`[{"name":"x","type":"u64"}]`) or tuple fields (`["u64"]`).
     #[serde(default)]
     pub fields: EnumFields,
+    /// Explicit tag value (Codama); the variant's index when absent.
+    #[serde(default)]
+    pub discriminator: Option<u32>,
 }
 
-/// Enum variant field list — named (struct-like) or tuple.
-///
-/// `Tuple` is tried first: Anchor emits bare type strings (`["u64"]`,
-/// `["bool"]`) for tuple variants, and serde's untagged recovery after a
-/// failed `Vec<Field>` element is unreliable.
+impl EnumVariant {
+    /// The tag value that selects this variant, at position `index` in the list.
+    #[must_use]
+    pub fn tag(&self, index: usize) -> u64 {
+        self.discriminator
+            .map_or_else(|| u64::try_from(index).unwrap_or(u64::MAX), u64::from)
+    }
+}
+
+/// Named or tuple variant fields. `Tuple` comes first because serde's untagged fallback
+/// after a half-parsed `Vec<Field>` is unreliable.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum EnumFields {
@@ -210,8 +285,7 @@ impl Default for EnumFields {
     }
 }
 
-/// The IDL type system. `Defined` references a name in the top-level `types[]`,
-/// which is what forces transitive resolution during diffing.
+/// An IDL type. `Defined` names an entry in `types`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Type {
@@ -226,24 +300,27 @@ pub enum Type {
     I64,
     U128,
     I128,
+    U256,
+    I256,
+    F32,
+    F64,
     Bytes,
     String,
     Pubkey,
     Option(Box<Type>),
+    /// Solana `COption`: a `u32` tag, then the value, which is present even when the tag is 0.
+    #[serde(rename = "coption")]
+    COption(Box<Type>),
     Vec(Box<Type>),
     Array(Box<Type>, ArrayLen),
-    /// Borsh `HashMap` / `BTreeMap`: `u32` len + `(key, value)*`. Key and value
-    /// types are part of the layout — changing either is a byte-level break.
+    /// Borsh map: a `u32` length, then key and value pairs.
     Map(Box<Type>, Box<Type>),
-    /// Borsh set: `u32` len + `item*`. Element type is layout-bearing.
+    /// Borsh set: a `u32` length, then the items.
     Set(Box<Type>),
-    /// Product type: elements serialized in order with no length prefix.
-    /// Element types and order participate in equality.
+    /// Elements in order, with no length prefix.
     Tuple(Vec<Type>),
-    /// Reference to a user-defined type in `types[]`. Carries generic
-    /// arguments: `Wrapper<u64>` and `Wrapper<u32>` are DIFFERENT types with
-    /// different Borsh layouts, so `generics` must participate in equality —
-    /// dropping it (Blocker #14) silently misses breaking generic-arg changes.
+    /// A type from `types`. The generic arguments are part of the identity:
+    /// `Wrapper<u64>` and `Wrapper<u32>` have different layouts.
     Defined {
         name: String,
         #[serde(default)]
@@ -252,8 +329,7 @@ pub enum Type {
     Generic(String),
 }
 
-/// A generic argument supplied when instantiating a `Defined` type.
-/// Mirrors `IdlGenericArg` from the Solana IDL spec.
+/// A generic argument to a `Defined` type.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum GenericArg {
@@ -267,19 +343,35 @@ pub enum GenericArg {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(untagged)]
+#[serde(from = "ArrayLenJson")]
 pub enum ArrayLen {
     Value(usize),
+    /// Name of a const generic parameter.
     Generic(String),
 }
 
+/// The spec writes a generic length as `{"generic": "N"}`; accept a bare name too.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ArrayLenJson {
+    Value(usize),
+    Generic { generic: String },
+    Name(String),
+}
+
+impl From<ArrayLenJson> for ArrayLen {
+    fn from(len: ArrayLenJson) -> Self {
+        match len {
+            ArrayLenJson::Value(n) => Self::Value(n),
+            ArrayLenJson::Generic { generic: name } | ArrayLenJson::Name(name) => {
+                Self::Generic(name)
+            }
+        }
+    }
+}
+
 impl Idl {
-    /// Parse an IDL from JSON text.
-    ///
-    /// Accepts:
-    /// - **Codama** `RootNode` JSON (`kind: "rootNode"`) — the shape Shipstern loads
-    /// - **Anchor / Solana IDL-spec** JSON — used by unit-test fixtures and
-    ///   `anchor idl fetch` (including legacy Anchor 0.x shapes)
+    /// Parse Codama `rootNode` JSON, or Anchor JSON in the 0.30 spec or a legacy shape.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let mut value: serde_json::Value = serde_json::from_str(s)?;
         if value.get("kind").and_then(|k| k.as_str()) == Some("rootNode") {
@@ -287,30 +379,138 @@ impl Idl {
             let root: codama_nodes::RootNode = serde_json::from_value(value)?;
             Ok(crate::codama_convert::from_codama(root))
         } else {
-            normalize_legacy_anchor(&mut value);
-            serde_json::from_value(value)
+            let legacy = normalize_legacy_anchor(&mut value);
+            let mut idl: Self = serde_json::from_value(value)?;
+            if legacy {
+                idl.format = Format::LegacyAnchor;
+            }
+            Ok(idl)
         }
     }
 
-    /// Index the top-level `types[]` by name for transitive `Defined` lookups.
+    /// A copy with every name in `camelCase`, as Codama writes them, so IDLs from different
+    /// formats can be compared name for name.
+    #[must_use]
+    pub fn with_camel_case_names(&self) -> Self {
+        let mut idl = self.clone();
+        for ix in &mut idl.instructions {
+            ix.name = camel(&ix.name);
+            camel_accounts(&mut ix.accounts);
+            ix.args.iter_mut().for_each(camel_field);
+        }
+        for account in &mut idl.accounts {
+            account.name = camel(&account.name);
+        }
+        for event in &mut idl.events {
+            event.name = camel(&event.name);
+        }
+        for td in &mut idl.types {
+            td.name = camel(&td.name);
+            match &mut td.ty {
+                TypeDefTy::Struct { fields } => fields.iter_mut().for_each(camel_field),
+                TypeDefTy::Enum { variants, .. } => {
+                    for variant in variants {
+                        variant.name = camel(&variant.name);
+                        match &mut variant.fields {
+                            EnumFields::Named(fields) => fields.iter_mut().for_each(camel_field),
+                            EnumFields::Tuple(items) => items.iter_mut().for_each(camel_type),
+                        }
+                    }
+                }
+                TypeDefTy::Type { alias } => camel_type(alias),
+            }
+        }
+        idl
+    }
+
+    /// `types`, indexed by name.
     #[must_use]
     pub fn type_map(&self) -> BTreeMap<String, &TypeDef> {
         self.types.iter().map(|t| (t.name.clone(), t)).collect()
     }
 }
 
-/// Coerce legacy Anchor IDL JSON (`anchor idl fetch` on older programs) into
-/// the Solana IDL-spec shape our structs deserialize.
-///
-/// Handles: top-level `name`/`version` → `metadata`; missing `address`;
-/// `publicKey` → `pubkey`; `isMut`/`isSigner` → `writable`/`signer`;
-/// account/event inline `type`/`fields` promoted into `types[]`.
-fn normalize_legacy_anchor(value: &mut serde_json::Value) {
+/// Rewrite pre-0.30 Anchor JSON into the 0.30 spec shape: `name` and `version` into
+/// `metadata`, old key names, and inline account and event types moved into `types`.
+/// Codama's `camelCase`, which differs from heck on acronyms (`AMMConfig` is `aMMConfig`).
+fn camel(name: &str) -> String {
+    let mut spaced = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_uppercase() {
+            spaced.push(' ');
+        }
+        spaced.push(c);
+    }
+    let mut out = String::with_capacity(name.len());
+    for word in spaced
+        .split(|c: char| matches!(c, '-' | '_' | '+' | '.') || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+    {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    let mut chars = out.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
+}
+
+fn camel_field(field: &mut Field) {
+    field.name = camel(&field.name);
+    camel_type(&mut field.ty);
+}
+
+fn camel_type(ty: &mut Type) {
+    match ty {
+        Type::Defined { name, generics } => {
+            *name = camel(name);
+            for arg in generics {
+                if let GenericArg::Type { ty } = arg {
+                    camel_type(ty);
+                }
+            }
+        }
+        Type::Option(inner)
+        | Type::COption(inner)
+        | Type::Vec(inner)
+        | Type::Array(inner, _)
+        | Type::Set(inner) => camel_type(inner),
+        Type::Map(key, value) => {
+            camel_type(key);
+            camel_type(value);
+        }
+        Type::Tuple(items) => items.iter_mut().for_each(camel_type),
+        _ => {}
+    }
+}
+
+fn camel_accounts(items: &mut [AccountItem]) {
+    for item in items {
+        match item {
+            AccountItem::Single(account) => account.name = camel(&account.name),
+            AccountItem::Composite { name, accounts } => {
+                *name = camel(name);
+                camel_accounts(accounts);
+            }
+        }
+    }
+}
+
+/// Returns whether the IDL was in the legacy shape.
+fn normalize_legacy_anchor(value: &mut serde_json::Value) -> bool {
     let Some(obj) = value.as_object_mut() else {
-        return;
+        return false;
     };
 
-    if !obj.contains_key("metadata") && (obj.contains_key("name") || obj.contains_key("version")) {
+    // 0.30 IDLs keep `name` in `metadata`; legacy ones put it at the top, and may have a
+    // `metadata` holding only the address.
+    let has_top_level_name = obj.contains_key("name") || obj.contains_key("version");
+    let metadata_has_name = obj.get("metadata").and_then(|m| m.get("name")).is_some();
+    let legacy = has_top_level_name && !metadata_has_name;
+    if legacy {
         let name = obj
             .get("name")
             .and_then(|v| v.as_str())
@@ -321,6 +521,11 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("0.0.0")
             .to_string();
+        let address = obj
+            .get("metadata")
+            .and_then(|m| m.get("address"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(String::new()));
         obj.insert(
             "metadata".into(),
             serde_json::json!({
@@ -329,10 +534,8 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) {
                 "spec": "legacy-anchor",
             }),
         );
-        // Legacy Anchor IDL often omits address; allow empty so fetch+stamp works.
-        if !obj.contains_key("address") {
-            obj.insert("address".into(), serde_json::Value::String(String::new()));
-        }
+        obj.entry("address".to_string()).or_insert(address);
+        add_legacy_discriminators(obj);
     }
 
     let mut extra_types: Vec<serde_json::Value> = Vec::new();
@@ -369,7 +572,7 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("UnknownEvent")
                     .to_string();
-                // Drop Anchor event field metadata (`index`) — not part of layout.
+                // `index` marks indexed event fields; it is not layout.
                 let clean_fields: Vec<serde_json::Value> = fields
                     .as_array()
                     .map(|arr| {
@@ -405,10 +608,53 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) {
 
     rewrite_legacy_keys(value);
     normalize_tuple_struct_fields(value);
+    legacy
 }
 
-/// Anchor sometimes emits newtype/tuple structs as `"fields": ["bool"]`
-/// (bare type strings). Our model expects named `Field`s — invent `_0`, `_1`, …
+/// Fill in the discriminators legacy IDLs leave out, the way Anchor derives them: the first
+/// 8 bytes of `sha256("global:<snake_case name>")`, `"account:<Name>"` or `"event:<Name>"`.
+fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    use heck::ToSnakeCase;
+    use sha2::{Digest, Sha256};
+
+    for (list, namespace) in [
+        ("instructions", "global"),
+        ("accounts", "account"),
+        ("events", "event"),
+    ] {
+        let Some(items) = obj.get_mut(list).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for item in items {
+            let Some(map) = item.as_object_mut() else {
+                continue;
+            };
+            let present = map
+                .get("discriminator")
+                .and_then(|d| d.as_array())
+                .is_some_and(|d| !d.is_empty());
+            let Some(name) = map.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            if present {
+                continue;
+            }
+            // Legacy IDLs camelCase instruction names; the hash uses the Rust fn name.
+            let name = if namespace == "global" {
+                name.to_snake_case()
+            } else {
+                name.to_string()
+            };
+            let hash = Sha256::digest(format!("{namespace}:{name}").as_bytes());
+            map.insert(
+                "discriminator".to_string(),
+                serde_json::json!(hash.get(..8).unwrap_or_default()),
+            );
+        }
+    }
+}
+
+/// Anchor writes tuple struct fields as bare types (`["bool"]`); name them `_0`, `_1`, ...
 fn normalize_tuple_struct_fields(value: &mut serde_json::Value) {
     let Some(types) = value.get_mut("types").and_then(|t| t.as_array_mut()) else {
         return;
@@ -447,14 +693,16 @@ fn normalize_tuple_struct_fields(value: &mut serde_json::Value) {
 fn rewrite_legacy_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            // Account flags (instruction accounts).
             if let Some(v) = map.remove("isMut") {
                 map.entry("writable".to_string()).or_insert(v);
             }
             if let Some(v) = map.remove("isSigner") {
                 map.entry("signer".to_string()).or_insert(v);
             }
-            // Old Anchor shorthand: `{"defined": "Foo"}` → `{"defined":{"name":"Foo"}}`.
+            if let Some(v) = map.remove("isOptional") {
+                map.entry("optional".to_string()).or_insert(v);
+            }
+            // Old shorthand: `{"defined": "Foo"}` for `{"defined": {"name": "Foo"}}`.
             if let Some(serde_json::Value::String(name)) = map.get("defined").cloned() {
                 map.insert(
                     "defined".into(),

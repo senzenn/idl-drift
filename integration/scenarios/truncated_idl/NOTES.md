@@ -1,10 +1,6 @@
 # truncated_idl
 
-## Real-world situation
-A cron job or hand-copy can truncate JSON mid-file (network blip, partial write).
-The tool must fail closed with a parse error — never panic — so CI can treat
-exit 2 as “retry / bad artifact”, distinct from Breaking (exit 1).
+A partial write or a bad copy can cut a JSON file short. The tool must fail with a parse
+error rather than panic, so CI can tell a bad file (exit 2) from a Breaking change (exit 1).
 
-## Expected
-- Exit code: **2** (I/O or parse error on stderr: `error: …`)
-- No panic
+Expected: exit 2, with `error: parse ...` on stderr.

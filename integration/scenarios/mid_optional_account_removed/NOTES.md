@@ -1,13 +1,7 @@
 # mid_optional_account_removed
 
-## Real-world situation
-An optional account (`referral`) sits in the **middle** of the account metas,
-not at the tail. Removing it shifts every later fixed position — callers that
-indexed by position (and Shipstern’s flattened account list) mis-bind remaining
-accounts. Contrast: removing a **tail** optional is only Dangerous (required
-prefix unchanged).
+The optional `referral` account sits in the middle of the list. Removing it moves every
+later account up one position, so a parser that reads accounts by index binds them wrong.
+Removing an optional account from the tail would only be Dangerous.
 
-## Expected
-- Classification: **Breaking** (`account removed` / positions shift, and/or
-  subsequent `account changed at fixed position`)
-- Exit code: **1**
+Expected: Breaking (accounts changed at fixed positions, account removed), exit 1.

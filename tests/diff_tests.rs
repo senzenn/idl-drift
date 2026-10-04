@@ -1,14 +1,12 @@
-//! Integration tests — assert the Rust engine's verdict matches the awk oracle
-//! (proto/*.facts, 13/13 green) on equivalent JSON fixtures.
-//!
-//! Run: `cargo test`
-//!
-//! Each test builds two IDLs inline and checks (a) whether a breaking change is
-//! present (the CI contract) and (b) the highest severity reported.
+//! One test per diff rule: build two IDLs, diff them, check the highest severity and,
+//! where it matters, the message.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use idl_drift::codama_convert::decode_encoded_bytes;
 use idl_drift::model::{
-    Account, AccountItem, Event, Field, Instruction, Metadata, NamedDisc, Type, TypeDef, TypeDefTy,
+    Account, AccountItem, ArrayLen, Event, Field, Format, Instruction, Metadata, NamedDisc, Type,
+    TypeDef, TypeDefTy,
 };
 use idl_drift::{diff, model::Idl, Severity};
 
@@ -47,7 +45,7 @@ const AMM_NEW: &str = r#"{
 
 #[test]
 fn amm_pool_field_width_is_breaking() {
-    // Pool.feeBps u16->u32 on a reachable account type => breaking (oracle: amm exit=1)
+    // Pool.feeBps u16 to u32 on a reachable account type.
     let r = diff(&parse(AMM_OLD), &parse(AMM_NEW));
     assert!(r.has_breaking(), "expected breaking; got {:?}", r.changes);
     assert_eq!(r.exit_code(), 1);
@@ -66,7 +64,6 @@ const DEAD_NEW: &str = r#"{
 
 #[test]
 fn unreachable_type_change_is_not_breaking() {
-    // oracle: dead exit=0
     let r = diff(&parse(DEAD_OLD), &parse(DEAD_NEW));
     assert!(
         !r.has_breaking(),
@@ -94,7 +91,6 @@ const ENUM_INSERT: &str = r#"{
 
 #[test]
 fn enum_append_is_dangerous_not_breaking() {
-    // oracle: enumappend exit=0
     let r = diff(&parse(ENUM_OLD), &parse(ENUM_APPEND));
     assert!(
         !r.has_breaking(),
@@ -106,7 +102,7 @@ fn enum_append_is_dangerous_not_breaking() {
 
 #[test]
 fn enum_middle_insert_is_breaking() {
-    // oracle: enum exit=1 (Slow shifts tag 1->2)
+    // Inserting before Slow moves its tag from 1 to 2.
     let r = diff(&parse(ENUM_OLD), &parse(ENUM_INSERT));
     assert!(
         r.has_breaking(),
@@ -128,20 +124,45 @@ const SER_NEW: &str = r#"{
   "types":[{"name":"Vault","serialization":"bytemuck","type":{"kind":"struct","fields":[{"name":"bal","type":"u64"}]}}]
 }"#;
 
+// A single u64 has no padding, so Borsh and repr(C) write the same bytes.
 #[test]
-fn serialization_mode_change_is_breaking() {
-    // oracle: serial exit=1
-    let r = diff(&parse(SER_OLD), &parse(SER_NEW));
-    assert!(
-        r.has_breaking(),
-        "borsh->bytemuck must be breaking; got {:?}",
-        r.changes
+fn serialization_change_without_padding_is_cosmetic() {
+    assert_eq!(max_sev(SER_OLD, SER_NEW), Some(Severity::Cosmetic));
+}
+
+#[test]
+fn serialization_change_with_padding_is_breaking() {
+    // u8 then u64: repr(C) puts 7 bytes of padding before `bal`.
+    let with_flag = |s: &str| {
+        s.replace(
+            r#"[{"name":"bal""#,
+            r#"[{"name":"flag","type":"u8"},{"name":"bal""#,
+        )
+    };
+    let report = diff(&parse(&with_flag(SER_OLD)), &parse(&with_flag(SER_NEW)));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["serialization changed (Vault): borsh -> bytemuck: moves `Vault.bal` from offset 1 to 8 (zero-copy layout)"]
     );
 }
 
-// Blocker #14: generic type-arg change. Wrapper<u64> -> Wrapper<u32> must be
-// breaking. The old model dropped `generics`, so both sides deserialized equal
-// and this was silently missed.
+#[test]
+fn serialization_change_with_only_trailing_padding_is_dangerous() {
+    // u64 then u8: 7 bytes of padding at the end, every field keeps its offset.
+    let tail = |s: &str| {
+        s.replace(
+            r#""type":"u64"}]"#,
+            r#""type":"u64"},{"name":"flag","type":"u8"}]"#,
+        )
+    };
+    assert_eq!(
+        max_sev(&tail(SER_OLD), &tail(SER_NEW)),
+        Some(Severity::Dangerous)
+    );
+}
+
+// Wrapper<u64> to Wrapper<u32> changes the layout even though the type name is the same.
 const GEN_OLD: &str = r#"{
   "address":"A","metadata":{"name":"g","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"f","discriminator":[1],"accounts":[],
@@ -165,8 +186,7 @@ fn generic_arg_change_is_breaking() {
     );
 }
 
-// Blocker #12: native/SPL-style IDL with no discriminator must deserialize and
-// not false-positive when unchanged.
+// Native programs may give no discriminator; an unchanged one must diff clean.
 const NODISC: &str = r#"{
   "address":"A","metadata":{"name":"n","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"transfer","accounts":[],"args":[{"name":"amount","type":"u64"}]}]
@@ -174,15 +194,13 @@ const NODISC: &str = r#"{
 
 #[test]
 fn missing_discriminator_deserializes_and_is_stable() {
-    let idl = parse(NODISC); // must not panic (Blocker #12)
+    let idl = parse(NODISC);
     let r = diff(&idl, &idl);
     assert!(!r.has_breaking());
     assert_eq!(r.exit_code(), 0);
 }
 
-// Blocker #15: type-alias target change. `Amount = u64` -> `Amount = u32` on a
-// reachable alias is a Borsh-width break. Previously fell through diff_types'
-// `_ => {}` arm and was silently missed.
+// `Amount = u64` to `u32` on a reachable alias changes the width everywhere it is used.
 const ALIAS_OLD: &str = r#"{
   "address":"A","metadata":{"name":"a","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"x","discriminator":[1],"accounts":[],
@@ -206,8 +224,7 @@ fn alias_target_change_is_breaking() {
     );
 }
 
-// Blocker #17: duplicate instruction names make name-keyed matching lossy.
-// The tool must flag the duplication rather than silently drop entries.
+// Instructions match by name, so a duplicate name would hide drift on all but one.
 const DUP: &str = r#"{
   "address":"A","metadata":{"name":"d","version":"1","spec":"0.1.0"},
   "instructions":[
@@ -229,17 +246,13 @@ fn duplicate_instruction_name_is_flagged() {
     );
 }
 
-// KEYSTONE: default-omission normalization. Two IDLs that are semantically
-// identical but differ only in whether default fields are written explicitly
-// MUST diff to zero changes. This is the property serde's `#[serde(default)]`
-// gives us; if it ever regresses, the whole tool floods false positives.
+// Writing default fields out explicitly must change nothing; if this regresses, every
+// diff floods with false positives.
 const OMITTED: &str = r#"{
   "address":"A","metadata":{"name":"o","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"swap","discriminator":[1],
     "accounts":[{"name":"pool","writable":true}]}]
 }"#;
-// Same meaning, but every default written explicitly: writable:false, signer:false,
-// optional:false, empty args:[], empty docs, borsh serialization, etc.
 const EXPLICIT: &str = r#"{
   "address":"A","metadata":{"name":"o","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"swap","discriminator":[1],
@@ -259,8 +272,7 @@ fn default_omission_produces_no_changes() {
     assert_eq!(r.exit_code(), 0);
 }
 
-/// Real Codama `RootNode` JSON (same shape Shipstern's `include_shipstern_parser!` loads).
-/// Self-diff must be empty — proves Codama deserialize + normalize is stable.
+/// A real Codama `RootNode` must diff clean against itself.
 #[test]
 fn codama_order_engine_self_diff_is_empty() {
     let src = include_str!("fixtures/codama_order_engine.json");
@@ -269,12 +281,11 @@ fn codama_order_engine_self_diff_is_empty() {
     assert_eq!(idl.address, "61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH");
     assert_eq!(idl.instructions.len(), 1);
     assert_eq!(idl.instructions[0].name, "fill");
-    // fieldDiscriminator → bytes from omitted discriminator arg
+    // A field discriminator takes its bytes from the omitted arg's default.
     assert_eq!(
         idl.instructions[0].discriminator,
         vec![0xa8, 0x60, 0xb7, 0xa3, 0x5c, 0x0a, 0x28, 0xa0]
     );
-    // discriminator arg itself is omitted from args[]
     assert_eq!(idl.instructions[0].args.len(), 3);
 
     let r = diff(&idl, &idl);
@@ -286,8 +297,7 @@ fn codama_order_engine_self_diff_is_empty() {
     assert_eq!(r.exit_code(), 0);
 }
 
-/// Codama sample with a top-level `program.events` entry — confirms events are
-/// normalized into `Idl.events` with discriminator bytes (Shipstern's separate list).
+/// Codama `program.events` land in `Idl.events` with their discriminator bytes.
 #[test]
 fn codama_events_are_top_level_with_discriminator() {
     let idl = parse(include_str!("fixtures/codama_tiny.json"));
@@ -301,9 +311,8 @@ fn codama_events_are_top_level_with_discriminator() {
     assert!(r.changes.is_empty(), "got {:?}", r.changes);
 }
 
-// Self-CPI event envelope: Anchor uses an 8-byte event-ix tag; Pinocchio often
-// uses a 1-byte custom envelope (Shipstern `cpi_event_discriminator` /
-// `cpi_event_payload_offset`). A length change is a scheme swap → Breaking.
+// Anchor wraps self-CPI events in an 8-byte tag, Pinocchio often in 1 byte; switching
+// moves where the payload starts.
 const EVENT_ENV_8: &str = r#"{
   "address":"A","metadata":{"name":"e","version":"1","spec":"0.1.0"},
   "instructions":[{"name":"noop","discriminator":[1],"accounts":[],"args":[]}],
@@ -345,7 +354,7 @@ fn event_envelope_length_8_to_1_is_breaking() {
     assert_eq!(r.exit_code(), 1);
 }
 
-// --- Discriminator collision detection (Shipstern InstructionParser fan-out) ---
+// --- Discriminator collisions (Shipstern dispatches shared discriminators by account count) ---
 
 fn bare_idl(instructions: Vec<Instruction>) -> Idl {
     Idl {
@@ -360,6 +369,7 @@ fn bare_idl(instructions: Vec<Instruction>) -> Idl {
         events: vec![],
         errors: vec![],
         types: vec![],
+        format: Format::Anchor,
     }
 }
 
@@ -369,6 +379,7 @@ fn acct(name: &str) -> AccountItem {
         writable: false,
         signer: false,
         optional: false,
+        address: None,
     })
 }
 
@@ -378,6 +389,7 @@ fn opt_acct(name: &str) -> AccountItem {
         writable: false,
         signer: false,
         optional: true,
+        address: None,
     })
 }
 
@@ -385,6 +397,7 @@ fn ix(name: &str, disc: Vec<u8>, accounts: Vec<AccountItem>) -> Instruction {
     Instruction {
         name: name.into(),
         discriminator: disc,
+        discriminator_offset: 0,
         accounts,
         args: vec![],
     }
@@ -432,8 +445,8 @@ fn same_disc_different_account_count_is_not_breaking() {
 #[test]
 fn disambiguation_order_change_is_dangerous() {
     let disc = vec![0xaa, 0xbb];
-    // Old counts {2,4}; new {2,3}. Shrink via optional-tail removal so the
-    // positional account rule stays Dangerous (not Breaking).
+    // Counts {2,4} become {2,3} by dropping optional tail accounts, which alone is only
+    // Dangerous.
     let old = bare_idl(vec![
         ix("swap_a", disc.clone(), vec![acct("a"), acct("b")]),
         ix(
@@ -476,8 +489,7 @@ fn same_discriminator_two_encodings_is_no_change() {
     assert_eq!(from_hex, from_b58);
     assert_eq!(from_hex, from_b64);
 
-    // Full Codama path: same account constant disc as base16 vs base58 must
-    // not produce a false-positive "discriminator changed".
+    // The same account discriminator in base16 and base58 must not count as a change.
     let base16_idl = r#"{
       "kind":"rootNode","standard":"codama","version":"1.5.1",
       "program":{
@@ -537,12 +549,14 @@ fn same_discriminator_two_encodings_is_no_change() {
     );
 }
 
-// --- Event-payload reachability (Codama PR #985: events de-dupe definedTypes) ---
+// --- Event payload reachability ---
 
 fn typedef_struct(name: &str, fields: Vec<Field>) -> TypeDef {
     TypeDef {
         name: name.into(),
         serialization: "borsh".into(),
+        repr: None,
+        generics: vec![],
         ty: TypeDefTy::Struct { fields },
     }
 }
@@ -583,14 +597,13 @@ fn idl_with(events: Vec<Event>, types: Vec<TypeDef>) -> Idl {
         events,
         errors: vec![],
         types,
+        format: Format::Anchor,
     }
 }
 
 #[test]
 fn event_only_type_field_change_is_breaking() {
-    // Trade event → Trade payload struct → Defined(TradeDetail). Nothing else
-    // references TradeDetail. Reachability must still pull it in via the event
-    // name root + transitive struct-field closure.
+    // Only the Trade event's payload references TradeDetail; that is enough to reach it.
     let old = idl_with(
         vec![event_named("Trade")],
         vec![
@@ -630,8 +643,7 @@ fn event_only_type_field_change_is_breaking() {
 
 #[test]
 fn truly_dead_type_change_is_cosmetic() {
-    // Trade event payload does NOT reference TradeDetail; nothing else does
-    // either. U16→U32 on TradeDetail must stay Cosmetic.
+    // Nothing references TradeDetail, so widening its field stays Cosmetic.
     let old = idl_with(
         vec![event_named("Trade")],
         vec![
@@ -661,7 +673,7 @@ fn truly_dead_type_change_is_cosmetic() {
     );
 }
 
-// --- Map / Set / Tuple structural layout (Borsh-bearing composites) ---
+// --- Map, set and tuple element types are layout ---
 
 fn idl_account(account: &str, types: Vec<TypeDef>) -> Idl {
     Idl {
@@ -675,10 +687,13 @@ fn idl_account(account: &str, types: Vec<TypeDef>) -> Idl {
         accounts: vec![NamedDisc {
             name: account.into(),
             discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            discriminator_offset: 0,
+            size: None,
         }],
         events: vec![],
         errors: vec![],
         types,
+        format: Format::Anchor,
     }
 }
 
@@ -715,7 +730,7 @@ fn map_value_widen_on_reachable_field_is_breaking() {
             c.severity == Severity::Breaking
                 && (c.message.contains("balances")
                     || c.message.contains("Vault#0")
-                    || c.message.contains("Map:"))
+                    || c.message.contains("Map<"))
         }),
         "expected Breaking mentioning the balances field; got {:?}",
         r.changes
@@ -772,8 +787,7 @@ fn tuple_element_reorder_is_breaking() {
 
 #[test]
 fn map_defined_value_stays_reachable() {
-    // Slot is referenced ONLY as Map value inside reachable Vault — must not
-    // be treated as dead/Cosmetic when its field widens.
+    // Slot is reachable only as a map value inside Vault.
     let old = idl_account(
         "Vault",
         vec![
@@ -833,7 +847,7 @@ fn unchanged_map_set_tuple_is_no_change() {
     );
 }
 
-// --- Real Shipstern Codama: limit_order v1 -> v2 ---
+// --- Real Codama pair: limit_order v1 to v2 ---
 
 fn limit_order_v1() -> Idl {
     parse(include_str!("idls/limit_order_v1.json"))
@@ -856,12 +870,12 @@ fn limit_order_v1_to_v2_is_breaking() {
     );
     assert_eq!(r.exit_code(), 1);
 
-    // Fee account: four u64 fees -> two u16 bps (+ removals).
+    // Fee account: four u64 fees become two u16 bps fields.
     assert!(
         r.changes.iter().any(|c| {
             c.severity == Severity::Breaking
                 && c.message.contains("fee#")
-                && (c.message.contains("u64 -> u16") || c.message.contains("present -> removed"))
+                && c.message.contains("makerFee: u64 -> normalFeeBps: u16")
         }),
         "expected fee account layout Breaking; got {:?}",
         r.changes
@@ -870,7 +884,7 @@ fn limit_order_v1_to_v2_is_breaking() {
             .collect::<Vec<_>>()
     );
 
-    // Bare structTypeNode events (v1) -> hiddenPrefix CPI envelope (v2).
+    // v1 events are bare structs; v2 wraps them in a self-CPI envelope.
     assert!(
         r.changes.iter().any(|c| {
             c.severity == Severity::Breaking && c.message.to_lowercase().contains("envelope")
@@ -919,7 +933,7 @@ fn limit_order_idls_have_no_unexpected_generics() {
         );
     }
 
-    // v2 fillOrder.swapData: sizePrefixTypeNode(bytes, u32) -> Type::Bytes.
+    // A u32-prefixed bytes node maps to Type::Bytes, not Generic.
     let v2 = limit_order_v2();
     let fill = v2
         .instructions
@@ -937,4 +951,464 @@ fn limit_order_idls_have_no_unexpected_generics() {
         "swapData must map to Bytes, not Generic; got {:?}",
         swap.ty
     );
+}
+
+#[test]
+fn codama_0_13_idl_loads() {
+    // `npx codama convert` output; codama-nodes 0.9.1 rejected it (AmountTypeNode `seeds`).
+    let src = std::fs::read_to_string("fixtures/live/voltr_vault/idl.js-codama.json")
+        .expect("read fixture");
+    let idl = parse(&src);
+    let receipt = idl
+        .accounts
+        .iter()
+        .find(|a| a.name == "adaptorAddReceipt")
+        .expect("adaptorAddReceipt account");
+    assert_eq!(receipt.discriminator, [105, 99, 219, 155, 77, 241, 7, 119]);
+    assert!(idl_drift::coverage(&idl).fully_mapped());
+}
+
+const ZC_PACKED: &str = r#"{
+  "address":"A","metadata":{"name":"zc","version":"0.1.0","spec":"0.1.0"},
+  "accounts":[{"name":"Pool","discriminator":[1,1,1,1,1,1,1,1]}],
+  "types":[{"name":"Pool","serialization":"bytemuck","repr":{"kind":"c","packed":true},
+    "type":{"kind":"struct","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u64"}]}}]
+}"#;
+
+#[test]
+fn repr_change_on_reachable_type_is_breaking() {
+    let unpacked = ZC_PACKED.replace(r#","packed":true"#, "");
+    let report = diff(&parse(ZC_PACKED), &parse(&unpacked));
+    assert!(report.has_breaking());
+    assert!(report.changes.iter().any(|c| c.message
+        == "repr changed (Pool): repr(C, packed) -> repr(C): moves `Pool.b` from offset 1 to 8 (zero-copy layout)"));
+}
+
+#[test]
+fn anchor_spec_layout_fields_parse() {
+    use idl_drift::model::{GenericParam, Repr, ReprKind};
+    let idl = parse(
+        r#"{
+  "address":"A","metadata":{"name":"t","version":"0.1.0","spec":"0.1.0"},
+  "instructions":[{"name":"go","discriminator":[1],
+    "accounts":[{"name":"system_program","address":"11111111111111111111111111111111"}],
+    "args":[{"name":"x","type":"f64"},{"name":"y","type":{"coption":"f32"}}]}],
+  "types":[{"name":"Buf","generics":[{"kind":"type","name":"T"},{"kind":"const","name":"N","type":"usize"}],
+    "repr":{"kind":"c","align":8},
+    "type":{"kind":"struct","fields":[{"name":"v","type":{"array":[{"generic":"T"},{"generic":"N"}]}}]}}]
+}"#,
+    );
+    let ix = &idl.instructions[0];
+    let AccountItem::Single(acct) = &ix.accounts[0] else {
+        panic!("expected a single account");
+    };
+    assert_eq!(
+        acct.address.as_deref(),
+        Some("11111111111111111111111111111111")
+    );
+    assert_eq!(ix.args[0].ty, Type::F64);
+    assert_eq!(ix.args[1].ty, Type::COption(Box::new(Type::F32)));
+    let buf = &idl.types[0];
+    assert_eq!(
+        buf.repr,
+        Some(Repr {
+            kind: ReprKind::C,
+            packed: false,
+            align: Some(8)
+        })
+    );
+    assert_eq!(
+        buf.generics[1],
+        GenericParam::Const {
+            name: "N".into(),
+            ty: "usize".into()
+        }
+    );
+}
+
+#[test]
+fn rename_message_names_both_fields() {
+    let renamed = AMM_OLD.replace(r#""name":"feeBps""#, r#""name":"tradeFeeBps""#);
+    let report = diff(&parse(AMM_OLD), &parse(&renamed));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["FIELD changed (Pool#1) via reachable type: feeBps renamed to tradeFeeBps (u16)"]
+    );
+}
+
+/// A Pool account whose `mode` field is the enum `Mode`, with `extra` spliced into `types`.
+fn pool_with_enum(variant_fields: &str, extra: &str) -> String {
+    format!(
+        r#"{{"address":"A","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},
+  "accounts":[{{"name":"Pool","discriminator":[1,1,1,1,1,1,1,1]}}],
+  "types":[{{"name":"Pool","type":{{"kind":"struct","fields":[{{"name":"mode","type":{{"defined":{{"name":"Mode"}}}}}}]}}}},
+    {{"name":"Mode","type":{{"kind":"enum","variants":[{{"name":"Fixed","fields":{variant_fields}}}]}}}}{extra}]}}"#
+    )
+}
+
+#[test]
+fn type_reached_only_through_an_enum_payload_is_checked() {
+    let fee = |ty: &str| {
+        format!(
+            r#",{{"name":"Fee","type":{{"kind":"struct","fields":[{{"name":"bps","type":"{ty}"}}]}}}}"#
+        )
+    };
+    let old = pool_with_enum(r#"[{"defined":{"name":"Fee"}}]"#, &fee("u16"));
+    let new = pool_with_enum(r#"[{"defined":{"name":"Fee"}}]"#, &fee("u64"));
+    assert_eq!(max_sev(&old, &new), Some(Severity::Breaking));
+}
+
+#[test]
+fn type_reached_only_through_an_alias_is_checked() {
+    let idl = |ty: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},
+  "accounts":[{{"name":"Pool","discriminator":[1,1,1,1,1,1,1,1]}}],
+  "types":[{{"name":"Pool","type":{{"kind":"struct","fields":[{{"name":"fee","type":{{"defined":{{"name":"FeeAlias"}}}}}}]}}}},
+    {{"name":"FeeAlias","type":{{"kind":"type","alias":{{"defined":{{"name":"Fee"}}}}}}}},
+    {{"name":"Fee","type":{{"kind":"struct","fields":[{{"name":"bps","type":"{ty}"}}]}}}}]}}"#
+        )
+    };
+    assert_eq!(max_sev(&idl("u16"), &idl("u64")), Some(Severity::Breaking));
+}
+
+#[test]
+fn inline_variant_payload_change_is_breaking() {
+    let report = diff(
+        &parse(&pool_with_enum(r#"["u16"]"#, "")),
+        &parse(&pool_with_enum(r#"["u64"]"#, "")),
+    );
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["enum variant payload changed (Mode#0 Fixed): (u16) -> (u64) (Borsh layout)"]
+    );
+}
+
+#[test]
+fn u256_and_i256_parse_and_diff() {
+    let idl = |ty: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},
+  "instructions":[{{"name":"go","discriminator":[1],"args":[{{"name":"x","type":"{ty}"}}]}}]}}"#
+        )
+    };
+    let report = diff(&parse(&idl("u256")), &parse(&idl("i256")));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["arg changed (go#0): x: u256 -> i256 (Borsh layout)"]
+    );
+    assert!(idl_drift::coverage(&parse(&idl("u256"))).fully_mapped());
+}
+
+#[test]
+fn legacy_discriminators_match_the_real_ones() {
+    // The same program as a legacy Anchor IDL (no discriminators) and as Codama (with them).
+    let legacy =
+        parse(&std::fs::read_to_string("fixtures/real/limit_order_v1_onchain.json").unwrap());
+    let codama = limit_order_v1();
+    let key = |name: &str| name.to_lowercase();
+    let pairs = |a: Vec<(String, Vec<u8>)>, b: Vec<(String, Vec<u8>)>| {
+        let b: std::collections::BTreeMap<_, _> =
+            b.into_iter().map(|(n, d)| (key(&n), d)).collect();
+        assert!(!a.is_empty());
+        for (name, disc) in a {
+            assert_eq!(disc.len(), 8, "{name}");
+            assert_eq!(Some(&disc), b.get(&key(&name)), "{name}");
+        }
+    };
+    let ixs = |idl: &Idl| {
+        idl.instructions
+            .iter()
+            .map(|i| (i.name.clone(), i.discriminator.clone()))
+            .collect()
+    };
+    let accts = |idl: &Idl| {
+        idl.accounts
+            .iter()
+            .map(|a| (a.name.clone(), a.discriminator.clone()))
+            .collect()
+    };
+    let events = |idl: &Idl| {
+        idl.events
+            .iter()
+            .map(|e| (e.name.clone(), e.discriminator.clone()))
+            .collect()
+    };
+    pairs(ixs(&legacy), ixs(&codama));
+    pairs(accts(&legacy), accts(&codama));
+    pairs(events(&legacy), events(&codama));
+}
+
+#[test]
+fn legacy_idl_with_address_only_metadata_parses() {
+    let idl = parse(
+        r#"{"version":"0.1.0","name":"counter","metadata":{"address":"Count111"},
+            "instructions":[{"name":"increment","accounts":[],"args":[]}]}"#,
+    );
+    assert_eq!(idl.address, "Count111");
+    assert_eq!(idl.metadata.name, "counter");
+    assert_eq!(idl.instructions[0].discriminator.len(), 8);
+}
+
+#[test]
+fn same_program_in_two_formats_diffs_clean() {
+    // Legacy Anchor (camelCase, no discriminators) against Codama (camelCase types too).
+    let legacy =
+        parse(&std::fs::read_to_string("fixtures/real/limit_order_v1_onchain.json").unwrap());
+    let report = diff(&legacy, &limit_order_v1());
+    assert!(report.changes.is_empty(), "{:#?}", report.changes);
+}
+
+#[test]
+fn cross_format_diff_still_reports_real_changes() {
+    let codama = limit_order_v1();
+    let mut legacy: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("fixtures/real/limit_order_v1_onchain.json").unwrap(),
+    )
+    .unwrap();
+    // Widen the first arg of initializeOrder (u64) in the legacy file.
+    legacy["instructions"][0]["args"][0]["type"] = serde_json::json!("u128");
+    let report = diff(&parse(&legacy.to_string()), &codama);
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["arg changed (initializeOrder#0): makingAmount: u128 -> u64 (Borsh layout)"]
+    );
+}
+
+#[test]
+fn codama_conversion_that_drops_zero_copy_layout_is_flagged() {
+    // `npx codama convert` drops serialization and repr. Only types whose padding moves
+    // fields misread; the rest are byte-identical.
+    let read = |p: &str| parse(&std::fs::read_to_string(p).unwrap());
+    let report = diff(
+        &read("fixtures/live/voltr_vault/idl.json"),
+        &read("fixtures/live/voltr_vault/idl.js-codama.json"),
+    );
+    let at = |sev: Severity| -> Vec<&str> {
+        report
+            .changes
+            .iter()
+            .filter(|c| c.severity == sev)
+            .map(|c| c.message.split(':').next().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(
+        at(Severity::Breaking),
+        ["serialization and repr changed (adaptorAddReceipt)"]
+    );
+    assert_eq!(
+        at(Severity::Dangerous),
+        ["serialization and repr changed (requestWithdrawVaultReceipt)"]
+    );
+    assert_eq!(at(Severity::Cosmetic).len(), 11);
+    assert_eq!(report.changes.len(), 13);
+}
+
+#[test]
+fn non_ascii_hex_discriminator_does_not_panic() {
+    // Slicing the hex string by byte index used to split `é` and panic.
+    let decoded = decode_encoded_bytes("base16", "éa");
+    assert_eq!(decoded, "éa".as_bytes());
+    assert_eq!(decode_encoded_bytes("base16", "0a1"), [0x00, 0xa1]);
+}
+
+#[test]
+fn new_instruction_reusing_a_discriminator_is_breaking() {
+    let old = r#"{"address":"A","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+      "instructions":[{"name":"a","discriminator":[1],"accounts":[{"name":"x"}],"args":[]}]}"#;
+    let new = r#"{"address":"A","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+      "instructions":[{"name":"a","discriminator":[1],"accounts":[{"name":"x"}],"args":[]},
+        {"name":"b","discriminator":[1],"accounts":[{"name":"x"},{"name":"y"}],"args":[{"name":"n","type":"u64"}]}]}"#;
+    let report = diff(&parse(old), &parse(new));
+    assert!(report
+        .changes
+        .iter()
+        .any(|c| c.severity == Severity::Breaking
+            && c.message
+                .starts_with("new instruction b reuses discriminator 01 of [a]")));
+}
+
+/// A one-instruction Codama program whose discriminator is a numeric arg.
+fn codama_transfer(format: &str, value: u64, offset: usize) -> String {
+    format!(
+        r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+  "program":{{"kind":"programNode","name":"system","publicKey":"11111111111111111111111111111111","version":"0",
+    "accounts":[],"definedTypes":[],"pdas":[],"errors":[],
+    "instructions":[{{"kind":"instructionNode","name":"transfer","accounts":[],
+      "arguments":[
+        {{"kind":"instructionArgumentNode","name":"discriminator","defaultValueStrategy":"omitted",
+          "type":{{"kind":"numberTypeNode","format":"{format}","endian":"le"}},
+          "defaultValue":{{"kind":"numberValueNode","number":{value}}}}},
+        {{"kind":"instructionArgumentNode","name":"lamports","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}],
+      "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":{offset}}}]}}]}}}}"#
+    )
+}
+
+#[test]
+fn codama_numeric_discriminator_keeps_its_width_and_offset() {
+    let ix = |f, v, o| parse(&codama_transfer(f, v, o)).instructions[0].clone();
+    assert_eq!(ix("u32", 2, 0).discriminator, [2, 0, 0, 0]);
+    assert_eq!(ix("u32", 512, 0).discriminator, [0, 2, 0, 0]);
+    assert_eq!(ix("u8", 2, 4).discriminator_offset, 4);
+    // A value that doesn't fit is not silently truncated.
+    assert!(ix("u8", 256, 0).discriminator.is_empty());
+    for (old, new) in [
+        (("u8", 2, 0), ("u32", 2, 0)),
+        (("u32", 256, 0), ("u32", 512, 0)),
+        (("u8", 2, 0), ("u8", 2, 4)),
+    ] {
+        let report = diff(
+            &parse(&codama_transfer(old.0, old.1, old.2)),
+            &parse(&codama_transfer(new.0, new.1, new.2)),
+        );
+        assert!(
+            report.has_breaking(),
+            "{old:?} -> {new:?}: {:?}",
+            report.changes
+        );
+    }
+}
+
+/// A Codama program whose one instruction takes an enum with the given tag size.
+fn codama_enum_arg(size: &str, b_discriminator: Option<u32>) -> String {
+    let disc = b_discriminator.map_or_else(String::new, |d| format!(r#","discriminator":{d}"#));
+    format!(
+        r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+  "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111","version":"0",
+    "accounts":[],"pdas":[],"errors":[],
+    "definedTypes":[{{"kind":"definedTypeNode","name":"state","type":{{"kind":"enumTypeNode",
+      "size":{{"kind":"numberTypeNode","format":"{size}","endian":"le"}},
+      "variants":[{{"kind":"enumEmptyVariantTypeNode","name":"a"}},{{"kind":"enumEmptyVariantTypeNode","name":"b"{disc}}}]}}}}],
+    "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],
+      "arguments":[{{"kind":"instructionArgumentNode","name":"state","type":{{"kind":"definedTypeLinkNode","name":"state"}}}}],
+      "discriminators":[]}}]}}}}"#
+    )
+}
+
+#[test]
+fn codama_enum_tag_width_and_variant_values_are_breaking() {
+    let base = parse(&codama_enum_arg("u8", None));
+    assert!(diff(&base, &parse(&codama_enum_arg("u8", None)))
+        .changes
+        .is_empty());
+    for new in [codama_enum_arg("u32", None), codama_enum_arg("u8", Some(5))] {
+        let report = diff(&base, &parse(&new));
+        assert!(report.has_breaking(), "{:?}", report.changes);
+    }
+}
+
+/// A Codama program with one defined type `ext` passed as an instruction arg.
+fn codama_defined_arg(ext: &str) -> String {
+    format!(
+        r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+  "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111","version":"0",
+    "accounts":[],"pdas":[],"errors":[],
+    "definedTypes":[{{"kind":"definedTypeNode","name":"ext","type":{ext}}}],
+    "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],
+      "arguments":[{{"kind":"instructionArgumentNode","name":"ext","type":{{"kind":"definedTypeLinkNode","name":"ext"}}}}],
+      "discriminators":[]}}]}}}}"#
+    )
+}
+
+#[test]
+fn codama_wrapper_on_defined_type_is_kept() {
+    let st = r#"{"kind":"structTypeNode","fields":[{"kind":"structFieldTypeNode","name":"x","type":{"kind":"numberTypeNode","format":"u64","endian":"le"}}]}"#;
+    let prefixed = format!(
+        r#"{{"kind":"sizePrefixTypeNode","type":{st},"prefix":{{"kind":"numberTypeNode","format":"u16","endian":"le"}}}}"#
+    );
+    let report = diff(
+        &parse(&codama_defined_arg(st)),
+        &parse(&codama_defined_arg(&prefixed)),
+    );
+    assert!(report.has_breaking(), "{:?}", report.changes);
+}
+
+#[test]
+fn codama_fixed_size_bytes_type_resolves_to_a_byte_array() {
+    let idl = parse(&codama_defined_arg(
+        r#"{"kind":"fixedSizeTypeNode","size":32,"type":{"kind":"bytesTypeNode"}}"#,
+    ));
+    assert_eq!(
+        idl.types[0].ty,
+        TypeDefTy::Type {
+            alias: Type::Array(Box::new(Type::U8), ArrayLen::Value(32))
+        }
+    );
+}
+
+// `Inner` has no padding of its own, but unpacking it moves `v` inside zero-copy `Outer`.
+const NESTED_PACKED: &str = r#"{
+  "address":"A","metadata":{"name":"n","version":"0","spec":"0.1.0"},
+  "accounts":[{"name":"Outer","discriminator":[1,1,1,1,1,1,1,1]}],
+  "types":[{"name":"Outer","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+      {"name":"tag","type":"u8"},{"name":"inner","type":{"defined":{"name":"Inner"}}}]}},
+    {"name":"Inner","repr":{"kind":"c","packed":true},"type":{"kind":"struct","fields":[{"name":"v","type":"u64"}]}}]
+}"#;
+
+#[test]
+fn repr_change_on_nested_type_that_moves_outer_fields_is_breaking() {
+    let unpacked = NESTED_PACKED.replace(r#","packed":true"#, "");
+    let report = diff(&parse(NESTED_PACKED), &parse(&unpacked));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["repr changed (Inner): repr(C, packed) -> repr(C): moves `Outer.inner.v` from offset 1 to 8 (zero-copy layout)"]
+    );
+}
+
+#[test]
+fn repr_change_on_borsh_only_type_is_cosmetic() {
+    // Only an instruction arg holds `Inner`, and Borsh ignores repr.
+    let old = r#"{
+  "address":"A","metadata":{"name":"b","version":"0","spec":"0.1.0"},
+  "instructions":[{"name":"f","discriminator":[1],"accounts":[],
+    "args":[{"name":"i","type":{"defined":{"name":"Inner"}}}]}],
+  "types":[{"name":"Inner","repr":{"kind":"c","packed":true},"type":{"kind":"struct","fields":[
+    {"name":"a","type":"u8"},{"name":"v","type":"u64"}]}}]
+}"#;
+    let new = old.replace(r#","packed":true"#, "");
+    assert_eq!(max_sev(old, &new), Some(Severity::Cosmetic));
+}
+
+#[test]
+fn removing_several_optional_tail_accounts_is_dangerous() {
+    let disc = vec![1];
+    let old = bare_idl(vec![ix(
+        "f",
+        disc.clone(),
+        vec![acct("a"), opt_acct("b"), opt_acct("c")],
+    )]);
+    let report = diff(
+        &old,
+        &bare_idl(vec![ix("f", disc.clone(), vec![acct("a")])]),
+    );
+    let max = report.changes.iter().map(|c| c.severity).max();
+    assert_eq!(max, Some(Severity::Dangerous), "{:?}", report.changes);
+    // A required account in the removed block still breaks.
+    let old = bare_idl(vec![ix(
+        "f",
+        disc.clone(),
+        vec![acct("a"), acct("b"), opt_acct("c")],
+    )]);
+    let report = diff(&old, &bare_idl(vec![ix("f", disc, vec![acct("a")])]));
+    assert!(report.has_breaking());
+}
+
+#[test]
+fn camel_case_matches_codama_on_acronyms() {
+    let mut idl = bare_idl(vec![ix(
+        "init_AMMConfig",
+        vec![1],
+        vec![acct("pool_state")],
+    )]);
+    idl = idl.with_camel_case_names();
+    assert_eq!(idl.instructions[0].name, "initAMMConfig");
+    let AccountItem::Single(a) = &idl.instructions[0].accounts[0] else {
+        panic!("single account")
+    };
+    assert_eq!(a.name, "poolState");
 }

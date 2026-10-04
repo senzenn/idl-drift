@@ -1,32 +1,22 @@
-//! Normalize a Codama `RootNode` into the flat semantic [`Idl`](crate::model::Idl)
-//! the diff engine operates on.
-//!
-//! Yellowstone Shipstern's `include_shipstern_parser!` loads the same shape via
-//! `codama_nodes::RootNode` and pulls `program.events` out separately. We keep
-//! events on the flat `Idl.events` list (name + discriminator bytes) so
-//! `diff_named_disc("event", …)` continues to apply.
+//! Convert a Codama `RootNode`, the shape Shipstern's `include_shipstern_parser!` loads,
+//! into the flat [`Idl`].
 
 use crate::model::{
     Account, AccountItem, ArrayLen, Discriminator, EnumFields, EnumVariant, ErrorCode, Event,
-    Field, Idl, Instruction, Metadata, NamedDisc, Type, TypeDef, TypeDefTy,
+    Field, Format, Idl, Instruction, Metadata, NamedDisc, Type, TypeDef, TypeDefTy,
 };
 use codama_nodes::{
     AccountNode, BytesEncoding, BytesValueNode, CountNode, DefaultValueStrategy, DefinedTypeNode,
-    DiscriminatorNode, EnumVariantTypeNode, ErrorNode, EventNode, InstructionAccountNode,
-    InstructionInputValueNode, InstructionNode, IsAccountSigner, NestedTypeNodeTrait, NumberFormat,
-    ProgramNode, RootNode, StructFieldTypeNode, StructTypeNode, TypeNode, ValueNode,
+    DiscriminatorNode, Endianness, EnumVariantTypeNode, ErrorNode, EventNode,
+    InstructionAccountNode, InstructionInputValueNode, InstructionNode, IsSigner, NestedTypeNode,
+    NestedTypeNodeTrait, NumberFormat, NumberTypeNode, RootNode, StructFieldTypeNode,
+    StructTypeNode, TypeNode, TypeNodeTrait, ValueNode,
 };
 
-/// Convert a Codama root (and its `program.events`) into the flat semantic IDL.
+/// Convert a Codama root into the flat IDL.
 #[must_use]
 pub fn from_codama(root: RootNode) -> Idl {
-    // Mirror Shipstern: events live on the program node and are handled as their
-    // own list (cloned out of the root for the render path).
-    let events = root.program.events.clone();
-    from_program(root.program, &events)
-}
-
-fn from_program(program: ProgramNode, events: &[EventNode]) -> Idl {
+    let program = root.program;
     let mut types: Vec<TypeDef> = program
         .defined_types
         .iter()
@@ -37,29 +27,27 @@ fn from_program(program: ProgramNode, events: &[EventNode]) -> Idl {
         .accounts
         .iter()
         .map(|a| {
-            let disc = extract_account_discriminator(a);
-            // Account data is inline on the Codama node; promote it into
-            // `types[]` under the account name so reachability + field diff work.
+            let (disc, offset) = extract_account_discriminator(a);
+            // Codama keeps account data inline; give it a `types` entry like Anchor does.
             types.push(account_as_type_def(a));
             NamedDisc {
                 name: a.name.to_string(),
                 discriminator: disc,
+                discriminator_offset: offset,
+                size: a.size.and_then(|n| usize::try_from(n).ok()),
             }
         })
         .collect();
 
-    let event_discs: Vec<Event> = events
+    let event_discs: Vec<Event> = program
+        .events
         .iter()
         .map(|e| {
             types.push(event_as_type_def(e));
-            // Content disc = EventNode.discriminators[] (constantDiscriminatorNode).
-            // Envelope (Shipstern cpi_event_*) = HiddenPrefixTypeNode.prefix bytes when
-            // event.data is wrapped — NOT discarded by unwrap_wrappers (that strip
-            // is only for payload struct fields). Bare structTypeNode ⇒ no envelope.
             let (envelope_discriminator, envelope_payload_offset) = extract_event_envelope(e);
             Event {
                 name: e.name.to_string(),
-                discriminator: extract_event_discriminator(e),
+                discriminator: extract_event_discriminator(e).0,
                 envelope_discriminator,
                 envelope_payload_offset,
             }
@@ -82,12 +70,13 @@ fn from_program(program: ProgramNode, events: &[EventNode]) -> Idl {
         events: event_discs,
         errors: program.errors.iter().map(convert_error).collect(),
         types,
+        format: Format::Codama,
     }
 }
 
 fn convert_error(e: &ErrorNode) -> ErrorCode {
     ErrorCode {
-        code: u32::try_from(e.code).unwrap_or(u32::MAX),
+        code: e.code,
         name: e.name.to_string(),
         msg: if e.message.is_empty() {
             None
@@ -98,9 +87,9 @@ fn convert_error(e: &ErrorNode) -> ErrorCode {
 }
 
 fn convert_instruction(ix: &InstructionNode) -> Instruction {
-    let discriminator = extract_ix_discriminator(ix);
+    let (discriminator, discriminator_offset) = extract_ix_discriminator(ix);
     let accounts = ix.accounts.iter().map(convert_ix_account).collect();
-    // Skip omitted args (typically the discriminator field itself).
+    // Omitted args are the discriminator, not data.
     let args = ix
         .arguments
         .iter()
@@ -113,6 +102,7 @@ fn convert_instruction(ix: &InstructionNode) -> Instruction {
     Instruction {
         name: ix.name.to_string(),
         discriminator,
+        discriminator_offset,
         accounts,
         args,
     }
@@ -122,8 +112,12 @@ fn convert_ix_account(a: &InstructionAccountNode) -> AccountItem {
     AccountItem::Single(Account {
         name: a.name.to_string(),
         writable: a.is_writable,
-        signer: matches!(a.is_signer, IsAccountSigner::True | IsAccountSigner::Either),
-        optional: a.is_optional,
+        signer: matches!(a.is_signer, IsSigner::True | IsSigner::Either),
+        optional: a.is_optional.unwrap_or(false),
+        address: match a.default_value.as_ref() {
+            Some(InstructionInputValueNode::PublicKeyValue(pk)) => Some(pk.public_key.clone()),
+            _ => None,
+        },
     })
 }
 
@@ -131,35 +125,56 @@ fn convert_defined_type(dt: &DefinedTypeNode) -> TypeDef {
     TypeDef {
         name: dt.name.to_string(),
         serialization: default_serialization(),
+        repr: None,
+        generics: Vec::new(),
         ty: convert_type_def_ty(&dt.r#type),
     }
 }
 
 fn account_as_type_def(a: &AccountNode) -> TypeDef {
-    let st = a.data.get_nested_type_node();
+    let ty = match &a.data {
+        NestedTypeNode::Value(st) => TypeDefTy::Struct {
+            fields: struct_fields_skipping_omitted(st),
+        },
+        wrapped => TypeDefTy::Type {
+            alias: Type::Generic(wrapper_kind(wrapped).to_string()),
+        },
+    };
     TypeDef {
         name: a.name.to_string(),
         serialization: default_serialization(),
-        ty: TypeDefTy::Struct {
-            fields: struct_fields_skipping_omitted(st),
-        },
+        repr: None,
+        generics: Vec::new(),
+        ty,
     }
 }
 
 fn event_as_type_def(e: &EventNode) -> TypeDef {
-    let TypeNode::Struct(st) = unwrap_wrappers(&e.data) else {
-        return TypeDef {
-            name: e.name.to_string(),
-            serialization: default_serialization(),
-            ty: TypeDefTy::Struct { fields: vec![] },
-        };
+    // A hidden prefix around the struct is the self-CPI envelope, read separately.
+    let data = match e.data.as_ref() {
+        TypeNode::HiddenPrefix(hp) => hp.r#type.as_ref(),
+        other => other,
     };
     TypeDef {
         name: e.name.to_string(),
         serialization: default_serialization(),
-        ty: TypeDefTy::Struct {
-            fields: struct_fields_skipping_omitted(st),
-        },
+        repr: None,
+        generics: Vec::new(),
+        ty: convert_type_def_ty(data),
+    }
+}
+
+/// Name of the wrapper node, kept as a `Generic` so the wrapped layout reads as unresolved.
+fn wrapper_kind<T: TypeNodeTrait>(n: &NestedTypeNode<T>) -> &'static str {
+    match n {
+        NestedTypeNode::FixedSize(_) => "fixedSizeTypeNode",
+        NestedTypeNode::HiddenPrefix(_) => "hiddenPrefixTypeNode",
+        NestedTypeNode::HiddenSuffix(_) => "hiddenSuffixTypeNode",
+        NestedTypeNode::PostOffset(_) => "postOffsetTypeNode",
+        NestedTypeNode::PreOffset(_) => "preOffsetTypeNode",
+        NestedTypeNode::Sentinel(_) => "sentinelTypeNode",
+        NestedTypeNode::SizePrefix(_) => "sizePrefixTypeNode",
+        NestedTypeNode::Value(_) => "value",
     }
 }
 
@@ -175,12 +190,13 @@ fn struct_fields_skipping_omitted(st: &StructTypeNode) -> Vec<Field> {
 }
 
 fn convert_type_def_ty(t: &TypeNode) -> TypeDefTy {
-    match unwrap_wrappers(t) {
+    match t {
         TypeNode::Struct(st) => TypeDefTy::Struct {
             fields: struct_fields_skipping_omitted(st),
         },
         TypeNode::Enum(en) => TypeDefTy::Enum {
             variants: en.variants.iter().map(convert_enum_variant).collect(),
+            tag: enum_tag(&en.size),
         },
         other => TypeDefTy::Type {
             alias: convert_type(other),
@@ -193,20 +209,39 @@ fn convert_enum_variant(v: &EnumVariantTypeNode) -> EnumVariant {
         EnumVariantTypeNode::Empty(e) => EnumVariant {
             name: e.name.to_string(),
             fields: EnumFields::default(),
+            discriminator: e.discriminator,
         },
         EnumVariantTypeNode::Struct(s) => EnumVariant {
             name: s.name.to_string(),
-            fields: EnumFields::Named(struct_fields_skipping_omitted(
-                s.r#struct.get_nested_type_node(),
-            )),
+            fields: match &s.r#struct {
+                NestedTypeNode::Value(st) => EnumFields::Named(struct_fields_skipping_omitted(st)),
+                wrapped => {
+                    EnumFields::Tuple(vec![Type::Generic(wrapper_kind(wrapped).to_string())])
+                }
+            },
+            discriminator: s.discriminator,
         },
-        EnumVariantTypeNode::Tuple(t) => {
-            let items = t.tuple.get_nested_type_node();
-            EnumVariant {
-                name: t.name.to_string(),
-                fields: EnumFields::Tuple(items.items.iter().map(convert_type).collect()),
-            }
-        }
+        EnumVariantTypeNode::Tuple(t) => EnumVariant {
+            name: t.name.to_string(),
+            fields: match &t.tuple {
+                NestedTypeNode::Value(items) => {
+                    EnumFields::Tuple(items.items.iter().map(convert_type).collect())
+                }
+                wrapped => {
+                    EnumFields::Tuple(vec![Type::Generic(wrapper_kind(wrapped).to_string())])
+                }
+            },
+            discriminator: t.discriminator,
+        },
+    }
+}
+
+/// `None` for Borsh's `u8` tag, so it compares equal to an Anchor enum.
+fn enum_tag(size: &NestedTypeNode<NumberTypeNode>) -> Option<Type> {
+    match size {
+        NestedTypeNode::Value(n) if n.format == NumberFormat::U8 => None,
+        NestedTypeNode::Value(n) => Some(number_type(n)),
+        _ => Some(Type::Generic("enumSize".to_string())),
     }
 }
 
@@ -214,87 +249,93 @@ fn default_serialization() -> String {
     "borsh".to_string()
 }
 
-/// Strip Codama wrapper nodes that don't change Borsh layout identity for diffing.
-fn unwrap_wrappers(t: &TypeNode) -> &TypeNode {
-    match t {
-        TypeNode::SizePrefix(sp) => unwrap_wrappers(sp.r#type.as_ref()),
-        TypeNode::FixedSize(fs) => unwrap_wrappers(fs.r#type.as_ref()),
-        TypeNode::HiddenPrefix(hp) => unwrap_wrappers(hp.r#type.as_ref()),
-        TypeNode::HiddenSuffix(hs) => unwrap_wrappers(hs.r#type.as_ref()),
-        TypeNode::PreOffset(p) => unwrap_wrappers(p.r#type.as_ref()),
-        TypeNode::PostOffset(p) => unwrap_wrappers(p.r#type.as_ref()),
-        TypeNode::Sentinel(s) => unwrap_wrappers(s.r#type.as_ref()),
-        other => other,
-    }
-}
-
+/// Map a Codama type to the flat model. Encodings with no Borsh equivalent (big-endian
+/// numbers, non-`u32` length prefixes, remainder or zeroable options) become `Generic`.
 fn convert_type(t: &TypeNode) -> Type {
     match t {
-        // Borsh `Vec<T>` / `String` / `Bytes` are size-prefixed.
-        TypeNode::SizePrefix(sp) => match sp.r#type.as_ref() {
-            TypeNode::Array(arr) => Type::Vec(Box::new(convert_type(&arr.item))),
+        TypeNode::SizePrefix(sp) if is_borsh_len_prefix(&sp.prefix) => match sp.r#type.as_ref() {
             TypeNode::String(_) => Type::String,
             TypeNode::Bytes(_) => Type::Bytes,
-            inner => convert_type(inner),
+            _ => Type::Generic("sizePrefixTypeNode".to_string()),
         },
         TypeNode::FixedSize(fs) => match fs.r#type.as_ref() {
-            TypeNode::Bytes(_) => Type::Array(Box::new(Type::U8), ArrayLen::Value(fs.size)),
-            inner => convert_type(inner),
-        },
-        TypeNode::Array(arr) => match &arr.count {
-            CountNode::Fixed(fc) => {
-                Type::Array(Box::new(convert_type(&arr.item)), ArrayLen::Value(fc.value))
+            TypeNode::Bytes(_) | TypeNode::String(_) => {
+                Type::Array(Box::new(Type::U8), ArrayLen::Value(fs.size))
             }
-            CountNode::Prefixed(_) | CountNode::Remainder(_) => {
+            _ => Type::Generic("fixedSizeTypeNode".to_string()),
+        },
+        TypeNode::Array(arr) => match arr.count.as_ref() {
+            CountNode::Fixed(fc) => match usize::try_from(fc.value) {
+                Ok(len) => Type::Array(Box::new(convert_type(&arr.item)), ArrayLen::Value(len)),
+                Err(_) => Type::Generic("fixedCountNode".to_string()),
+            },
+            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => {
                 Type::Vec(Box::new(convert_type(&arr.item)))
             }
+            CountNode::Prefixed(_) => Type::Generic("prefixedCountNode".to_string()),
+            CountNode::Remainder(_) => Type::Generic("remainderCountNode".to_string()),
         },
         TypeNode::Boolean(_) => Type::Bool,
-        TypeNode::Number(n) => number_format(n.format),
+        TypeNode::Number(n) => number_type(n),
+        TypeNode::Amount(a) => number_type(a.number.get_nested_type_node()),
+        TypeNode::SolAmount(a) => number_type(a.number.get_nested_type_node()),
+        TypeNode::DateTime(d) => number_type(d.number.get_nested_type_node()),
         TypeNode::PublicKey(_) => Type::Pubkey,
-        TypeNode::Bytes(_) => Type::Bytes,
-        TypeNode::String(_) => Type::String,
-        TypeNode::Option(o) => Type::Option(Box::new(convert_type(&o.item))),
-        TypeNode::RemainderOption(o) => Type::Option(Box::new(convert_type(&o.item))),
-        TypeNode::ZeroableOption(o) => Type::Option(Box::new(convert_type(&o.item))),
+        TypeNode::Option(o) => {
+            let prefix = o.prefix.get_nested_type_node();
+            let le = prefix.endian == Endianness::Le;
+            match (prefix.format, o.fixed.unwrap_or(false)) {
+                (NumberFormat::U8, false) if le => Type::Option(Box::new(convert_type(&o.item))),
+                (NumberFormat::U32, true) if le => Type::COption(Box::new(convert_type(&o.item))),
+                _ => Type::Generic("optionTypeNode".to_string()),
+            }
+        }
         TypeNode::Link(link) => Type::Defined {
             name: link.name.to_string(),
             generics: vec![],
         },
-        TypeNode::Amount(a) => number_format(a.number.get_nested_type_node().format),
-        TypeNode::SolAmount(a) => number_format(a.number.get_nested_type_node().format),
-        TypeNode::DateTime(d) => number_format(d.number.get_nested_type_node().format),
-        TypeNode::HiddenPrefix(hp) => convert_type(hp.r#type.as_ref()),
-        TypeNode::HiddenSuffix(hs) => convert_type(hs.r#type.as_ref()),
-        TypeNode::PreOffset(p) => convert_type(p.r#type.as_ref()),
-        TypeNode::PostOffset(p) => convert_type(p.r#type.as_ref()),
-        TypeNode::Sentinel(s) => convert_type(s.r#type.as_ref()),
-        // Map/Set/Tuple: key, value, and element types ARE Borsh layout — model
-        // them structurally so inner widenings compare unequal (not Generic).
-        TypeNode::Map(m) => Type::Map(
-            Box::new(convert_type(unwrap_wrappers(m.key.as_ref()))),
-            Box::new(convert_type(unwrap_wrappers(m.value.as_ref()))),
-        ),
-        TypeNode::Set(s) => Type::Set(Box::new(convert_type(unwrap_wrappers(s.item.as_ref())))),
-        TypeNode::Tuple(t) => Type::Tuple(
-            t.items
-                .iter()
-                .map(|item| convert_type(unwrap_wrappers(item)))
-                .collect(),
-        ),
-        // Residual known gap: inline struct/enum used *as a field type*
-        // (anonymous composite). Top-level account data / definedTypes already
-        // promote to TypeDef via convert_defined_type / account_as_type_def.
-        // Representing anonymous inlines needs Type::InlineStruct/InlineEnum
-        // (or synthetic Defined names) — left Generic until that lands. Real
-        // Shipstern Codama IDLs almost always Link to definedTypes instead.
+        TypeNode::Map(m) => match m.count.as_ref() {
+            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => Type::Map(
+                Box::new(convert_type(m.key.as_ref())),
+                Box::new(convert_type(m.value.as_ref())),
+            ),
+            _ => Type::Generic("mapTypeNode".to_string()),
+        },
+        TypeNode::Set(st) => match st.count.as_ref() {
+            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => {
+                Type::Set(Box::new(convert_type(st.item.as_ref())))
+            }
+            _ => Type::Generic("setTypeNode".to_string()),
+        },
+        TypeNode::Tuple(t) => Type::Tuple(t.items.iter().map(convert_type).collect()),
+        // Inline structs and enums as field types have no flat equivalent yet. Real IDLs
+        // almost always link to a defined type instead.
         TypeNode::Struct(_) => Type::Generic("structTypeNode".to_string()),
         TypeNode::Enum(_) => Type::Generic("enumTypeNode".to_string()),
+        // Bare strings and bytes run to the end of the data; Borsh has no such encoding.
+        TypeNode::String(_) => Type::Generic("stringTypeNode".to_string()),
+        TypeNode::Bytes(_) => Type::Generic("bytesTypeNode".to_string()),
+        TypeNode::SizePrefix(_) => Type::Generic("sizePrefixTypeNode".to_string()),
+        TypeNode::HiddenPrefix(_) => Type::Generic("hiddenPrefixTypeNode".to_string()),
+        TypeNode::HiddenSuffix(_) => Type::Generic("hiddenSuffixTypeNode".to_string()),
+        TypeNode::PreOffset(_) => Type::Generic("preOffsetTypeNode".to_string()),
+        TypeNode::PostOffset(_) => Type::Generic("postOffsetTypeNode".to_string()),
+        TypeNode::Sentinel(_) => Type::Generic("sentinelTypeNode".to_string()),
+        TypeNode::RemainderOption(_) => Type::Generic("remainderOptionTypeNode".to_string()),
+        TypeNode::ZeroableOption(_) => Type::Generic("zeroableOptionTypeNode".to_string()),
     }
 }
 
-fn number_format(f: NumberFormat) -> Type {
-    match f {
+/// Borsh writes every length as a little-endian `u32`.
+fn is_borsh_len_prefix(prefix: &NestedTypeNode<NumberTypeNode>) -> bool {
+    matches!(
+        prefix,
+        NestedTypeNode::Value(n) if n.format == NumberFormat::U32 && n.endian == Endianness::Le
+    )
+}
+
+fn number_type(n: &NumberTypeNode) -> Type {
+    let ty = match n.format {
         NumberFormat::U8 => Type::U8,
         NumberFormat::U16 => Type::U16,
         NumberFormat::U32 => Type::U32,
@@ -305,28 +346,33 @@ fn number_format(f: NumberFormat) -> Type {
         NumberFormat::I32 => Type::I32,
         NumberFormat::I64 => Type::I64,
         NumberFormat::I128 => Type::I128,
-        // Not standard Anchor/Borsh integer scalars we model; opaque by design.
-        NumberFormat::F32 | NumberFormat::F64 | NumberFormat::ShortU16 => {
-            Type::Generic(format!("{f:?}").to_lowercase())
-        }
+        NumberFormat::F32 => Type::F32,
+        NumberFormat::F64 => Type::F64,
+        // Variable-length (1 to 3 bytes); not a Borsh scalar.
+        NumberFormat::ShortU16 => return Type::Generic("shortu16".to_string()),
+    };
+    // Single bytes have no byte order.
+    if n.endian == Endianness::Be && !matches!(ty, Type::U8 | Type::I8) {
+        return Type::Generic(format!("{ty:?}be").to_lowercase());
     }
+    ty
 }
 
-// --- discriminators -------------------------------------------------------
-
-fn extract_ix_discriminator(ix: &InstructionNode) -> Discriminator {
+fn extract_ix_discriminator(ix: &InstructionNode) -> (Discriminator, usize) {
     extract_discriminator(&ix.discriminators, |name| {
         let arg = ix.arguments.iter().find(|a| a.name.as_str() == name)?;
-        match arg.default_value.as_ref()? {
-            InstructionInputValueNode::Bytes(b) => Some(decode_bytes(b)),
-            InstructionInputValueNode::Number(n) => number_to_bytes(n),
-            InstructionInputValueNode::Constant(c) => value_to_bytes(c.value.as_ref()),
+        match arg.default_value.as_ref().as_ref()? {
+            InstructionInputValueNode::BytesValue(b) => Some(decode_bytes(b)),
+            InstructionInputValueNode::NumberValue(n) => number_to_bytes(n, &arg.r#type),
+            InstructionInputValueNode::ConstantValue(c) => {
+                value_to_bytes(c.value.as_ref(), c.r#type.as_ref())
+            }
             _ => None,
         }
     })
 }
 
-fn extract_account_discriminator(a: &AccountNode) -> Discriminator {
+fn extract_account_discriminator(a: &AccountNode) -> (Discriminator, usize) {
     let st = a.data.get_nested_type_node();
     extract_discriminator(&a.discriminators, |name| {
         let field = st.fields.iter().find(|f| f.name.as_str() == name)?;
@@ -334,9 +380,13 @@ fn extract_account_discriminator(a: &AccountNode) -> Discriminator {
     })
 }
 
-fn extract_event_discriminator(e: &EventNode) -> Discriminator {
-    let fields: &[StructFieldTypeNode] = match unwrap_wrappers(&e.data) {
+fn extract_event_discriminator(e: &EventNode) -> (Discriminator, usize) {
+    let fields: &[StructFieldTypeNode] = match e.data.as_ref() {
         TypeNode::Struct(st) => st.fields.as_slice(),
+        TypeNode::HiddenPrefix(hp) => match hp.r#type.as_ref() {
+            TypeNode::Struct(st) => st.fields.as_slice(),
+            _ => &[],
+        },
         _ => &[],
     };
     extract_discriminator(&e.discriminators, |name| {
@@ -345,22 +395,15 @@ fn extract_event_discriminator(e: &EventNode) -> Discriminator {
     })
 }
 
-/// Capture Shipstern self-CPI event envelope from Codama `hiddenPrefixTypeNode`.
-///
-/// - `discriminator` (caller): `EventNode.discriminators[]` content sighash.
-/// - `envelope_discriminator`: concatenation of `HiddenPrefixTypeNode.prefix`
-///   [`ConstantValueNode`] bytes (`prefix` field on the nestable node).
-/// - `envelope_payload_offset`: `Some(prefix_len)` when a non-empty prefix exists.
-///
-/// Payload layout still uses [`unwrap_wrappers`] so the prefix is not part of
-/// the promoted event struct fields.
+/// The self-CPI envelope: the constant bytes of a `hiddenPrefixTypeNode` around the event
+/// payload, and the payload offset they imply. A bare struct has no envelope.
 fn extract_event_envelope(e: &EventNode) -> (Discriminator, Option<usize>) {
-    let TypeNode::HiddenPrefix(hp) = &e.data else {
+    let TypeNode::HiddenPrefix(hp) = e.data.as_ref() else {
         return (Vec::new(), None);
     };
     let mut bytes = Vec::new();
     for constant in &hp.prefix {
-        if let Some(chunk) = value_to_bytes(constant.value.as_ref()) {
+        if let Some(chunk) = value_to_bytes(constant.value.as_ref(), constant.r#type.as_ref()) {
             bytes.extend(chunk);
         }
     }
@@ -373,54 +416,94 @@ fn extract_event_envelope(e: &EventNode) -> (Discriminator, Option<usize>) {
 }
 
 fn field_default_bytes(field: &StructFieldTypeNode) -> Option<Vec<u8>> {
-    match field.default_value.as_ref()? {
+    match field.default_value.as_ref().as_ref()? {
         ValueNode::Bytes(b) => Some(decode_bytes(b)),
-        ValueNode::Number(n) => number_to_bytes(n),
-        ValueNode::Constant(c) => value_to_bytes(c.value.as_ref()),
+        ValueNode::Number(n) => number_to_bytes(n, &field.r#type),
+        ValueNode::Constant(c) => value_to_bytes(c.value.as_ref(), c.r#type.as_ref()),
         _ => None,
     }
 }
 
+/// The discriminator bytes and the offset they start at.
 fn extract_discriminator(
     discs: &[DiscriminatorNode],
     resolve_field: impl Fn(&str) -> Option<Vec<u8>>,
-) -> Discriminator {
+) -> (Discriminator, usize) {
     let Some(d) = discs.first() else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     match d {
-        DiscriminatorNode::Constant(c) => {
-            value_to_bytes(c.constant.value.as_ref()).unwrap_or_default()
-        }
-        DiscriminatorNode::Field(f) => resolve_field(f.name.as_str()).unwrap_or_default(),
-        DiscriminatorNode::Size(_) => Vec::new(),
+        DiscriminatorNode::Constant(c) => (
+            value_to_bytes(c.constant.value.as_ref(), c.constant.r#type.as_ref())
+                .unwrap_or_default(),
+            usize::try_from(c.offset).unwrap_or(usize::MAX),
+        ),
+        DiscriminatorNode::Field(f) => (
+            resolve_field(f.name.as_str()).unwrap_or_default(),
+            usize::try_from(f.offset).unwrap_or(usize::MAX),
+        ),
+        DiscriminatorNode::Size(_) => (Vec::new(), 0),
     }
 }
 
-fn value_to_bytes(v: &ValueNode) -> Option<Vec<u8>> {
+fn value_to_bytes(v: &ValueNode, ty: &TypeNode) -> Option<Vec<u8>> {
     match v {
         ValueNode::Bytes(b) => Some(decode_bytes(b)),
-        ValueNode::Number(n) => number_to_bytes(n),
+        ValueNode::Number(n) => number_to_bytes(n, ty),
         _ => None,
     }
 }
 
-fn number_to_bytes(n: &codama_nodes::NumberValueNode) -> Option<Vec<u8>> {
-    match n.number {
-        codama_nodes::Number::UnsignedInteger(v) => Some(vec![u8::try_from(v).unwrap_or(0)]),
-        _ => None,
+/// Encode a numeric discriminator at its declared width and byte order, so a `u32` tag of 2
+/// is four bytes. `None` when the type isn't a number or the value doesn't fit.
+fn number_to_bytes(n: &codama_nodes::NumberValueNode, ty: &TypeNode) -> Option<Vec<u8>> {
+    let number = match ty {
+        TypeNode::Number(nt) => nt,
+        TypeNode::Amount(a) => a.number.get_nested_type_node(),
+        TypeNode::SolAmount(a) => a.number.get_nested_type_node(),
+        TypeNode::DateTime(d) => d.number.get_nested_type_node(),
+        _ => return None,
+    };
+    let width = match number.format {
+        NumberFormat::U8 | NumberFormat::I8 => 1,
+        NumberFormat::U16 | NumberFormat::I16 => 2,
+        NumberFormat::U32 | NumberFormat::I32 => 4,
+        NumberFormat::U64 | NumberFormat::I64 => 8,
+        NumberFormat::U128 | NumberFormat::I128 => 16,
+        _ => return None,
+    };
+    let value: i128 = match n.number {
+        codama_nodes::Number::UnsignedInteger(v) => i128::from(v),
+        codama_nodes::Number::SignedInteger(v) => i128::from(v),
+        codama_nodes::Number::Float(_) => return None,
+    };
+    let signed = matches!(
+        number.format,
+        NumberFormat::I8
+            | NumberFormat::I16
+            | NumberFormat::I32
+            | NumberFormat::I64
+            | NumberFormat::I128
+    );
+    let bits = width * 8;
+    let fits = if signed {
+        bits >= 128 || (-(1i128 << (bits - 1))..(1i128 << (bits - 1))).contains(&value)
+    } else {
+        value >= 0 && (bits >= 128 || value < (1i128 << bits))
+    };
+    if !fits {
+        return None;
     }
+    let mut bytes = value.to_le_bytes()[..width].to_vec();
+    if number.endian == Endianness::Be {
+        bytes.reverse();
+    }
+    Some(bytes)
 }
 
-/// Decode a Codama [`BytesValueNode`] to its underlying bytes.
-///
-/// Encodings must normalize to the same `Vec<u8>`: a constant discriminator
-/// written as base16 in one IDL version and base58/base64 in another (e.g.
-/// after Shipstern PR #277 / a Codama bump) is the *same* value. Storing the
-/// encoded string's UTF-8 bytes for base58/base64 caused false-positive
-/// "discriminator changed" findings on self-equivalent IDLs.
-///
-/// Never panics: malformed input falls back to the raw string bytes.
+/// The bytes behind a Codama [`BytesValueNode`], whatever its encoding, so a discriminator
+/// written in base16 in one version and base58 in the next compares equal. Malformed input
+/// falls back to the raw string bytes.
 #[must_use]
 pub fn decode_bytes(b: &BytesValueNode) -> Vec<u8> {
     match b.encoding {
@@ -438,8 +521,7 @@ pub fn decode_bytes(b: &BytesValueNode) -> Vec<u8> {
     }
 }
 
-/// Test/tooling helper: decode `data` under a Codama encoding name
-/// (`"base16"` / `"base58"` / `"base64"` / `"utf8"`).
+/// Decode `data` under a Codama encoding name: `base16`, `base58`, `base64` or `utf8`.
 #[must_use]
 pub fn decode_encoded_bytes(encoding: &str, data: &str) -> Vec<u8> {
     let node = match encoding {
@@ -451,20 +533,23 @@ pub fn decode_encoded_bytes(encoding: &str, data: &str) -> Vec<u8> {
     decode_bytes(&node)
 }
 
+/// Works on bytes, not string slices, so non-ASCII input can't split a character.
 fn decode_hex(s: &str) -> Vec<u8> {
-    let s = s.trim();
-    let padded = if s.len() % 2 == 1 {
-        format!("0{s}")
-    } else {
-        s.to_string()
-    };
-    (0..padded.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&padded[i..i + 2], 16).ok())
-        .collect()
+    let raw = s.trim().as_bytes();
+    let digits: Vec<u8> = std::iter::repeat_n(b'0', raw.len() % 2)
+        .chain(raw.iter().copied())
+        .collect();
+    let decoded: Option<Vec<u8>> = digits
+        .chunks(2)
+        .map(|pair| {
+            let hex = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(hex, 16).ok()
+        })
+        .collect();
+    decoded.unwrap_or_else(|| raw.to_vec())
 }
 
-/// Coerce `"code": "6000"` → `6000` in `program.errors[]` (same as Shipstern).
+/// Turn string error codes (`"code": "6000"`) into numbers, as Shipstern does.
 pub fn fix_string_error_codes(value: &mut serde_json::Value) {
     let Some(errors) = value
         .get_mut("program")

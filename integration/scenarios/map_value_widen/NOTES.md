@@ -1,12 +1,6 @@
 # map_value_widen
 
-## Real-world situation
-A reachable account field is a Borsh map (`u32` len + `(key, value)*`). Widening
-the value type (`u64` → `u128`) changes every entry’s byte width. Before
-structural `Type::Map` support this was a false-negative (Generic compared equal
-to itself).
+A reachable account field is a Borsh map. Widening its value type from `u64` to `u128`
+changes the size of every entry.
 
-## Expected
-- Classification: **Breaking** (Borsh layout on the reachable `balances` field)
-- Exit code: **1**
-- Map/Set/Tuple structural support is present — this pair is expected to **PASS**.
+Expected: Breaking (`balances: Map<pubkey, u64> -> Map<pubkey, u128>`), exit 1.

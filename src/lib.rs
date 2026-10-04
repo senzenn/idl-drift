@@ -1,27 +1,22 @@
-//! `idl-drift` — semantic drift detection for Solana program IDLs.
+//! `idl-drift` diffs two Solana program IDLs and classifies every change as Breaking,
+//! Dangerous, Additive or Cosmetic by whether a parser generated from the old IDL would
+//! misread data after it.
 //!
-//! Diffs two IDL versions and classifies every change as
-//! Breaking / Dangerous / Additive / Cosmetic, oriented around whether a
-//! Shipstern-generated parser would misread data after the change.
+//! ```no_run
+//! use idl_drift::{diff, model::Idl};
 //!
-//! The classification rules are grounded in how Shipstern's generated parsers read
-//! bytes (positional accounts, `check_min_accounts_req`, discriminator
-//! dispatch, tag-indexed `oneof` enums) and validated against an awk oracle
-//! (`proto/diff.awk`) and its `.facts` fixture suite.
-#![warn(clippy::pedantic)]
-// Match Shipstern's own crate posture (see crates/parser/src/lib.rs): pedantic
-// warnings on, but docs/errors-doc/panics-doc allowances so the gate is
-// identical to the workspace it will live in.
-#![allow(
-    missing_docs,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::module_name_repetitions
-)]
+//! let old = Idl::from_json(&std::fs::read_to_string("old.json")?)?;
+//! let new = Idl::from_json(&std::fs::read_to_string("new.json")?)?;
+//! let report = diff(&old, &new);
+//! std::process::exit(report.exit_code());
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+#![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
 pub mod codama_convert;
 pub mod diff;
 pub mod inspect;
+pub mod layout;
 pub mod model;
 
 pub use diff::{diff, Change, Report, Severity};

@@ -1,0 +1,8 @@
+{
+  "name": "idl-verify-reference",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@coral-xyz/anchor": "0.31.1"
+  }
+}

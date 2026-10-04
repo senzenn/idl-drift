@@ -1,31 +1,20 @@
-//! idl-drift CLI — `diff` and `inspect` subcommands.
-//!
-//! Exit codes for `diff` (oasdiff CI contract):
-//!   0 = no Breaking changes
-//!   1 = at least one Breaking change
-//!   2 = I/O or parse error
-//!
-//! Exit codes for `inspect`:
-//!   0 = zero reachable Generic (unmapped) fields
-//!   1 = at least one reachable Generic field
-//!   2 = I/O or parse error
-
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use idl_drift::model::Idl;
-use idl_drift::{coverage, diff, Report, Severity};
+use idl_drift::{coverage, diff, CoverageReport, Report, Severity};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
+/// Semantic drift detection for Solana program IDLs.
 #[derive(Parser)]
-#[command(
-    name = "idl-drift",
-    version,
-    about = "Semantic drift detection for Solana program IDLs"
-)]
+#[command(name = "idl-drift", version, about)]
+#[command(after_help = "Exit codes:
+  0  diff: no Breaking change; inspect: every field resolved
+  1  diff: at least one Breaking change; inspect: unmapped fields
+  2  a file could not be read or parsed")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,146 +22,106 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Diff two IDL JSON files and classify every change.
+    /// Diff two IDLs and classify every change.
     Diff {
-        /// Path to the baseline (old) IDL JSON.
+        /// Baseline (old) IDL: Anchor or Codama JSON.
         old: PathBuf,
-        /// Path to the current (new) IDL JSON.
+        /// Current (new) IDL: Anchor or Codama JSON.
         new: PathBuf,
-        /// Emit machine-readable JSON instead of the human report.
+        /// Print the report as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Parse one IDL and report Codama→flat type coverage gaps (`Type::Generic`).
+    /// Report fields whose byte layout could not be resolved.
     Inspect {
-        /// Path to an IDL JSON (Codama `RootNode` or Anchor/Solana-spec).
+        /// IDL to scan: Anchor or Codama JSON.
         idl: PathBuf,
     },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.cmd {
+    let result = match Cli::parse().cmd {
         Cmd::Diff { old, new, json } => run_diff(&old, &new, json),
         Cmd::Inspect { idl } => run_inspect(&idl),
+    };
+    match result {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "error: {e}");
+            ExitCode::from(2)
+        }
     }
 }
 
-fn run_inspect(path: &PathBuf) -> ExitCode {
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => return fail(format!("read {}: {e}", path.display())),
-    };
-    let idl = match Idl::from_json(&src) {
-        Ok(v) => v,
-        Err(e) => return fail(format!("parse {}: {e}", path.display())),
-    };
+fn load(path: &Path) -> Result<Idl, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Idl::from_json(&src).map_err(|e| format!("parse {}: {e}", path.display()))
+}
 
-    let report = coverage(&idl);
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    if let Err(e) = writeln!(
+fn run_diff(old: &Path, new: &Path, json: bool) -> Result<u8, String> {
+    let report = diff(&load(old)?, &load(new)?);
+    let written = if json {
+        print_json(&report)
+    } else {
+        print_human(&report)
+    };
+    written.map_err(|e| format!("write report: {e}"))?;
+    Ok(u8::from(report.has_breaking()))
+}
+
+fn run_inspect(path: &Path) -> Result<u8, String> {
+    let report = coverage(&load(path)?);
+    print_coverage(&report).map_err(|e| format!("write report: {e}"))?;
+    Ok(u8::from(!report.fully_mapped()))
+}
+
+fn print_coverage(report: &CoverageReport) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(
         out,
         "instructions: {}  accounts: {}  events: {}  types: {}",
         report.instructions, report.accounts, report.events, report.types
-    ) {
-        return fail(format!("write report: {e}"));
-    }
-    if let Err(e) = writeln!(out, "unmapped (Generic) fields: {}", report.unmapped.len()) {
-        return fail(format!("write report: {e}"));
-    }
+    )?;
+    writeln!(out, "unmapped (Generic) fields: {}", report.unmapped.len())?;
     for u in &report.unmapped {
-        if let Err(e) = writeln!(out, "UNMAPPED: {} -> Generic(\"{}\")", u.path, u.kind) {
-            return fail(format!("write report: {e}"));
-        }
+        writeln!(out, "UNMAPPED: {} -> Generic(\"{}\")", u.path, u.kind)?;
     }
-
-    if report.fully_mapped() {
-        ExitCode::from(0)
-    } else {
-        ExitCode::from(1)
-    }
+    Ok(())
 }
 
-fn run_diff(old_path: &PathBuf, new_path: &PathBuf, as_json: bool) -> ExitCode {
-    let old_src = match std::fs::read_to_string(old_path) {
-        Ok(s) => s,
-        Err(e) => return fail(format!("read {}: {e}", old_path.display())),
-    };
-    let new_src = match std::fs::read_to_string(new_path) {
-        Ok(s) => s,
-        Err(e) => return fail(format!("read {}: {e}", new_path.display())),
-    };
-
-    let old = match Idl::from_json(&old_src) {
-        Ok(v) => v,
-        Err(e) => return fail(format!("parse {}: {e}", old_path.display())),
-    };
-    let new = match Idl::from_json(&new_src) {
-        Ok(v) => v,
-        Err(e) => return fail(format!("parse {}: {e}", new_path.display())),
-    };
-
-    let report = diff(&old, &new);
-    let code = report.exit_code();
-
-    if as_json {
-        if let Err(e) = print_json(&report) {
-            return fail(format!("write json: {e}"));
-        }
-    } else if let Err(e) = print_human(&report) {
-        return fail(format!("write report: {e}"));
-    }
-
-    ExitCode::from(u8::try_from(code).unwrap_or(1))
-}
-
-fn fail(msg: impl AsRef<str>) -> ExitCode {
-    let _ = writeln!(io::stderr(), "error: {}", msg.as_ref());
-    ExitCode::from(2)
-}
+const TIERS: [(Severity, &str); 4] = [
+    (Severity::Breaking, "BREAKING"),
+    (Severity::Dangerous, "DANGEROUS"),
+    (Severity::Additive, "ADDITIVE"),
+    (Severity::Cosmetic, "COSMETIC"),
+];
 
 fn print_human(report: &Report) -> io::Result<()> {
-    let color = io::stdout().is_terminal();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    let groups: [(Severity, &str); 4] = [
-        (Severity::Breaking, "BREAKING"),
-        (Severity::Dangerous, "DANGEROUS"),
-        (Severity::Additive, "ADDITIVE"),
-        (Severity::Cosmetic, "COSMETIC"),
-    ];
-
-    for (sev, tag) in groups {
-        let msgs: Vec<&str> = report
-            .changes
-            .iter()
-            .filter(|c| c.severity == sev)
-            .map(|c| c.message.as_str())
-            .collect();
-        if msgs.is_empty() {
-            continue;
-        }
-        for msg in msgs {
-            writeln!(out, "  [{}] {}", paint_tag(tag, sev, color), msg)?;
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut out = io::stdout().lock();
+    for (severity, tag) in TIERS {
+        for change in report.changes.iter().filter(|c| c.severity == severity) {
+            writeln!(
+                out,
+                "  [{}] {}",
+                paint(tag, severity, color),
+                change.message
+            )?;
         }
     }
-
     let (b, d, a, c) = report.counts();
     writeln!(
         out,
         "summary: {b} breaking, {d} dangerous, {a} additive, {c} cosmetic"
     )?;
-    writeln!(out, "exit code: {}", report.exit_code())?;
-    Ok(())
+    writeln!(out, "exit code: {}", report.exit_code())
 }
 
-fn paint_tag(tag: &str, sev: Severity, color: bool) -> String {
+fn paint(tag: &str, severity: Severity, color: bool) -> String {
     if !color {
         return tag.to_string();
     }
-    match sev {
+    match severity {
         Severity::Breaking => tag.red().bold().to_string(),
         Severity::Dangerous => tag.yellow().bold().to_string(),
         Severity::Additive => tag.green().to_string(),
@@ -198,30 +147,29 @@ struct JsonCounts {
     cosmetic: usize,
 }
 
-fn print_json(report: &Report) -> Result<(), serde_json::Error> {
-    let (b, d, a, c) = report.counts();
+fn print_json(report: &Report) -> io::Result<()> {
+    let messages = |severity| {
+        report
+            .changes
+            .iter()
+            .filter(|c| c.severity == severity)
+            .map(|c| c.message.as_str())
+            .collect()
+    };
+    let (breaking, dangerous, additive, cosmetic) = report.counts();
     let view = JsonReport {
-        breaking: msgs(report, Severity::Breaking),
-        dangerous: msgs(report, Severity::Dangerous),
-        additive: msgs(report, Severity::Additive),
-        cosmetic: msgs(report, Severity::Cosmetic),
+        breaking: messages(Severity::Breaking),
+        dangerous: messages(Severity::Dangerous),
+        additive: messages(Severity::Additive),
+        cosmetic: messages(Severity::Cosmetic),
         counts: JsonCounts {
-            breaking: b,
-            dangerous: d,
-            additive: a,
-            cosmetic: c,
+            breaking,
+            dangerous,
+            additive,
+            cosmetic,
         },
         exit_code: report.exit_code(),
     };
-    println!("{}", serde_json::to_string_pretty(&view)?);
-    Ok(())
-}
-
-fn msgs(report: &Report, sev: Severity) -> Vec<&str> {
-    report
-        .changes
-        .iter()
-        .filter(|c| c.severity == sev)
-        .map(|c| c.message.as_str())
-        .collect()
+    let text = serde_json::to_string_pretty(&view).map_err(io::Error::other)?;
+    writeln!(io::stdout().lock(), "{text}")
 }

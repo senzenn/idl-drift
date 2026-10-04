@@ -1,7 +1,7 @@
-# Real IDLs dropped for local validation (keep README tracked).
-integration/real/*.json
+# Build output.
+/target/
+*-output.txt
+node_modules/
 
-# Shipstern fixtures copied locally for validation (keep README tracked).
-shipstern-integration/idls/*.json
-*/target/
-/traget
+# macOS Finder metadata.
+.DS_Store

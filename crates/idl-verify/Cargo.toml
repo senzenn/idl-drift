@@ -1,0 +1,27 @@
+[package]
+name = "idl-verify"
+description = "Check a Solana program IDL against real account and instruction data."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solana", "idl", "anchor", "borsh", "zero-copy"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+idl-drift = { path = "../..", version = "0.1.0" }
+base64 = "0.22"
+bs58 = "0.5"
+clap = { version = "4", features = ["derive"] }
+owo-colors = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[[bin]]
+name = "idl-verify"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,18 +1,18 @@
-//! Coverage report: find Codama shapes that fell through to `Type::Generic`.
+//! Find fields whose layout the converter could not resolve (`Type::Generic`).
 
 use crate::diff::reachable_types;
 use crate::model::{EnumFields, Idl, Type, TypeDefTy};
 
-/// One field (or ix arg) whose resolved type is / contains `Type::Generic`.
+/// A field or instruction arg whose type is or contains `Type::Generic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmappedField {
-    /// Display path, e.g. `MyAccount.owner` or `ix:swap.amount`.
+    /// Such as `MyAccount.owner` or `ix:swap.amount`.
     pub path: String,
-    /// The opaque kind string inside `Type::Generic(...)`.
+    /// The string inside `Type::Generic`.
     pub kind: String,
 }
 
-/// Coverage summary for one parsed IDL.
+/// Coverage of one IDL.
 #[derive(Debug, Clone)]
 pub struct CoverageReport {
     pub instructions: usize,
@@ -23,14 +23,14 @@ pub struct CoverageReport {
 }
 
 impl CoverageReport {
-    /// `true` when every reachable field resolved to a concrete layout type.
+    /// `true` when every reachable field has a concrete layout.
     #[must_use]
     pub fn fully_mapped(&self) -> bool {
         self.unmapped.is_empty()
     }
 }
 
-/// Scan an IDL for reachable fields that resolved to `Type::Generic`.
+/// Scan instruction args and reachable types for `Type::Generic`.
 #[must_use]
 pub fn coverage(idl: &Idl) -> CoverageReport {
     let reached = reachable_types(idl);
@@ -56,7 +56,10 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
                     collect_generic(&format!("{}.{}", td.name, f.name), &f.ty, &mut unmapped);
                 }
             }
-            TypeDefTy::Enum { variants } => {
+            TypeDefTy::Enum { variants, tag } => {
+                if let Some(tag) = tag {
+                    collect_generic(&format!("{}.<tag>", td.name), tag, &mut unmapped);
+                }
                 for v in variants {
                     match &v.fields {
                         EnumFields::Named(fields) => {
@@ -103,7 +106,11 @@ fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
                 kind: kind.clone(),
             });
         }
-        Type::Option(inner) | Type::Vec(inner) | Type::Array(inner, _) | Type::Set(inner) => {
+        Type::Option(inner)
+        | Type::COption(inner)
+        | Type::Vec(inner)
+        | Type::Array(inner, _)
+        | Type::Set(inner) => {
             collect_generic(path, inner, out);
         }
         Type::Map(key, value) => {
@@ -133,6 +140,10 @@ fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
         | Type::I64
         | Type::U128
         | Type::I128
+        | Type::U256
+        | Type::I256
+        | Type::F32
+        | Type::F64
         | Type::Bytes
         | Type::String
         | Type::Pubkey => {}

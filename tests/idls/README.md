@@ -1,24 +1,11 @@
-# Real Codama IDL fixtures (Shipstern)
+# Codama IDL pair for `limit_order_v1_to_v2_is_breaking`
 
-Place Yellowstone Shipstern Codama `rootNode` JSON here for regression tests.
-These files are **committed when present** so `cargo test` needs no network.
+Copied from the Shipstern repo, `tests/idls/`:
 
-## Required for `limit_order_v1_to_v2_is_breaking`
+| File | Program |
+|---|---|
+| `limit_order_v1.json` | `jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu` |
+| `limit_order_v2.json` | `j1o2qRpjcyUwEvwtcfhEQefh773ZgjxcVRry7LDqg5X` |
 
-| File | Raw URL |
-|------|---------|
-| `limit_order_v1.json` | https://raw.githubusercontent.com/solana-rpc/shipstern/main/tests/idls/limit_order_v1.json |
-| `limit_order_v2.json` | https://raw.githubusercontent.com/solana-rpc/shipstern/main/tests/idls/limit_order_v2.json |
-
-Blob (browsable): https://github.com/solana-rpc/shipstern/blob/main/tests/idls/limit_order_v1.json  
-(and `…/limit_order_v2.json`)
-
-```bash
-# from repo root (manual; not run by CI)
-curl -fsSL -o tests/idls/limit_order_v1.json \
-  https://raw.githubusercontent.com/solana-rpc/shipstern/main/tests/idls/limit_order_v1.json
-curl -fsSL -o tests/idls/limit_order_v2.json \
-  https://raw.githubusercontent.com/solana-rpc/shipstern/main/tests/idls/limit_order_v2.json
-```
-
-Or copy from a local Shipstern checkout: `cp /path/to/shipstern/tests/idls/limit_order_v{1,2}.json tests/idls/`
+v2 is a successor program rather than an in-place upgrade, but it is the largest real Codama
+pair available, so the test uses it to check that the diff stays stable and Breaking.

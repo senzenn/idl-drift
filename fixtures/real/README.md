@@ -1,74 +1,18 @@
-# Real Codama IDL fixtures
+# Real on-chain Anchor IDLs
 
-Drop real Yellowstone Shipstern / Codama `rootNode` JSON files here as `*.json`.
-Nothing in this directory is fetched by the build or tests — place files manually.
+Fetched from mainnet with `anchor idl fetch`. `integration/run-all.sh` runs `idl-drift inspect`
+on each and expects every field to resolve.
 
-Then run:
+| File | Program | Format |
+|---|---|---|
+| `limit_order_v1_onchain.json` | `jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu` | legacy Anchor (pre-0.30) |
+| `limit_order_v2_onchain.json` | `j1o2qRpjcyUwEvwtcfhEQefh773ZgjxcVRry7LDqg5X` | Anchor 0.30 spec |
+| `pump_fun_onchain.json` | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | Anchor 0.30 spec |
 
-```bash
-./scripts/inspect-real.sh
-```
-
-## Where to get them
-
-### 1. From the Yellowstone Shipstern repo (preferred)
-
-Clone or copy from [solana-rpc/shipstern](https://github.com/solana-rpc/shipstern).
-Codama IDL fixtures live under:
-
-```
-tests/idls/*.json
-```
-
-As of recent main, that includes (among others):
-
-- `tests/idls/dca.json`
-- `tests/idls/dynamic_bonding_curve.json`
-- `tests/idls/glow.json`
-- `tests/idls/invite_escrow.json`
-- `tests/idls/jupiter_log_scope_regression.json`
-- `tests/idls/limit_order_v1.json`
-- `tests/idls/limit_order_v2.json`
-- `tests/idls/loopscale.json`
-- `tests/idls/metaplex.json`
-- `tests/idls/okx_labs1.json`
-- `tests/idls/order_engine.json`
-- `tests/idls/perpetuals.json`
-- `tests/idls/pump_fun.json`
-- `tests/idls/raydium_amm_v4_with_swapv2.json`
-- `tests/idls/spl_governance.json`
-- `tests/idls/squads_multisig_program.json`
-
-Copy any subset into this directory, e.g.:
+To add one (needs the Anchor CLI and mainnet RPC access):
 
 ```bash
-cp /path/to/shipstern/tests/idls/order_engine.json fixtures/real/
+./scripts/fetch-idl.sh <PROGRAM_ID> <name>
 ```
 
-Each file should have `"kind": "rootNode"` / `"standard": "codama"` at the top level.
-
-### 3. From mainnet via `anchor idl fetch` (live program IDL)
-
-Requires the Anchor CLI and RPC access:
-
-```bash
-# helpers stamp `address` (legacy IDLs omit it) and run inspect
-./scripts/fetch-idl.sh jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu limit_order_v1_onchain
-./scripts/fetch-idl.sh j1o2qRpjcyUwEvwtcfhEQefh773ZgjxcVRry7LDqg5X limit_order_v2_onchain
-
-# then diff two versions / related programs
-cargo run --quiet -- diff \
-  fixtures/real/limit_order_v1_onchain.json \
-  fixtures/real/limit_order_v2_onchain.json
-```
-
-Or raw:
-
-```bash
-anchor idl fetch <PROGRAM_ID> --provider.cluster mainnet -o fixtures/real/<name>.json
-```
-
-`Idl::from_json` accepts both modern Solana IDL-spec JSON and legacy Anchor 0.x
-shapes (`name`/`version` at top level, `publicKey`, `isMut`/`isSigner`, inline
-account/event types).
-
+The script stamps the program id into `address`, since legacy IDLs omit it.

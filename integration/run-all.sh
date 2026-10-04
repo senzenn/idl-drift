@@ -1,84 +1,93 @@
 #!/usr/bin/env bash
-# Run every integration/scenarios pair + optional inspect on integration/real/.
+# End-to-end checks: run each tool on real inputs and assert its exit code.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-SCEN="$ROOT/integration/scenarios"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT"' EXIT
 PASS=0
-FAIL=0
 TOTAL=0
 
-# scenario | expected_exit
-CASES=(
-  "anchor_029_to_030|1"
-  "account_removed_collision|1"
-  "mid_optional_account_removed|1"
-  "cpi_event_anchor_to_pinocchio|1"
-  "map_value_widen|1"
-  "truncated_idl|2"
-)
-
-echo "== idl-drift integration scenarios =="
-echo
-
-for entry in "${CASES[@]}"; do
-  IFS='|' read -r name expect <<<"$entry"
+# expect <label> <exit code> <command...>
+expect() {
+  local label="$1" want="$2"
+  shift 2
   TOTAL=$((TOTAL + 1))
-  old="$SCEN/$name/old.json"
-  new="$SCEN/$name/new.json"
-
   set +e
-  cargo run --quiet -- diff "$old" "$new" \
-    >/tmp/idl-drift-integ-out.txt 2>/tmp/idl-drift-integ-err.txt
-  code=$?
+  "$@" >"$OUT" 2>&1
+  local got=$?
   set -e
-
-  if [[ "$code" -eq "$expect" ]]; then
-    echo "${name}: exit=${code} PASS"
+  if [[ "$got" -eq "$want" ]]; then
+    echo "${label}: exit=${got} PASS"
     PASS=$((PASS + 1))
   else
-    echo "${name}: exit=${code} FAIL (expected=${expect})"
-    echo "----- stdout -----"
-    cat /tmp/idl-drift-integ-out.txt || true
-    echo "----- stderr -----"
-    cat /tmp/idl-drift-integ-err.txt || true
-    echo "------------------"
-    FAIL=$((FAIL + 1))
+    echo "${label}: exit=${got} FAIL (expected ${want})"
+    sed 's/^/    /' "$OUT"
   fi
+}
+
+cargo build --quiet --workspace
+DRIFT="$ROOT/target/debug/idl-drift"
+VERIFY="$ROOT/target/debug/idl-verify"
+
+echo "== idl-drift diff: integration/scenarios =="
+for entry in \
+  "anchor_029_to_030|1" \
+  "account_removed_collision|1" \
+  "mid_optional_account_removed|1" \
+  "cpi_event_anchor_to_pinocchio|1" \
+  "map_value_widen|1" \
+  "truncated_idl|2"; do
+  IFS='|' read -r name want <<<"$entry"
+  dir="integration/scenarios/$name"
+  expect "$name" "$want" "$DRIFT" diff "$dir/old.json" "$dir/new.json"
 done
 
 echo
-echo "== inspect integration/real/*.json (if any) =="
-shopt -s nullglob
-real_files=(integration/real/*.json)
-if ((${#real_files[@]} == 0)); then
-  echo "(none present — see integration/real/README.md)"
-else
-  for f in "${real_files[@]}"; do
-    set +e
-    out="$(cargo run --quiet -- inspect "$f" 2>&1)"
-    icode=$?
-    set -e
-    base="$(basename "$f")"
-    if ((icode == 2)); then
-      echo "${base}  ERROR (parse/io)  FAIL"
-      echo "$out" >&2
-      continue
-    fi
-    count="$(printf '%s\n' "$out" | sed -n 's/^unmapped (Generic) fields: //p' | head -n1)"
-    [[ -z "$count" ]] && count="?"
-    if ((icode == 0)); then
-      echo "${base}  Generic=${count}  PASS"
-    else
-      echo "${base}  Generic=${count}  FAIL"
-    fi
-  done
-fi
+echo "== idl-drift diff: fixtures/manual =="
+for entry in \
+  "00_identical|0" \
+  "01_default_omission|0" \
+  "02_new_instruction|0" \
+  "03_enum_append|0" \
+  "10_field_widen|1" \
+  "11_enum_mid_insert|1" \
+  "12_arg_added|1" \
+  "13_account_reorder|1" \
+  "14_disc_len_change|1" \
+  "15_alias_retarget|1" \
+  "16_collision_introduced|1" \
+  "17_disc_reencoded|0"; do
+  IFS='|' read -r name want <<<"$entry"
+  expect "$name" "$want" "$DRIFT" diff "fixtures/manual/${name}_old.json" "fixtures/manual/${name}_new.json"
+done
+# Malformed input must exit 2, not panic.
+for name in 90_broken_json 91_missing_field; do
+  expect "$name" 2 "$DRIFT" diff "fixtures/manual/${name}_old.json" fixtures/manual/00_identical_new.json
+done
+
+# The same program as legacy Anchor and as Codama: names and discriminators must line up.
+expect "cross-format limit_order_v1" 0 "$DRIFT" diff fixtures/real/limit_order_v1_onchain.json tests/idls/limit_order_v1.json
 
 echo
-echo "${PASS}/${TOTAL} scenarios behaved as expected"
-if [[ "$FAIL" -ne 0 ]]; then
-  exit 1
-fi
+echo "== idl-drift inspect: fixtures/real =="
+for f in fixtures/real/*.json; do
+  expect "$(basename "$f")" 0 "$DRIFT" inspect "$f"
+done
+
+echo
+echo "== idl-verify: fixtures/live =="
+for entry in \
+  "voltr_vault|idl.json|0" \
+  "voltr_vault|idl.js-codama.json|1" \
+  "jupiter_vaults|idl.json|0"; do
+  IFS='|' read -r program idl want <<<"$entry"
+  dir="fixtures/live/$program"
+  expect "$program/$idl" "$want" "$VERIFY" --idl "$dir/$idl" --samples "$dir/samples.json"
+done
+
+echo
+echo "${PASS}/${TOTAL} behaved as expected"
+[[ "$PASS" -eq "$TOTAL" ]]
