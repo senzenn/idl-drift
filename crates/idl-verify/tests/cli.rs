@@ -94,3 +94,27 @@ fn reference_for_other_samples_exits_2() {
         "{stderr}"
     );
 }
+
+#[test]
+fn rpc_failure_exits_2_without_printing_the_url() {
+    // Port 9 on localhost is closed, so no network is needed. The path stands in for a token.
+    for url in ["http://127.0.0.1:9/secret-token", "secret-token"] {
+        let out = idl_verify(&["--idl", &live("voltr_vault/idl.json"), "--rpc", url]);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("getSignaturesForAddress"), "{stderr}");
+        assert!(!stderr.contains("secret-token"), "{stderr}");
+    }
+}
+
+#[test]
+fn reads_the_rpc_url_from_the_environment() {
+    let out = Command::new(env!("CARGO_BIN_EXE_idl-verify"))
+        .args(["--idl", &live("voltr_vault/idl.json")])
+        .env("IDL_VERIFY_RPC_URL", "http://127.0.0.1:9/secret-token")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("getSignaturesForAddress"), "{stderr}");
+}

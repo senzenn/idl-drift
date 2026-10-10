@@ -26,10 +26,15 @@ Or run it from the repo with `cargo run -p idl-verify -- <args>`.
 idl-verify --idl idl.json --samples samples.json
 idl-verify --idl idl.json --samples samples.json --json
 idl-verify --idl idl.json --samples samples.json --reference reference.json
+IDL_VERIFY_RPC_URL=<url> idl-verify --idl idl.json
+IDL_VERIFY_RPC_URL=<url> idl-verify --idl idl.json --program <program id>
 ```
 
 `--idl` takes an Anchor IDL (0.30+ spec, with discriminators) or a Codama `rootNode` file.
-`--samples` is captured data, described [below](#the-samples-file).
+`--samples` is captured data, described [below](#the-samples-file). `--rpc` or
+`IDL_VERIFY_RPC_URL` takes samples from a live cluster instead, described in
+[live sampling](#live-sampling). Prefer the env var: `ps` and shell history show a URL given
+on the command line. `--samples` wins when both are set.
 
 Run on the Codama conversion of voltr_vault, from the repo root:
 
@@ -160,8 +165,24 @@ with SBF alignment rules:
 - `programId`, `address` and `signature` are optional but make the report useful. Other
   keys, such as a `type` label, are ignored: samples are classified by discriminator only.
 
-`fixtures/live/*/samples.json` are real examples, captured from mainnet. idl-verify does
-not fetch samples itself yet (see [limitations](#limitations)).
+`fixtures/live/*/samples.json` are real examples, captured from mainnet.
+
+## Live sampling
+
+`--rpc <url>` samples the program (`--program`, or the IDL's `address`) over JSON-RPC:
+
+- The 40 most recent signatures, from `getSignaturesForAddress`. Failed transactions are
+  skipped, since they can carry data the program rejected.
+- From each transaction (`getTransaction`, versions 0 and 1): every instruction that calls
+  the program, top level and CPI, with keys resolved through address lookup tables. Anchor
+  self-CPI events are skipped. At most 20 instructions are kept.
+- The accounts those instructions pass that the program owns (`getMultipleAccounts`), at
+  most 5 per account type. Accounts with an unknown discriminator are kept, so the
+  `discriminator` check can report them.
+
+A failed request exits 2: a run never passes on samples it could not fetch. Rate limits
+and server errors are retried 5 times. The URL is never printed, since providers put the
+API key in it.
 
 ## Reference comparison
 
@@ -213,8 +234,8 @@ decoder over the IDL model and the `repr(C)` layout calculator.
 
 ## Limitations
 
-- **No live sampling yet.** Samples must be captured separately. `--rpc` and `--program` are
-  planned.
+- **Live sampling sees recent activity only.** Account types and instructions that the last
+  40 transactions don't touch are not sampled; the report lists them under "not sampled".
 - **Events are not checked.** Neither `Program data:` logs nor self-CPI events.
 - **Spare allocation is a heuristic.** "Rounded up to 8" is a common allocation pattern,
   not proof; it is a warning for that reason.

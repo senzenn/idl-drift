@@ -360,3 +360,47 @@ fn u32_discriminator_reads_the_amount_at_the_right_offset() {
     assert!(report.findings.is_empty(), "{:#?}", report.findings);
     assert_eq!(report.instructions[0].name, "transfer");
 }
+
+#[test]
+fn numeric_constant_discriminator_is_the_body_first_field() {
+    // SPL Governance: byte 0 is the discriminator and `accountType` at once. Shipstern's
+    // parser decodes the body from offset 0 and reads the real account right; so must this.
+    let account = |disc: u8, weight: u64| {
+        let mut bytes = vec![disc];
+        bytes.extend_from_slice(&weight.to_le_bytes());
+        serde_json::json!({ "address": "A", "type": "voteRecord", "data": STANDARD.encode(bytes) })
+    };
+    let idl = serde_json::json!({
+        "kind": "rootNode", "standard": "codama", "version": "1.5.1",
+        "program": {
+            "kind": "programNode", "name": "gov", "publicKey": "11111111111111111111111111111111",
+            "version": "0.1.0", "instructions": [], "definedTypes": [], "pdas": [], "errors": [],
+            "accounts": [{
+                "kind": "accountNode", "name": "voteRecord",
+                "discriminators": [{ "kind": "constantDiscriminatorNode", "offset": 0, "constant": {
+                    "kind": "constantValueNode",
+                    "type": { "kind": "numberTypeNode", "format": "u8", "endian": "le" },
+                    "value": { "kind": "numberValueNode", "number": 12 } } }],
+                "data": { "kind": "structTypeNode", "fields": [
+                    { "kind": "structFieldTypeNode", "name": "discriminator", "defaultValueStrategy": "omitted",
+                      "type": { "kind": "fixedSizeTypeNode", "size": 1, "type": { "kind": "bytesTypeNode" } },
+                      "defaultValue": { "kind": "bytesValueNode", "data": "0c", "encoding": "base16" } },
+                    { "kind": "structFieldTypeNode", "name": "accountType",
+                      "type": { "kind": "numberTypeNode", "format": "u8", "endian": "le" } },
+                    { "kind": "structFieldTypeNode", "name": "weight",
+                      "type": { "kind": "numberTypeNode", "format": "u64", "endian": "le" } }
+                ] }
+            }]
+        }
+    });
+    let samples = |accounts: Vec<Json>| serde_json::json!({ "programId": "11111111111111111111111111111111", "accounts": accounts, "instructions": [] });
+    let report = run(&idl, &samples(vec![account(12, 7), account(12, 9)]));
+    assert!(
+        findings(&report, Severity::Error).is_empty(),
+        "{:#?}",
+        report.findings
+    );
+    // Another first byte is another account type, not a shifted read of this one.
+    let report = run(&idl, &samples(vec![account(13, 7)]));
+    assert_eq!(only_error(&report).check, Check::Discriminator);
+}

@@ -180,10 +180,7 @@ impl Verifier<'_> {
 
     fn check_account_type(&mut self, nd: &NamedDisc, idxs: &[usize]) -> AccountSummary {
         let subject = format!("account {}", nd.name);
-        // Data starts after the discriminator, wherever it sits.
-        let disc = nd
-            .discriminator_offset
-            .saturating_add(nd.discriminator.len());
+        let disc = nd.payload_start();
         let accounts = &self.samples.accounts;
         let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
         for &i in idxs {
@@ -393,9 +390,7 @@ impl Verifier<'_> {
         outcomes: &Outcomes,
     ) {
         let accounts = &self.samples.accounts;
-        let disc = nd
-            .discriminator_offset
-            .saturating_add(nd.discriminator.len());
+        let disc = nd.payload_start();
         let mut classes: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
         for (i, result) in outcomes {
             if let Ok((_, used)) = result {
@@ -834,18 +829,20 @@ impl Verifier<'_> {
                 })
                 .collect();
             let fixed = missing.iter().all(|a| a.address.is_some());
-            let hint = if fixed {
-                "every missing account has a fixed address, so the program likely stopped requiring them; a parser that checks the IDL's account count rejects these instructions"
+            // Shipstern reads an absent optional tail account as `None`, so nothing breaks.
+            let (severity, hint) = if !required {
+                (Severity::Note, "every missing account is optional at the tail; a generated parser reads them as absent")
+            } else if fixed {
+                (Severity::Error, "every missing account has a fixed address, so the program likely stopped requiring them; a parser that checks the IDL's account count rejects these instructions")
             } else {
-                "a parser that checks the IDL's account count rejects these instructions"
+                (
+                    Severity::Error,
+                    "a parser that checks the IDL's account count rejects these instructions",
+                )
             };
             let example = samples[group[0]].signature.clone();
             self.push(
-                if required {
-                    Severity::Error
-                } else {
-                    Severity::Warning
-                },
+                severity,
                 Check::AccountCount,
                 subject,
                 format!(
@@ -910,10 +907,10 @@ impl Verifier<'_> {
 }
 
 /// A discriminator: where it starts in the data, and its bytes.
-type Disc<'a> = (usize, &'a [u8]);
+pub(crate) type Disc<'a> = (usize, &'a [u8]);
 
 /// `(discriminator, index)` pairs, longest discriminator first, empty ones dropped.
-fn disc_table<'a>(discs: impl Iterator<Item = Disc<'a>>) -> Vec<(Disc<'a>, usize)> {
+pub(crate) fn disc_table<'a>(discs: impl Iterator<Item = Disc<'a>>) -> Vec<(Disc<'a>, usize)> {
     let mut table: Vec<(Disc<'a>, usize)> = discs
         .enumerate()
         .filter(|(_, (_, d))| !d.is_empty())
@@ -924,7 +921,7 @@ fn disc_table<'a>(discs: impl Iterator<Item = Disc<'a>>) -> Vec<(Disc<'a>, usize
 }
 
 /// Every entry whose discriminator is the longest one found in `data` at its offset.
-fn longest_match(table: &[(Disc<'_>, usize)], data: &[u8]) -> Option<Vec<usize>> {
+pub(crate) fn longest_match(table: &[(Disc<'_>, usize)], data: &[u8]) -> Option<Vec<usize>> {
     let at = |(offset, disc): &Disc<'_>| data.get(*offset..).is_some_and(|d| d.starts_with(disc));
     let (found, _) = table.iter().find(|(d, _)| at(d))?;
     Some(
@@ -969,7 +966,7 @@ fn flatten(items: &[AccountItem]) -> Vec<&Account> {
     out
 }
 
-fn prefix_hex(data: &[u8]) -> String {
+pub(crate) fn prefix_hex(data: &[u8]) -> String {
     if data.is_empty() {
         return "no data".to_string();
     }
@@ -1183,6 +1180,28 @@ mod tests {
         let report = verify(&idl, &instructions(&[(&[1, 9], &["k1", "k2"])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
         assert_eq!(report.instructions[0].name, "two");
+    }
+
+    #[test]
+    fn optional_tail_accounts_left_out_are_a_note_not_a_warning() {
+        // SPL Governance castVote passes 11 of 13 accounts live; Shipstern parses it.
+        let lenient = idl(
+            "[]",
+            r#"[{"name":"vote","discriminator":[1],"accounts":[
+                {"name":"realm"},{"name":"voterWeightRecord","optional":true}]}]"#,
+            "[]",
+        );
+        let report = verify(&lenient, &instructions(&[(&[1], &["R"])]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Note, Check::AccountCount));
+        // A required account left out is still an error.
+        let strict = idl(
+            "[]",
+            r#"[{"name":"vote","discriminator":[1],"accounts":[{"name":"realm"},{"name":"proposal"}]}]"#,
+            "[]",
+        );
+        let report = verify(&strict, &instructions(&[(&[1], &["R"])]), None);
+        assert_eq!(only(&report).severity, Severity::Error);
     }
 
     #[test]

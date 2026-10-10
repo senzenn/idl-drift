@@ -102,6 +102,21 @@ pub struct NamedDisc {
     /// Declared account size in bytes, discriminator included (Codama `size`).
     #[serde(default)]
     pub size: Option<usize>,
+    /// Explicit body start; `None` means right after the discriminator.
+    #[serde(default)]
+    pub payload_offset: Option<usize>,
+}
+
+impl NamedDisc {
+    /// Where the account body starts: after the discriminator, unless the IDL says the
+    /// discriminator byte is also the body's first field (SPL Governance).
+    #[must_use]
+    pub fn payload_start(&self) -> usize {
+        self.payload_offset.unwrap_or_else(|| {
+            self.discriminator_offset
+                .saturating_add(self.discriminator.len())
+        })
+    }
 }
 
 /// A program event. The envelope is the self-CPI wrap around the payload: Anchor's 8-byte
@@ -148,7 +163,12 @@ pub struct Field {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TypeDef {
     pub name: String,
-    #[serde(default = "default_serialization")]
+    /// `borsh`, `bytemuck`, `bytemuckunsafe`, or `custom:<name>` for Anchor's
+    /// `{"custom": "<name>"}`, whose layout the IDL does not describe.
+    #[serde(
+        default = "default_serialization",
+        deserialize_with = "deserialize_serialization"
+    )]
     pub serialization: String,
     /// Memory representation, which sets the layout of zero-copy types.
     #[serde(default)]
@@ -161,6 +181,20 @@ pub struct TypeDef {
 
 fn default_serialization() -> String {
     "borsh".to_string()
+}
+
+/// The spec writes a custom serializer as `{"custom": "<name>"}`.
+fn deserialize_serialization<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Serialization {
+        Name(String),
+        Custom { custom: String },
+    }
+    Ok(match Serialization::deserialize(d)? {
+        Serialization::Name(name) => name,
+        Serialization::Custom { custom } => format!("custom:{custom}"),
+    })
 }
 
 impl TypeDef {
@@ -433,6 +467,8 @@ impl Idl {
 /// Rewrite pre-0.30 Anchor JSON into the 0.30 spec shape: `name` and `version` into
 /// `metadata`, old key names, and inline account and event types moved into `types`.
 /// Codama's `camelCase`, which differs from heck on acronyms (`AMMConfig` is `aMMConfig`).
+/// Anchor 0.30 names foreign types by path (`whirlpool::state::Position`); legacy IDLs
+/// flattened the same path to `WhirlpoolStatePosition`, so `::` splits a word too.
 fn camel(name: &str) -> String {
     let mut spaced = String::with_capacity(name.len());
     for c in name.chars() {
@@ -443,7 +479,7 @@ fn camel(name: &str) -> String {
     }
     let mut out = String::with_capacity(name.len());
     for word in spaced
-        .split(|c: char| matches!(c, '-' | '_' | '+' | '.') || c.is_whitespace())
+        .split(|c: char| matches!(c, '-' | '_' | '+' | '.' | ':') || c.is_whitespace())
         .filter(|w| !w.is_empty())
     {
         let mut chars = word.chars();
@@ -607,7 +643,7 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) -> bool {
     }
 
     rewrite_legacy_keys(value);
-    normalize_tuple_struct_fields(value);
+    normalize_type_defs(value);
     legacy
 }
 
@@ -654,39 +690,38 @@ fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value
     }
 }
 
-/// Anchor writes tuple struct fields as bare types (`["bool"]`); name them `_0`, `_1`, ...
-fn normalize_tuple_struct_fields(value: &mut serde_json::Value) {
+/// Two shapes the spec structs don't take: tuple struct fields, which Anchor writes as bare
+/// types (`["bool"]` or `[{"array":["u8",4]}]`) and get named `_0`, `_1`, ...; and the
+/// pre-0.30 alias `{"kind":"alias","value":T}` for `{"kind":"type","alias":T}`.
+fn normalize_type_defs(value: &mut serde_json::Value) {
     let Some(types) = value.get_mut("types").and_then(|t| t.as_array_mut()) else {
         return;
     };
     for td in types {
-        let Some(ty) = td.get_mut("type") else {
+        let Some(ty) = td.get_mut("type").and_then(|t| t.as_object_mut()) else {
             continue;
         };
-        let Some(kind) = ty.get("kind").and_then(|k| k.as_str()) else {
-            continue;
-        };
-        if kind != "struct" {
-            continue;
-        }
-        let Some(fields) = ty.get_mut("fields").and_then(|f| f.as_array_mut()) else {
-            continue;
-        };
-        if fields.is_empty() || fields.iter().all(serde_json::Value::is_object) {
-            continue;
-        }
-        let rewritten: Vec<serde_json::Value> = fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                if f.is_object() {
-                    f.clone()
-                } else {
-                    serde_json::json!({ "name": format!("_{i}"), "type": f })
+        match ty.get("kind").and_then(|k| k.as_str()) {
+            Some("alias") => {
+                if let Some(target) = ty.remove("value") {
+                    ty.insert("kind".into(), "type".into());
+                    ty.insert("alias".into(), target);
                 }
-            })
-            .collect();
-        *fields = rewritten;
+            }
+            Some("struct") => {
+                let Some(fields) = ty.get_mut("fields").and_then(|f| f.as_array_mut()) else {
+                    continue;
+                };
+                // A bare type is anything without a `name`; a type object never has one.
+                for (i, f) in fields.iter_mut().enumerate() {
+                    if f.get("name").is_none() {
+                        let bare = std::mem::take(f);
+                        *f = serde_json::json!({ "name": format!("_{i}"), "type": bare });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

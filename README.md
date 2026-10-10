@@ -39,6 +39,7 @@ Or run in place with `cargo run -- <args>` and `cargo run -p idl-verify -- <args
 ```bash
 idl-drift diff old.json new.json
 idl-drift diff old.json new.json --json
+idl-drift diff old.json new.json --fail-on dangerous
 ```
 
 Either file can be Anchor JSON (0.30 spec or legacy) or Codama `rootNode` JSON; the two
@@ -46,8 +47,11 @@ don't have to match. Each format names things its own way (`deposit_vault`, `dep
 so when they differ, names are compared in camelCase, as Codama writes them. Struct-typed
 instruction args are compared field by field then too, since Codama inlines them. Legacy
 Anchor IDLs leave discriminators out, so they are computed from the names, the way Anchor
-does. The human report lists changes by tier and ends with a summary;
-`--json` gives the same changes as four arrays, with counts and the exit code.
+does. The human report lists changes by tier and ends with a summary.
+`--json` gives every change with its `severity`, `kind` (the rule, such as
+`field_renamed`), `subject` (such as `swap#2` or `Pool#1`) and `message`, plus the four
+tier arrays, counts and the exit code. Allow-list a known change in CI by `kind` and
+`subject`, not by message text.
 
 For example, `idl-drift diff tests/fixtures/amm_old.json tests/fixtures/amm_new.json`:
 
@@ -61,8 +65,8 @@ exit code: 1
 
 | Exit code | Meaning |
 |---|---|
-| `0` | No Breaking change |
-| `1` | At least one Breaking change |
+| `0` | No change at or above `--fail-on` (default: Breaking) |
+| `1` | At least one change at or above `--fail-on` |
 | `2` | A file could not be read or parsed |
 
 In CI:
@@ -91,14 +95,19 @@ generated parsers read them. Layout changes only count on types a parser reads: 
 types, event types, types named in instruction args, and everything those reference
 through fields, variant payloads and aliases.
 
+Three Anchor shapes outside the spec structs are accepted: tuple struct fields written as
+bare types, the pre-0.30 `{"kind": "alias"}` type, and `"serialization": {"custom": ...}`,
+whose layout is treated as unknown.
+
 | Tier | Meaning | Rules |
 |---|---|---|
-| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Instruction removed; duplicate instruction name; instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap); account changed at a fixed position; account removed mid-list; arg added, removed or changed; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed or changed, enum variant inserted mid-list, removed or renamed, variant payload changed, alias target changed, `serialization` or `repr` changed so that a field of a zero-copy type moves, including a nested type's `repr` (such as a converter dropping `bytemuckunsafe`) |
-| **Dangerous** | Existing positions and tags hold, but the parser must grow. Review. | Enum variant appended; account appended to an instruction; optional account removed from the tail; discriminator collision carried over; the set of account counts under a shared discriminator changed; `serialization` or `repr` changed with no field moving but the zero-copy size changing (trailing padding) |
+| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Instruction removed; duplicate instruction name; instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap); account moved to another position; account removed mid-list; arg added, removed, retyped or moved; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed, retyped or moved, enum variant inserted mid-list, removed or moved, variant payload changed, alias target changed, type removed while still referenced, `serialization` or `repr` changed so that a field of a zero-copy type moves, including a nested type's `repr` (such as a converter dropping `bytemuckunsafe`) |
+| **Dangerous** | Existing positions and tags hold, but the parser must grow or its names change. Review. | Enum variant appended; account appended to an instruction; optional account removed from the tail; account `writable`, `signer` or `optional` flag changed; a field, arg, account or variant renamed in place (same type, same position, and neither name used elsewhere on the other side, otherwise it moved); discriminator collision carried over; the set of account counts under a shared discriminator changed; `serialization` or `repr` changed with no field moving but the zero-copy size changing (trailing padding) |
 | **Additive** | New surface; old parsers are unaffected. | New instruction, account type or event type |
 | **Cosmetic** | No byte a parser reads changes. | Any of the layout changes above on an unreachable type; `serialization` or `repr` changed with no zero-copy field moving, or on a type only ever read as Borsh |
 
-Only Breaking sets the exit code.
+Only Breaking sets the exit code, unless `--fail-on` lowers the bar (`dangerous`, `additive`
+or `cosmetic`).
 
 Two rules follow Shipstern's dispatch: instructions that share a discriminator are told
 apart by account count, most first, so the same discriminator and count can't be resolved;
@@ -109,8 +118,8 @@ and a self-CPI event envelope that changes length (Anchor's 8-byte tag to Pinocc
 
 - **IDL against IDL only.** `idl-drift` can't see a program upgraded on chain without an IDL
   update. `idl-verify` covers that case by checking the IDL against real data.
-- **Types added to or removed from `types` are not reported.** A dangling reference left by
-  a removal goes unnoticed.
+- **Types added to `types` are not reported**, and a type removed from `types` is only
+  reported when something a parser reads still references it.
 
 ## Repo layout
 

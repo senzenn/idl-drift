@@ -8,7 +8,7 @@ use idl_drift::model::{
     Account, AccountItem, ArrayLen, Event, Field, Format, Instruction, Metadata, NamedDisc, Type,
     TypeDef, TypeDefTy,
 };
-use idl_drift::{diff, model::Idl, Severity};
+use idl_drift::{diff, model::Idl, ChangeKind, Severity};
 
 fn parse(s: &str) -> Idl {
     Idl::from_json(s).expect("fixture should deserialize")
@@ -689,6 +689,7 @@ fn idl_account(account: &str, types: Vec<TypeDef>) -> Idl {
             discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
             discriminator_offset: 0,
             size: None,
+            payload_offset: None,
         }],
         events: vec![],
         errors: vec![],
@@ -1411,4 +1412,211 @@ fn camel_case_matches_codama_on_acronyms() {
         panic!("single account")
     };
     assert_eq!(a.name, "poolState");
+}
+
+#[test]
+fn anchor_030_tuple_struct_with_object_typed_fields_parses() {
+    // Anchor writes tuple struct fields as bare types; `{"array":[..]}` is a type, not a field.
+    let idl = parse(
+        r#"{"address":"A","metadata":{"name":"t","version":"1","spec":"0.1.0"},
+            "types":[{"name":"Seed","type":{"kind":"struct","fields":[{"array":["u8",24]},"bool"]}}]}"#,
+    );
+    let TypeDefTy::Struct { fields } = &idl.types[0].ty else {
+        panic!("expected a struct");
+    };
+    assert_eq!(fields[0].name, "_0");
+    assert_eq!(
+        fields[0].ty,
+        Type::Array(Box::new(Type::U8), ArrayLen::Value(24))
+    );
+    assert_eq!(fields[1].ty, Type::Bool);
+}
+
+#[test]
+fn legacy_alias_kind_parses_as_a_type_alias() {
+    let idl = parse(
+        r#"{"version":"0.1.0","name":"legacy","metadata":null,
+            "instructions":[{"name":"noop","accounts":[],"args":[{"name":"c","type":{"defined":"Config"}}]}],
+            "types":[{"name":"Config","type":{"kind":"alias","value":{"defined":"Inner"}}},
+                     {"name":"Inner","type":{"kind":"struct","fields":[{"name":"x","type":"u8"}]}}]}"#,
+    );
+    assert_eq!(
+        idl.types[0].ty,
+        TypeDefTy::Type {
+            alias: Type::Defined {
+                name: "Inner".into(),
+                generics: vec![]
+            }
+        }
+    );
+}
+
+#[test]
+fn custom_serialization_parses_and_is_not_zero_copy() {
+    let idl = parse(
+        r#"{"address":"A","metadata":{"name":"t","version":"1","spec":"0.1.0"},
+            "types":[{"name":"Tick","serialization":{"custom":"market-tick-v1"},"repr":{"kind":"c"},
+                      "type":{"kind":"struct","fields":[{"name":"slot","type":"u64"}]}}]}"#,
+    );
+    assert_eq!(idl.types[0].serialization, "custom:market-tick-v1");
+    assert!(!idl.types[0].is_zero_copy());
+}
+
+const DANGLING_OLD: &str = r#"{
+  "address":"A","metadata":{"name":"d","version":"1","spec":"0.1.0"},
+  "instructions":[{"name":"set","discriminator":[1],"accounts":[],"args":[{"name":"c","type":{"defined":{"name":"Config"}}}]}],
+  "types":[{"name":"Config","type":{"kind":"struct","fields":[{"name":"x","type":"u8"}]}}]
+}"#;
+const DANGLING_NEW: &str = r#"{
+  "address":"A","metadata":{"name":"d","version":"1","spec":"0.1.0"},
+  "instructions":[{"name":"set","discriminator":[1],"accounts":[],"args":[{"name":"c","type":{"defined":{"name":"Config"}}}]}],
+  "types":[]
+}"#;
+
+#[test]
+fn removing_a_type_that_an_arg_still_references_is_breaking() {
+    let report = diff(&parse(DANGLING_OLD), &parse(DANGLING_NEW));
+    let msgs: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        msgs,
+        ["type removed while still referenced (Config): dangling reference"]
+    );
+    assert!(report.has_breaking());
+}
+
+#[test]
+fn a_reference_dangling_in_both_idls_is_not_a_change() {
+    assert_eq!(max_sev(DANGLING_NEW, DANGLING_NEW), None);
+}
+
+#[test]
+fn fails_at_applies_the_threshold() {
+    // Enum append is Dangerous: passes the default gate, fails a stricter one.
+    let report = diff(
+        &parse(&std::fs::read_to_string("fixtures/manual/03_enum_append_old.json").unwrap()),
+        &parse(&std::fs::read_to_string("fixtures/manual/03_enum_append_new.json").unwrap()),
+    );
+    assert!(!report.fails_at(Severity::Breaking));
+    assert!(report.fails_at(Severity::Dangerous));
+}
+
+fn kinds(old: &str, new: &str) -> Vec<(Severity, ChangeKind)> {
+    diff(&parse(old), &parse(new))
+        .changes
+        .iter()
+        .map(|c| (c.severity, c.kind))
+        .collect()
+}
+
+#[test]
+fn field_rename_with_same_type_is_dangerous() {
+    let renamed = AMM_OLD.replace(r#""name":"feeBps""#, r#""name":"tradeFeeBps""#);
+    assert_eq!(
+        kinds(AMM_OLD, &renamed),
+        [(Severity::Dangerous, ChangeKind::FieldRenamed)]
+    );
+}
+
+#[test]
+fn swapping_two_same_typed_fields_is_breaking() {
+    // Two renames whose names exist on the other side are a reorder: bytes change meaning.
+    let old = r#"{"address":"A","metadata":{"name":"s","version":"1","spec":"0.1.0"},
+      "accounts":[{"name":"P","discriminator":[1]}],
+      "types":[{"name":"P","type":{"kind":"struct","fields":[{"name":"a","type":"u64"},{"name":"b","type":"u64"}]}}]}"#;
+    let new = old.replace(
+        r#"{"name":"a","type":"u64"},{"name":"b","type":"u64"}"#,
+        r#"{"name":"b","type":"u64"},{"name":"a","type":"u64"}"#,
+    );
+    assert_eq!(
+        kinds(old, &new),
+        [
+            (Severity::Breaking, ChangeKind::FieldMoved),
+            (Severity::Breaking, ChangeKind::FieldMoved)
+        ]
+    );
+}
+
+#[test]
+fn account_flag_flip_at_same_position_is_dangerous() {
+    let new = AMM_OLD.replace(
+        r#"{"name":"user","signer":true}"#,
+        r#"{"name":"user","signer":true,"writable":true}"#,
+    );
+    assert_eq!(
+        kinds(AMM_OLD, &new),
+        [(Severity::Dangerous, ChangeKind::AccountFlagsChanged)]
+    );
+}
+
+#[test]
+fn account_rename_at_same_position_is_dangerous_but_a_swap_is_breaking() {
+    let renamed = AMM_OLD.replace(
+        r#"{"name":"user","signer":true}"#,
+        r#"{"name":"payer","signer":true}"#,
+    );
+    assert_eq!(
+        kinds(AMM_OLD, &renamed),
+        [(Severity::Dangerous, ChangeKind::AccountRenamed)]
+    );
+    let swapped = AMM_OLD.replace(
+        r#"[{"name":"pool","writable":true},{"name":"user","signer":true}]"#,
+        r#"[{"name":"user","signer":true},{"name":"pool","writable":true}]"#,
+    );
+    assert!(kinds(AMM_OLD, &swapped)
+        .iter()
+        .all(|k| *k == (Severity::Breaking, ChangeKind::AccountMoved)));
+}
+
+#[test]
+fn arg_rename_is_dangerous_and_arg_type_change_is_breaking() {
+    let renamed = AMM_OLD.replace(r#""name":"amountIn""#, r#""name":"amount""#);
+    assert_eq!(
+        kinds(AMM_OLD, &renamed),
+        [(Severity::Dangerous, ChangeKind::ArgRenamed)]
+    );
+    let widened = AMM_OLD.replace(
+        r#"{"name":"amountIn","type":"u64"}"#,
+        r#"{"name":"amountIn","type":"u128"}"#,
+    );
+    assert_eq!(
+        kinds(AMM_OLD, &widened),
+        [(Severity::Breaking, ChangeKind::ArgChanged)]
+    );
+}
+
+#[test]
+fn enum_variant_rename_is_dangerous() {
+    let renamed = ENUM_OLD.replace(r#""name":"Slow""#, r#""name":"Lazy""#);
+    assert_eq!(
+        kinds(ENUM_OLD, &renamed),
+        [(Severity::Dangerous, ChangeKind::VariantRenamed)]
+    );
+}
+
+#[test]
+fn change_serializes_with_kind_and_subject() {
+    let report = diff(&parse(AMM_OLD), &parse(AMM_NEW));
+    let field = report
+        .changes
+        .iter()
+        .find(|c| c.kind == ChangeKind::FieldChanged)
+        .expect("Pool.feeBps widened");
+    let json = serde_json::to_value(field).unwrap();
+    assert_eq!(json["severity"], "breaking");
+    assert_eq!(json["kind"], "field_changed");
+    assert_eq!(json["subject"], "Pool#1");
+}
+
+#[test]
+fn camel_case_splits_anchor_type_paths() {
+    // Anchor 0.30 names a foreign type by path; legacy IDLs flattened it. Both compare equal.
+    let path = r#"{"address":"A","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+      "accounts":[{"name":"Position","discriminator":[170,188,143,228,122,64,247,208]}],
+      "types":[{"name":"Position","type":{"kind":"struct","fields":[{"name":"r","type":{"defined":{"name":"whirlpool::state::position::PositionRewardInfo"}}}]}},
+               {"name":"whirlpool::state::position::PositionRewardInfo","type":{"kind":"struct","fields":[{"name":"x","type":"u8"}]}}]}"#;
+    let flat = r#"{"version":"1","name":"p","metadata":{"address":"A"},"instructions":[],
+      "accounts":[{"name":"Position","type":{"kind":"struct","fields":[{"name":"r","type":{"defined":"WhirlpoolStatePositionPositionRewardInfo"}}]}}],
+      "types":[{"name":"WhirlpoolStatePositionPositionRewardInfo","type":{"kind":"struct","fields":[{"name":"x","type":"u8"}]}}]}"#;
+    let report = diff(&parse(flat), &parse(path));
+    assert!(report.changes.is_empty(), "{:#?}", report.changes);
 }

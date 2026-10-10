@@ -9,9 +9,11 @@ use crate::layout::{self, LayoutError, Reading, TypeIndex};
 use crate::model::{
     AccountItem, ArrayLen, EnumFields, Field, Format, GenericArg, Idl, Type, TypeDef, TypeDefTy,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Cosmetic,
     Additive,
@@ -19,9 +21,65 @@ pub enum Severity {
     Breaking,
 }
 
-#[derive(Debug, Clone)]
+/// The rule a change came from. Stable names, so CI can allow-list one change by `kind`
+/// and `subject` instead of matching message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    InstructionAdded,
+    InstructionRemoved,
+    InstructionDuplicate,
+    DiscriminatorReused,
+    DiscriminatorChanged,
+    DiscriminatorOffsetChanged,
+    AccountMoved,
+    AccountRenamed,
+    AccountFlagsChanged,
+    AccountRemoved,
+    OptionalAccountRemoved,
+    AccountAdded,
+    ArgChanged,
+    ArgMoved,
+    ArgRenamed,
+    ArgRemoved,
+    ArgAdded,
+    Collision,
+    CollisionPreexisting,
+    DispatchOrderChanged,
+    AccountTypeAdded,
+    AccountTypeRemoved,
+    AccountDiscriminatorChanged,
+    AccountDiscriminatorOffsetChanged,
+    EventAdded,
+    EventRemoved,
+    EventDiscriminatorChanged,
+    EventEnvelopeChanged,
+    EventPayloadOffsetChanged,
+    EnumTagChanged,
+    AliasChanged,
+    TypeKindChanged,
+    TypeRemoved,
+    LayoutChanged,
+    FieldChanged,
+    FieldMoved,
+    FieldRenamed,
+    FieldAdded,
+    FieldRemoved,
+    VariantTagChanged,
+    VariantPayloadChanged,
+    VariantMoved,
+    VariantRenamed,
+    VariantAppended,
+    VariantInserted,
+    VariantRemoved,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Change {
     pub severity: Severity,
+    pub kind: ChangeKind,
+    /// What changed: an instruction, type or event name, with `#pos` for a positional item.
+    pub subject: String,
     pub message: String,
 }
 
@@ -31,9 +89,17 @@ pub struct Report {
 }
 
 impl Report {
-    fn push(&mut self, severity: Severity, message: impl Into<String>) {
+    fn push(
+        &mut self,
+        severity: Severity,
+        kind: ChangeKind,
+        subject: impl Into<String>,
+        message: impl Into<String>,
+    ) {
         self.changes.push(Change {
             severity,
+            kind,
+            subject: subject.into(),
             message: message.into(),
         });
     }
@@ -47,6 +113,11 @@ impl Report {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         i32::from(self.has_breaking())
+    }
+    /// `true` when any change is at `threshold` or above, for a stricter CI gate.
+    #[must_use]
+    pub fn fails_at(&self, threshold: Severity) -> bool {
+        self.changes.iter().any(|c| c.severity >= threshold)
     }
     #[must_use]
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -143,10 +214,17 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
                     .map(|oi| oi.name.as_str())
                     .collect();
                 if shared.is_empty() {
-                    r.push(Severity::Additive, format!("new instruction: {name}"));
+                    r.push(
+                        Severity::Additive,
+                        ChangeKind::InstructionAdded,
+                        *name,
+                        format!("new instruction: {name}"),
+                    );
                 } else {
                     r.push(
                         Severity::Breaking,
+                        ChangeKind::DiscriminatorReused,
+                        *name,
                         format!(
                             "new instruction {name} reuses discriminator {} of [{}]: parsers built from the old IDL route it there and misread its args",
                             disc_hex(&ni.discriminator),
@@ -160,21 +238,25 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
     }
     for name in old_ix.keys() {
         if !new_ix.contains_key(name) {
-            r.push(Severity::Breaking, format!("instruction removed: {name}"));
+            r.push(
+                Severity::Breaking,
+                ChangeKind::InstructionRemoved,
+                *name,
+                format!("instruction removed: {name}"),
+            );
         }
     }
 
     diff_discriminator_collisions(old, new, &mut r);
     // Account layouts live in `types`; here only the discriminators.
-    diff_named_disc("account", &old.accounts, &new.accounts, &mut r);
+    diff_account_types(&old.accounts, &new.accounts, &mut r);
     diff_events(&old.events, &new.events, &mut r);
     diff_types(old, new, &reached, &mut r);
 
     r
 }
 
-fn diff_named_disc(
-    kind: &str,
+fn diff_account_types(
     old: &[crate::model::NamedDisc],
     new: &[crate::model::NamedDisc],
     r: &mut Report,
@@ -183,22 +265,34 @@ fn diff_named_disc(
     let nm: BTreeMap<_, _> = new.iter().map(|a| (&a.name, a)).collect();
     for (name, na) in &nm {
         match om.get(name) {
-            None => r.push(Severity::Additive, format!("new {kind} type: {name}")),
+            None => r.push(
+                Severity::Additive,
+                ChangeKind::AccountTypeAdded,
+                *name,
+                format!("new account type: {name}"),
+            ),
             Some(oa) if oa.discriminator != na.discriminator => {
                 let msg = if oa.discriminator.len() == na.discriminator.len() {
-                    format!("{kind} discriminator changed ({name})")
+                    format!("account discriminator changed ({name})")
                 } else {
                     format!(
-                        "{kind} discriminator LENGTH changed ({name}): {}->{} bytes (scheme swap, e.g. Anchor<->Quasar)",
+                        "account discriminator LENGTH changed ({name}): {}->{} bytes (scheme swap, e.g. Anchor<->Quasar)",
                         oa.discriminator.len(), na.discriminator.len()
                     )
                 };
-                r.push(Severity::Breaking, msg);
+                r.push(
+                    Severity::Breaking,
+                    ChangeKind::AccountDiscriminatorChanged,
+                    *name,
+                    msg,
+                );
             }
             Some(oa) if oa.discriminator_offset != na.discriminator_offset => r.push(
                 Severity::Breaking,
+                ChangeKind::AccountDiscriminatorOffsetChanged,
+                *name,
                 format!(
-                    "{kind} discriminator offset changed ({name}): {} -> {}",
+                    "account discriminator offset changed ({name}): {} -> {}",
                     oa.discriminator_offset, na.discriminator_offset
                 ),
             ),
@@ -207,7 +301,12 @@ fn diff_named_disc(
     }
     for name in om.keys() {
         if !nm.contains_key(name) {
-            r.push(Severity::Breaking, format!("{kind} type removed: {name}"));
+            r.push(
+                Severity::Breaking,
+                ChangeKind::AccountTypeRemoved,
+                *name,
+                format!("account type removed: {name}"),
+            );
         }
     }
 }
@@ -219,7 +318,12 @@ fn diff_events(old: &[crate::model::Event], new: &[crate::model::Event], r: &mut
     let nm: BTreeMap<_, _> = new.iter().map(|e| (&e.name, e)).collect();
     for (name, ne) in &nm {
         match om.get(name) {
-            None => r.push(Severity::Additive, format!("new event type: {name}")),
+            None => r.push(
+                Severity::Additive,
+                ChangeKind::EventAdded,
+                *name,
+                format!("new event type: {name}"),
+            ),
             Some(oe) => {
                 if oe.discriminator != ne.discriminator {
                     let msg = if oe.discriminator.len() == ne.discriminator.len() {
@@ -231,7 +335,12 @@ fn diff_events(old: &[crate::model::Event], new: &[crate::model::Event], r: &mut
                             ne.discriminator.len()
                         )
                     };
-                    r.push(Severity::Breaking, msg);
+                    r.push(
+                        Severity::Breaking,
+                        ChangeKind::EventDiscriminatorChanged,
+                        *name,
+                        msg,
+                    );
                 }
                 diff_event_envelope(name, oe, ne, r);
             }
@@ -239,7 +348,12 @@ fn diff_events(old: &[crate::model::Event], new: &[crate::model::Event], r: &mut
     }
     for name in om.keys() {
         if !nm.contains_key(name) {
-            r.push(Severity::Breaking, format!("event type removed: {name}"));
+            r.push(
+                Severity::Breaking,
+                ChangeKind::EventRemoved,
+                *name,
+                format!("event type removed: {name}"),
+            );
         }
     }
 }
@@ -258,6 +372,8 @@ fn diff_event_envelope(
         match (oe.envelope_payload_offset, ne.envelope_payload_offset) {
             (Some(o), Some(n)) if o != n => r.push(
                 Severity::Breaking,
+                ChangeKind::EventPayloadOffsetChanged,
+                name,
                 format!(
                     "event envelope payload offset changed ({name}): {o}->{n} (self-CPI parse starts elsewhere)"
                 ),
@@ -276,11 +392,18 @@ fn diff_event_envelope(
                 new_env.len()
             )
         };
-        r.push(Severity::Breaking, msg);
+        r.push(
+            Severity::Breaking,
+            ChangeKind::EventEnvelopeChanged,
+            name,
+            msg,
+        );
     }
     match (oe.effective_payload_offset(), ne.effective_payload_offset()) {
         (Some(o), Some(n)) if o != n => r.push(
             Severity::Breaking,
+            ChangeKind::EventPayloadOffsetChanged,
+            name,
             format!(
                 "event envelope payload offset changed ({name}): {o}->{n} (self-CPI parse starts elsewhere)"
             ),
@@ -294,77 +417,171 @@ fn diff_instruction(
     ni: &crate::model::Instruction,
     r: &mut Report,
 ) {
+    let ix = oi.name.as_str();
     if oi.discriminator != ni.discriminator {
         let msg = if oi.discriminator.len() == ni.discriminator.len() {
-            format!("discriminator changed ({})", oi.name)
+            format!("discriminator changed ({ix})")
         } else {
             format!(
-                "discriminator LENGTH changed ({}): {}->{} bytes (scheme swap)",
-                oi.name,
+                "discriminator LENGTH changed ({ix}): {}->{} bytes (scheme swap)",
                 oi.discriminator.len(),
                 ni.discriminator.len()
             )
         };
-        r.push(Severity::Breaking, msg);
+        r.push(
+            Severity::Breaking,
+            ChangeKind::DiscriminatorChanged,
+            ix,
+            msg,
+        );
     }
     if oi.discriminator_offset != ni.discriminator_offset {
         r.push(
             Severity::Breaking,
+            ChangeKind::DiscriminatorOffsetChanged,
+            ix,
             format!(
-                "discriminator offset changed ({}): {} -> {}",
-                oi.name, oi.discriminator_offset, ni.discriminator_offset
+                "discriminator offset changed ({ix}): {} -> {}",
+                oi.discriminator_offset, ni.discriminator_offset
             ),
         );
     }
 
     // Parsers read accounts by position, so compare the flattened lists index by index.
-    let ofa = flatten_accounts(&oi.accounts);
-    let nfa = flatten_accounts(&ni.accounts);
-    // Dropping only optional accounts off the end keeps every required position.
-    let removed_all_optional = ofa.iter().skip(nfa.len()).all(|a| a.optional);
-    let max = ofa.len().max(nfa.len());
-    for pos in 0..max {
-        match (ofa.get(pos), nfa.get(pos)) {
-            (Some(o), Some(n)) if o != n => r.push(
-                Severity::Breaking,
-                format!("account changed at fixed position ({}#{pos}): {o} -> {n}", oi.name),
-            ),
-            (Some(_), None) => {
-                if removed_all_optional {
-                    r.push(Severity::Dangerous, format!(
-                        "optional account removed from tail ({}#{pos}): required positions unchanged", oi.name));
-                } else {
-                    r.push(Severity::Breaking, format!(
-                        "account removed from instruction ({}#{pos}): positions shift", oi.name));
-                }
-            }
-            (None, Some(_)) => r.push(
-                Severity::Dangerous,
-                format!("new account on instruction ({}#{pos}): shifts count/positions -> check_min_accounts_req expects more", oi.name),
-            ),
-            _ => {}
-        }
-    }
+    diff_accounts(
+        ix,
+        &flatten_accounts(&oi.accounts),
+        &flatten_accounts(&ni.accounts),
+        r,
+    );
 
     // Any arg change moves every later byte.
     let max_a = oi.args.len().max(ni.args.len());
     for pos in 0..max_a {
+        let subject = format!("{ix}#{pos}");
         match (oi.args.get(pos), ni.args.get(pos)) {
-            (Some(o), Some(n)) if o != n => r.push(
-                Severity::Breaking,
-                format!("arg changed ({}#{pos}): {}", oi.name, field_change(o, n)),
-            ),
+            (Some(o), Some(n)) if o != n => {
+                let edit = field_edit(&oi.args, &ni.args, o, n);
+                let kind = match edit {
+                    FieldEdit::Changed => ChangeKind::ArgChanged,
+                    FieldEdit::Moved => ChangeKind::ArgMoved,
+                    FieldEdit::Renamed => ChangeKind::ArgRenamed,
+                };
+                r.push(
+                    edit.severity(),
+                    kind,
+                    subject,
+                    format!("arg changed ({ix}#{pos}): {}", field_change(o, n)),
+                );
+            }
             (Some(o), None) => r.push(
                 Severity::Breaking,
-                format!("arg removed ({}#{pos}): {}", oi.name, field_str(o)),
+                ChangeKind::ArgRemoved,
+                subject,
+                format!("arg removed ({ix}#{pos}): {}", field_str(o)),
             ),
             (None, Some(n)) => r.push(
                 Severity::Breaking,
+                ChangeKind::ArgAdded,
+                subject,
                 format!(
-                    "new arg ({}#{pos}): {} (Borsh layout grows)",
-                    oi.name,
+                    "new arg ({ix}#{pos}): {} (Borsh layout grows)",
                     field_str(n)
                 ),
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// How a field at a fixed position changed.
+#[derive(Debug, Clone, Copy)]
+enum FieldEdit {
+    /// The type changed, so the bytes at this position mean something else.
+    Changed,
+    /// Same type, but one of the names holds another position on the other side: the
+    /// parser now reads the wrong bytes under that name.
+    Moved,
+    /// Same type and a fresh name: the bytes are the same, only the generated name differs.
+    Renamed,
+}
+
+impl FieldEdit {
+    fn severity(self) -> Severity {
+        match self {
+            Self::Changed | Self::Moved => Severity::Breaking,
+            Self::Renamed => Severity::Dangerous,
+        }
+    }
+}
+
+fn field_edit(old_list: &[Field], new_list: &[Field], o: &Field, n: &Field) -> FieldEdit {
+    if o.ty != n.ty {
+        FieldEdit::Changed
+    } else if old_list.iter().any(|f| f.name == n.name) || new_list.iter().any(|f| f.name == o.name)
+    {
+        FieldEdit::Moved
+    } else {
+        FieldEdit::Renamed
+    }
+}
+
+fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
+    // Dropping only optional accounts off the end keeps every required position.
+    let removed_all_optional = ofa.iter().skip(nfa.len()).all(|a| a.optional);
+    let max = ofa.len().max(nfa.len());
+    for pos in 0..max {
+        let subject = format!("{ix}#{pos}");
+        match (ofa.get(pos), nfa.get(pos)) {
+            (Some(o), Some(n)) if o.name != n.name => {
+                // Either name at another position on the other side means the account
+                // moved, so the parser reads the wrong one. Fresh names are only a rename.
+                let moved = ofa.iter().any(|a| a.name == n.name)
+                    || nfa.iter().any(|a| a.name == o.name);
+                if moved {
+                    r.push(
+                        Severity::Breaking,
+                        ChangeKind::AccountMoved,
+                        subject,
+                        format!("account changed at fixed position ({ix}#{pos}): {o} -> {n}"),
+                    );
+                } else {
+                    r.push(
+                        Severity::Dangerous,
+                        ChangeKind::AccountRenamed,
+                        subject,
+                        format!("account renamed at fixed position ({ix}#{pos}): {o} -> {n} (same position, generated field name changes)"),
+                    );
+                }
+            }
+            (Some(o), Some(n)) if o != n => r.push(
+                Severity::Dangerous,
+                ChangeKind::AccountFlagsChanged,
+                subject,
+                format!("account flags changed ({ix}#{pos}): {o} -> {n} (position unchanged, parsers don't read flags)"),
+            ),
+            (Some(_), None) => {
+                if removed_all_optional {
+                    r.push(
+                        Severity::Dangerous,
+                        ChangeKind::OptionalAccountRemoved,
+                        subject,
+                        format!("optional account removed from tail ({ix}#{pos}): required positions unchanged"),
+                    );
+                } else {
+                    r.push(
+                        Severity::Breaking,
+                        ChangeKind::AccountRemoved,
+                        subject,
+                        format!("account removed from instruction ({ix}#{pos}): positions shift"),
+                    );
+                }
+            }
+            (None, Some(_)) => r.push(
+                Severity::Dangerous,
+                ChangeKind::AccountAdded,
+                subject,
+                format!("new account on instruction ({ix}#{pos}): shifts count/positions -> check_min_accounts_req expects more"),
             ),
             _ => {}
         }
@@ -433,6 +650,8 @@ fn diff_discriminator_collisions(old: &Idl, new: &Idl, r: &mut Report) {
         if preexisting {
             r.push(
                 Severity::Dangerous,
+                ChangeKind::CollisionPreexisting,
+                &hex,
                 format!(
                     "pre-existing collision on discriminator {hex} with {count} accounts: [{name_list}]"
                 ),
@@ -440,6 +659,8 @@ fn diff_discriminator_collisions(old: &Idl, new: &Idl, r: &mut Report) {
         } else {
             r.push(
                 Severity::Breaking,
+                ChangeKind::Collision,
+                &hex,
                 format!(
                     "unresolvable collision on discriminator {hex} with {count} accounts: [{name_list}]"
                 ),
@@ -466,6 +687,8 @@ fn diff_discriminator_collisions(old: &Idl, new: &Idl, r: &mut Report) {
             let new_list = counts_list(new_set);
             r.push(
                 Severity::Dangerous,
+                ChangeKind::DispatchOrderChanged,
+                &hex,
                 format!(
                     "disambiguation order changed for discriminator {hex}: account counts {{{old_list}}} -> {{{new_list}}}"
                 ),
@@ -556,6 +779,8 @@ fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) 
                     if is_reached {
                         r.push(
                             Severity::Breaking,
+                            ChangeKind::EnumTagChanged,
+                            name.as_str(),
                             format!(
                                 "enum tag width changed ({name}): {} -> {} (every variant tag is read differently)",
                                 show(otag),
@@ -565,6 +790,8 @@ fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) 
                     } else {
                         r.push(
                             Severity::Cosmetic,
+                            ChangeKind::EnumTagChanged,
+                            name.as_str(),
                             format!("enum tag changed in UNREACHED type ({name})"),
                         );
                     }
@@ -576,6 +803,8 @@ fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) 
                 if is_reached {
                     r.push(
                         Severity::Breaking,
+                        ChangeKind::AliasChanged,
+                        name.as_str(),
                         format!(
                             "type alias target changed ({name}): {} -> {} (Borsh layout)",
                             tystr(oa),
@@ -585,14 +814,33 @@ fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) 
                 } else {
                     r.push(
                         Severity::Cosmetic,
+                        ChangeKind::AliasChanged,
+                        name.as_str(),
                         format!("alias changed in UNREACHED type ({name})"),
                     );
                 }
             }
             (a, b) if std::mem::discriminant(a) != std::mem::discriminant(b) => {
-                r.push(Severity::Breaking, format!("type kind changed ({name})"));
+                r.push(
+                    Severity::Breaking,
+                    ChangeKind::TypeKindChanged,
+                    name.as_str(),
+                    format!("type kind changed ({name})"),
+                );
             }
             _ => {}
+        }
+    }
+    // A type dropped from `types` while a parser still reaches it leaves a dangling
+    // reference: no parser can be generated. A reference dangling in both IDLs is not a change.
+    for name in reached {
+        if om.contains_key(name) && !nm.contains_key(name) {
+            r.push(
+                Severity::Breaking,
+                ChangeKind::TypeRemoved,
+                name,
+                format!("type removed while still referenced ({name}): dangling reference"),
+            );
         }
     }
 }
@@ -625,7 +873,12 @@ fn diff_layout_attrs(
         ),
     };
     if !reached.contains(name) {
-        r.push(Severity::Cosmetic, format!("{what} in an UNREACHED type"));
+        r.push(
+            Severity::Cosmetic,
+            ChangeKind::LayoutChanged,
+            name,
+            format!("{what} in an UNREACHED type"),
+        );
         return;
     }
     let mut hybrid = old.clone();
@@ -663,7 +916,12 @@ fn diff_layout_attrs(
         LayoutEffect::Size => (Severity::Dangerous, worst.1),
         LayoutEffect::Moves => (Severity::Breaking, worst.1),
     };
-    r.push(severity, format!("{what}: {detail}"));
+    r.push(
+        severity,
+        ChangeKind::LayoutChanged,
+        name,
+        format!("{what}: {detail}"),
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -753,34 +1011,44 @@ fn contains(index: &TypeIndex<'_>, td: &TypeDef, target: &str, depth: usize) -> 
 fn diff_fields(ty: &str, of: &[Field], nf: &[Field], reached: bool, r: &mut Report) {
     let max = of.len().max(nf.len());
     for pos in 0..max {
-        match (of.get(pos), nf.get(pos)) {
+        let (severity, kind, change) = match (of.get(pos), nf.get(pos)) {
             (Some(o), Some(n)) if o != n => {
-                classify_field(ty, pos, &field_change(o, n), reached, r);
+                let edit = field_edit(of, nf, o, n);
+                let kind = match edit {
+                    FieldEdit::Changed => ChangeKind::FieldChanged,
+                    FieldEdit::Moved => ChangeKind::FieldMoved,
+                    FieldEdit::Renamed => ChangeKind::FieldRenamed,
+                };
+                (edit.severity(), kind, field_change(o, n))
             }
-            (Some(o), None) => {
-                let change = format!("{} removed (Borsh layout)", field_str(o));
-                classify_field(ty, pos, &change, reached, r);
-            }
-            (None, Some(n)) => {
-                let change = format!("{} added (Borsh layout)", field_str(n));
-                classify_field(ty, pos, &change, reached, r);
-            }
-            _ => {}
+            (Some(o), None) => (
+                Severity::Breaking,
+                ChangeKind::FieldRemoved,
+                format!("{} removed (Borsh layout)", field_str(o)),
+            ),
+            (None, Some(n)) => (
+                Severity::Breaking,
+                ChangeKind::FieldAdded,
+                format!("{} added (Borsh layout)", field_str(n)),
+            ),
+            _ => continue,
+        };
+        let subject = format!("{ty}#{pos}");
+        if reached {
+            r.push(
+                severity,
+                kind,
+                subject,
+                format!("FIELD changed ({ty}#{pos}) via reachable type: {change}"),
+            );
+        } else {
+            r.push(
+                Severity::Cosmetic,
+                kind,
+                subject,
+                format!("field changed in UNREACHED type ({ty}#{pos}): dead code"),
+            );
         }
-    }
-}
-
-fn classify_field(ty: &str, pos: usize, change: &str, reached: bool, r: &mut Report) {
-    if reached {
-        r.push(
-            Severity::Breaking,
-            format!("FIELD changed ({ty}#{pos}) via reachable type: {change}"),
-        );
-    } else {
-        r.push(
-            Severity::Cosmetic,
-            format!("field changed in UNREACHED type ({ty}#{pos}): dead code"),
-        );
     }
 }
 
@@ -794,78 +1062,80 @@ fn diff_variants(
     let old_max = ov.len().saturating_sub(1);
     let max = ov.len().max(nv.len());
     for pos in 0..max {
-        match (ov.get(pos), nv.get(pos)) {
-            (Some(o), Some(n)) if o.name == n.name && o.tag(pos) != n.tag(pos) => {
-                if reached {
-                    r.push(
-                        Severity::Breaking,
-                        format!(
-                            "enum variant tag value changed ({ty}#{pos} {}): {} -> {}",
-                            o.name,
-                            o.tag(pos),
-                            n.tag(pos)
-                        ),
-                    );
-                } else {
-                    r.push(
-                        Severity::Cosmetic,
-                        format!("variant tag changed in UNREACHED enum ({ty}#{pos})"),
-                    );
-                }
-            }
-            (Some(o), Some(n)) if o.name == n.name && !same_payload(&o.fields, &n.fields) => {
-                if reached {
-                    r.push(
-                        Severity::Breaking,
-                        format!(
-                            "enum variant payload changed ({ty}#{pos} {}): {} -> {} (Borsh layout)",
-                            o.name,
-                            payload_str(&o.fields),
-                            payload_str(&n.fields)
-                        ),
-                    );
-                } else {
-                    r.push(
-                        Severity::Cosmetic,
-                        format!("variant payload changed in UNREACHED enum ({ty}#{pos})"),
-                    );
-                }
-            }
+        let (severity, kind, message) = match (ov.get(pos), nv.get(pos)) {
+            (Some(o), Some(n)) if o.name == n.name && o.tag(pos) != n.tag(pos) => (
+                Severity::Breaking,
+                ChangeKind::VariantTagChanged,
+                format!(
+                    "enum variant tag value changed ({ty}#{pos} {}): {} -> {}",
+                    o.name,
+                    o.tag(pos),
+                    n.tag(pos)
+                ),
+            ),
+            (Some(o), Some(n)) if o.name == n.name && !same_payload(&o.fields, &n.fields) => (
+                Severity::Breaking,
+                ChangeKind::VariantPayloadChanged,
+                format!(
+                    "enum variant payload changed ({ty}#{pos} {}): {} -> {} (Borsh layout)",
+                    o.name,
+                    payload_str(&o.fields),
+                    payload_str(&n.fields)
+                ),
+            ),
+            // Either name at another index on the other side means the tag now selects a
+            // different variant. A fresh name with the same payload is a rename.
             (Some(o), Some(n)) if o.name != n.name => {
-                if reached {
-                    r.push(
+                let moved = ov.iter().any(|v| v.name == n.name)
+                    || nv.iter().any(|v| v.name == o.name)
+                    || !same_payload(&o.fields, &n.fields);
+                if moved {
+                    (
                         Severity::Breaking,
+                        ChangeKind::VariantMoved,
                         format!(
                             "enum variant changed at index ({ty}#{pos}): {} -> {} (tag reassigned)",
                             o.name, n.name
                         ),
-                    );
+                    )
                 } else {
-                    r.push(
-                        Severity::Cosmetic,
-                        format!("variant changed in UNREACHED enum ({ty}#{pos})"),
-                    );
+                    (
+                        Severity::Dangerous,
+                        ChangeKind::VariantRenamed,
+                        format!(
+                            "enum variant renamed ({ty}#{pos}): {} -> {} (same tag and payload)",
+                            o.name, n.name
+                        ),
+                    )
                 }
             }
-            (None, Some(_)) => {
-                if !reached {
-                    r.push(
-                        Severity::Cosmetic,
-                        format!("variant added to UNREACHED enum ({ty}#{pos})"),
-                    );
-                } else if pos > old_max {
-                    r.push(Severity::Dangerous, format!("enum variant APPENDED ({ty}#{pos}): existing tags unchanged, parser must handle new variant"));
-                } else {
-                    r.push(Severity::Breaking, format!("enum variant INSERTED at non-terminal index ({ty}#{pos}): shifts later tags"));
-                }
-            }
-            (Some(_), None) if reached => {
-                r.push(
-                    Severity::Breaking,
-                    format!("enum variant removed ({ty}#{pos}): shifts later tags"),
-                );
-            }
-            _ => {}
+            (None, Some(_)) if pos > old_max => (
+                Severity::Dangerous,
+                ChangeKind::VariantAppended,
+                format!("enum variant APPENDED ({ty}#{pos}): existing tags unchanged, parser must handle new variant"),
+            ),
+            (None, Some(_)) => (
+                Severity::Breaking,
+                ChangeKind::VariantInserted,
+                format!("enum variant INSERTED at non-terminal index ({ty}#{pos}): shifts later tags"),
+            ),
+            (Some(_), None) => (
+                Severity::Breaking,
+                ChangeKind::VariantRemoved,
+                format!("enum variant removed ({ty}#{pos}): shifts later tags"),
+            ),
+            _ => continue,
+        };
+        let subject = format!("{ty}#{pos}");
+        if reached {
+            r.push(severity, kind, subject, message);
+        } else {
+            r.push(
+                Severity::Cosmetic,
+                kind,
+                subject,
+                format!("variant changed in UNREACHED enum ({ty}#{pos})"),
+            );
         }
     }
 }
@@ -958,6 +1228,8 @@ fn report_duplicate_names(instructions: &[crate::model::Instruction], r: &mut Re
         if count > 1 {
             r.push(
                 Severity::Breaking,
+                ChangeKind::InstructionDuplicate,
+                name,
                 format!("duplicate instruction name '{name}' appears {count}x: the IDL is ambiguous and matching is unreliable"),
             );
         }

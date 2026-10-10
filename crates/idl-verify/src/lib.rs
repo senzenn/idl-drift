@@ -21,6 +21,7 @@ mod error;
 pub use idl_drift::layout;
 mod reference;
 pub mod report;
+pub mod rpc;
 mod samples;
 mod verify;
 

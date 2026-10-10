@@ -27,4 +27,8 @@ pub enum Error {
     ReferenceJson(serde_json::Error),
     #[error("reference file does not match the samples: {0}")]
     ReferenceMismatch(String),
+    #[error("unexpected RPC response: {0}")]
+    RpcResponse(String),
+    #[error("RPC request failed: {0}")]
+    Rpc(String),
 }

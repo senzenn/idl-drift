@@ -35,6 +35,7 @@ pub fn from_codama(root: RootNode) -> Idl {
                 discriminator: disc,
                 discriminator_offset: offset,
                 size: a.size.and_then(|n| usize::try_from(n).ok()),
+                payload_offset: numeric_constant_discriminator(a).then_some(0),
             }
         })
         .collect();
@@ -370,6 +371,15 @@ fn extract_ix_discriminator(ix: &InstructionNode) -> (Discriminator, usize) {
             _ => None,
         }
     })
+}
+
+/// A numeric constant discriminator is a check on a byte the body re-reads as its first
+/// field, so Shipstern's account parser decodes from offset 0 (SPL Governance's `accountType`).
+fn numeric_constant_discriminator(a: &AccountNode) -> bool {
+    matches!(
+        a.discriminators.first(),
+        Some(DiscriminatorNode::Constant(c)) if matches!(c.constant.value.as_ref(), ValueNode::Number(_))
+    )
 }
 
 fn extract_account_discriminator(a: &AccountNode) -> (Discriminator, usize) {

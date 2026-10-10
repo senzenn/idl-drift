@@ -63,11 +63,15 @@ for entry in \
   IFS='|' read -r name want <<<"$entry"
   expect "$name" "$want" "$DRIFT" diff "fixtures/manual/${name}_old.json" "fixtures/manual/${name}_new.json"
 done
+# A stricter gate: enum append is Dangerous, so it fails only under --fail-on dangerous.
+expect "03_enum_append --fail-on dangerous" 1 "$DRIFT" diff --fail-on dangerous fixtures/manual/03_enum_append_old.json fixtures/manual/03_enum_append_new.json
 # Malformed input must exit 2, not panic.
 for name in 90_broken_json 91_missing_field; do
   expect "$name" 2 "$DRIFT" diff "fixtures/manual/${name}_old.json" fixtures/manual/00_identical_new.json
 done
 
+# A real upgrade: the legacy pump.fun IDL against the on-chain 0.30 one.
+expect "real pair pump_fun legacy -> 0.30" 1 "$DRIFT" diff shipstern-integration/idls/pump_fun.json fixtures/real/pump_fun_onchain.json
 # The same program as legacy Anchor and as Codama: names and discriminators must line up.
 expect "cross-format limit_order_v1" 0 "$DRIFT" diff fixtures/real/limit_order_v1_onchain.json tests/idls/limit_order_v1.json
 

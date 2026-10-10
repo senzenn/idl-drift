@@ -2,9 +2,9 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use idl_drift::model::Idl;
-use idl_drift::{coverage, diff, CoverageReport, Report, Severity};
+use idl_drift::{coverage, diff, Change, CoverageReport, Report, Severity};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
@@ -12,8 +12,8 @@ use serde::Serialize;
 #[derive(Parser)]
 #[command(name = "idl-drift", version, about)]
 #[command(after_help = "Exit codes:
-  0  diff: no Breaking change; inspect: every field resolved
-  1  diff: at least one Breaking change; inspect: unmapped fields
+  0  diff: no change at or above --fail-on; inspect: every field resolved
+  1  diff: at least one change at or above --fail-on; inspect: unmapped fields
   2  a file could not be read or parsed")]
 struct Cli {
     #[command(subcommand)]
@@ -31,6 +31,9 @@ enum Cmd {
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Lowest tier that sets exit code 1.
+        #[arg(long, value_enum, default_value_t = Tier::Breaking)]
+        fail_on: Tier,
     },
     /// Report fields whose byte layout could not be resolved.
     Inspect {
@@ -39,9 +42,34 @@ enum Cmd {
     },
 }
 
+/// `Severity` as a CLI value; the lib enum stays free of clap.
+#[derive(Clone, Copy, ValueEnum)]
+enum Tier {
+    Breaking,
+    Dangerous,
+    Additive,
+    Cosmetic,
+}
+
+impl From<Tier> for Severity {
+    fn from(tier: Tier) -> Self {
+        match tier {
+            Tier::Breaking => Self::Breaking,
+            Tier::Dangerous => Self::Dangerous,
+            Tier::Additive => Self::Additive,
+            Tier::Cosmetic => Self::Cosmetic,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let result = match Cli::parse().cmd {
-        Cmd::Diff { old, new, json } => run_diff(&old, &new, json),
+        Cmd::Diff {
+            old,
+            new,
+            json,
+            fail_on,
+        } => run_diff(&old, &new, json, fail_on.into()),
         Cmd::Inspect { idl } => run_inspect(&idl),
     };
     match result {
@@ -58,15 +86,16 @@ fn load(path: &Path) -> Result<Idl, String> {
     Idl::from_json(&src).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
-fn run_diff(old: &Path, new: &Path, json: bool) -> Result<u8, String> {
+fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8, String> {
     let report = diff(&load(old)?, &load(new)?);
+    let code = u8::from(report.fails_at(fail_on));
     let written = if json {
-        print_json(&report)
+        print_json(&report, code)
     } else {
-        print_human(&report)
+        print_human(&report, code)
     };
     written.map_err(|e| format!("write report: {e}"))?;
-    Ok(u8::from(report.has_breaking()))
+    Ok(code)
 }
 
 fn run_inspect(path: &Path) -> Result<u8, String> {
@@ -96,7 +125,7 @@ const TIERS: [(Severity, &str); 4] = [
     (Severity::Cosmetic, "COSMETIC"),
 ];
 
-fn print_human(report: &Report) -> io::Result<()> {
+fn print_human(report: &Report, exit_code: u8) -> io::Result<()> {
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = io::stdout().lock();
     for (severity, tag) in TIERS {
@@ -114,7 +143,7 @@ fn print_human(report: &Report) -> io::Result<()> {
         out,
         "summary: {b} breaking, {d} dangerous, {a} additive, {c} cosmetic"
     )?;
-    writeln!(out, "exit code: {}", report.exit_code())
+    writeln!(out, "exit code: {exit_code}")
 }
 
 fn paint(tag: &str, severity: Severity, color: bool) -> String {
@@ -131,12 +160,14 @@ fn paint(tag: &str, severity: Severity, color: bool) -> String {
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
+    /// Every change with its rule (`kind`) and `subject`, for allow-lists in CI.
+    changes: &'a [Change],
     breaking: Vec<&'a str>,
     dangerous: Vec<&'a str>,
     additive: Vec<&'a str>,
     cosmetic: Vec<&'a str>,
     counts: JsonCounts,
-    exit_code: i32,
+    exit_code: u8,
 }
 
 #[derive(Serialize)]
@@ -147,7 +178,7 @@ struct JsonCounts {
     cosmetic: usize,
 }
 
-fn print_json(report: &Report) -> io::Result<()> {
+fn print_json(report: &Report, exit_code: u8) -> io::Result<()> {
     let messages = |severity| {
         report
             .changes
@@ -158,6 +189,7 @@ fn print_json(report: &Report) -> io::Result<()> {
     };
     let (breaking, dangerous, additive, cosmetic) = report.counts();
     let view = JsonReport {
+        changes: &report.changes,
         breaking: messages(Severity::Breaking),
         dangerous: messages(Severity::Dangerous),
         additive: messages(Severity::Additive),
@@ -168,7 +200,7 @@ fn print_json(report: &Report) -> io::Result<()> {
             additive,
             cosmetic,
         },
-        exit_code: report.exit_code(),
+        exit_code,
     };
     let text = serde_json::to_string_pretty(&view).map_err(io::Error::other)?;
     writeln!(io::stdout().lock(), "{text}")
