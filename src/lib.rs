@@ -20,4 +20,4 @@ pub mod layout;
 pub mod model;
 
 pub use diff::{diff, Change, ChangeKind, Report, Severity};
-pub use inspect::{coverage, CoverageReport, UnmappedField};
+pub use inspect::{coverage, layouts, CoverageReport, TypeLayout, UnmappedField};

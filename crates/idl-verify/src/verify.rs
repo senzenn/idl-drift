@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use idl_drift::model::{Account, AccountItem, Idl, Instruction, NamedDisc, Type, TypeDef};
 
 use crate::decode::{DecodeError, Decoder, Value};
-use crate::layout::{StructLayout, TypeIndex};
+use crate::layout::{Reading, StructLayout, TypeIndex};
 use crate::reference::{first_difference, normalize, to_json, Outcome, Reference};
 use crate::report::{
     AccountSummary, Check, Coverage, Finding, InstructionSummary, ProgramInfo, Range,
@@ -123,16 +123,44 @@ impl Verifier<'_> {
                 .map(|a| (a.discriminator_offset, a.discriminator.as_slice())),
         );
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); idl.accounts.len()];
+        let sized = self.sized_account_types();
+        let by_size = table.is_empty() && !sized.is_empty();
+        // Key: the head of the error message, so each kind of miss groups on its own.
         let mut unknown: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (i, sample) in self.samples.accounts.iter().enumerate() {
-            match longest_match(&table, &sample.data) {
-                Some(matches) => groups[matches[0]].push(i),
-                None => unknown.entry(prefix_hex(&sample.data)).or_default().push(i),
+            if let Some(matches) = longest_match(&table, &sample.data) {
+                groups[matches[0]].push(i);
+                continue;
             }
+            let len = sample.data.len();
+            let fits: Vec<usize> = sized
+                .iter()
+                .filter(|(_, size)| *size == len)
+                .map(|(t, _)| *t)
+                .collect();
+            let key = match fits.as_slice() {
+                [t] => {
+                    groups[*t].push(i);
+                    continue;
+                }
+                [] if by_size => format!("{len}-byte data matches no account type size"),
+                [] => format!(
+                    "{} matches no account discriminator in the IDL",
+                    prefix_hex(&sample.data)
+                ),
+                many => {
+                    let names: Vec<&str> = many
+                        .iter()
+                        .map(|t| idl.accounts[*t].name.as_str())
+                        .collect();
+                    format!("{len}-byte data fits {} alike", names.join(" and "))
+                }
+            };
+            unknown.entry(key).or_default().push(i);
         }
 
         let unknown_count: usize = unknown.values().map(Vec::len).sum();
-        if table.is_empty() && !idl.accounts.is_empty() && unknown_count > 0 {
+        if table.is_empty() && sized.is_empty() && !idl.accounts.is_empty() && unknown_count > 0 {
             self.push(
                 Severity::Error,
                 Check::Discriminator,
@@ -140,22 +168,34 @@ impl Verifier<'_> {
                 format!(
                     "the IDL gives no account discriminators, so none of the {unknown_count} sampled accounts can be classified"
                 ),
-                Some("add the discriminators to the IDL; idl-verify computes them only for legacy (pre-0.30) Anchor IDLs".into()),
+                Some("add the discriminators or the account sizes to the IDL; idl-verify computes discriminators only for legacy (pre-0.30) Anchor IDLs".into()),
                 None,
             );
         } else {
-            for (prefix, idxs) in &unknown {
+            let hint = if by_size {
+                let known: Vec<String> = sized
+                    .iter()
+                    .map(|(t, size)| format!("{} {size}", idl.accounts[*t].name))
+                    .collect();
+                format!(
+                    "the IDL tells these accounts apart by size ({}); a longer account has room the IDL does not declare, or is a type it lacks",
+                    known.join(", ")
+                )
+            } else {
+                "the program uses an account type the IDL does not declare, or these accounts belong to another program".to_string()
+            };
+            for (head, idxs) in &unknown {
                 let example = self.samples.accounts[idxs[0]].address.as_str();
                 self.push(
                     Severity::Error,
                     Check::Discriminator,
                     "accounts",
                     format!(
-                        "{prefix} matches no account discriminator in the IDL, in {} {}",
+                        "{head}, in {} {}",
                         idxs.len(),
                         plural(idxs.len(), "sample", "samples")
                     ),
-                    Some("the program uses an account type the IDL does not declare, or these accounts belong to another program".into()),
+                    Some(hint.clone()),
                     Some(example),
                 );
             }
@@ -176,6 +216,34 @@ impl Verifier<'_> {
             not_sampled,
         };
         (coverage, summaries)
+    }
+
+    /// Account types with no discriminator and a known size: the IDL's declared `size`, else
+    /// the type's fixed size. Codama's size discriminator tells such accounts apart by length.
+    fn sized_account_types(&self) -> Vec<(usize, usize)> {
+        let index = TypeIndex::new(self.idl);
+        self.idl
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, nd)| nd.discriminator.is_empty())
+            .filter_map(|(i, nd)| {
+                let computed = || {
+                    let td = index.get(&nd.name)?;
+                    let reading = if td.is_zero_copy() {
+                        Reading::ZeroCopy
+                    } else {
+                        Reading::Borsh
+                    };
+                    let ty = Type::Defined {
+                        name: nd.name.clone(),
+                        generics: Vec::new(),
+                    };
+                    index.reading_size(&ty, reading).ok()
+                };
+                nd.size.or_else(computed).map(|size| (i, size))
+            })
+            .collect()
     }
 
     fn check_account_type(&mut self, nd: &NamedDisc, idxs: &[usize]) -> AccountSummary {
@@ -524,7 +592,7 @@ impl Verifier<'_> {
         if decoded.is_empty() {
             return;
         }
-        if let Some(layout) = padded {
+        if let Some(layout) = padded.filter(|_| !reference.honors_padding) {
             self.reference_summary.skipped += decoded.len();
             self.push(
                 Severity::Note,
@@ -771,7 +839,16 @@ impl Verifier<'_> {
                         .and_then(|n| n.as_str())
                         .unwrap_or_default();
                     if normalize(name) == normalize(&ix.name) {
-                        let data = theirs.get("data").cloned().unwrap_or_default();
+                        let mut data = theirs.get("data").cloned().unwrap_or_default();
+                        // Shipstern writes a lone struct argument as the struct itself.
+                        if let [arg] = ix.args.as_slice() {
+                            let named = data.as_object().is_some_and(|o| {
+                                o.keys().any(|k| normalize(k) == normalize(&arg.name))
+                            });
+                            if !named {
+                                data = serde_json::json!({ arg.name.clone(): data });
+                            }
+                        }
                         entries.push((*i, Some(Outcome::Ok(data)), value));
                     } else {
                         wrong_name.push((*i, name.to_string()));
@@ -1159,13 +1236,54 @@ mod tests {
 
     #[test]
     fn idl_without_discriminators_says_so() {
-        let idl = idl(r#"[{"name":"A"}]"#, "[]", &format!("[{U32_TYPE}]"));
+        // A string field leaves no fixed size to tell accounts apart by.
+        let idl = idl(
+            r#"[{"name":"A"}]"#,
+            "[]",
+            r#"[{"name":"A","type":{"kind":"struct","fields":[{"name":"s","type":"string"}]}}]"#,
+        );
         let report = verify(&idl, &accounts(&[&[1, 0, 0, 0]]), None);
         let f = only(&report);
         assert_eq!(f.check, Check::Discriminator);
         assert!(f
             .message
             .starts_with("the IDL gives no account discriminators"));
+    }
+
+    #[test]
+    fn accounts_without_discriminators_are_told_apart_by_size() {
+        let idl = idl(
+            r#"[{"name":"Small","size":4},{"name":"Big"}]"#,
+            "[]",
+            r#"[{"name":"Small","type":{"kind":"struct","fields":[{"name":"a","type":"u32"}]}},
+                {"name":"Big","type":{"kind":"struct","fields":[{"name":"a","type":"u64"},{"name":"b","type":"u64"}]}}]"#,
+        );
+        let raw = |bodies: &[&[u8]]| Samples {
+            program_id: None,
+            accounts: bodies
+                .iter()
+                .enumerate()
+                .map(|(i, b)| AccountSample {
+                    address: format!("addr{i}"),
+                    data: b.to_vec(),
+                })
+                .collect(),
+            instructions: Vec::new(),
+        };
+        // 4 bytes by the declared size, 16 by the computed Borsh size.
+        let report = verify(&idl, &raw(&[&[1, 0, 0, 0], &[0; 16]]), None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.accounts.len(), 2);
+        // A length that no type has is an error that names the length.
+        let report = verify(&idl, &raw(&[&[0; 7]]), None);
+        let f = only(&report);
+        assert_eq!(f.check, Check::Discriminator);
+        assert!(
+            f.message
+                .starts_with("7-byte data matches no account type size"),
+            "{}",
+            f.message
+        );
     }
 
     #[test]

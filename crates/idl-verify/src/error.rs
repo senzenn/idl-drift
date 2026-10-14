@@ -31,4 +31,6 @@ pub enum Error {
     RpcResponse(String),
     #[error("RPC request failed: {0}")]
     Rpc(String),
+    #[error("decoder under test: {0}")]
+    Decoder(String),
 }

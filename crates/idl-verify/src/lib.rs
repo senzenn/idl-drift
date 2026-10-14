@@ -17,6 +17,7 @@
 //! ```
 
 pub mod decode;
+mod decoder;
 mod error;
 pub use idl_drift::layout;
 mod reference;
@@ -25,6 +26,7 @@ pub mod rpc;
 mod samples;
 mod verify;
 
+pub use decoder::run_decoder;
 pub use error::Error;
 pub use reference::Reference;
 pub use report::{Finding, Report, Severity};

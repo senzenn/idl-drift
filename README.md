@@ -79,6 +79,7 @@ idl-drift diff idl/baseline.json idl/current.json
 
 ```bash
 idl-drift inspect idl.json
+idl-drift inspect idl.json --layout
 ```
 
 Lists the fields whose byte layout `idl-drift` could not resolve, such as inline structs or
@@ -86,6 +87,12 @@ Codama encodings with no Borsh equivalent (big-endian numbers, non-`u32` length 
 zeroable options). A change to such a field can't be classified, and `idl-verify` can't
 decode it, so run this before trusting a `diff` on a new IDL. Exit code 1 means at least
 one unresolved field.
+
+`--layout` also prints every `bytemuck` and `bytemuckunsafe` type field by field: offset,
+size and alignment under SBF `repr(C)`, each implicit gap, and the zero-copy size next to the
+Borsh size. For voltr's `AdaptorAddReceipt`: a 7-byte gap before `last_updated_epoch`, 144
+bytes against 137. An IDL whose converter dropped `serialization` lists no zero-copy types,
+which is the first thing to check when a parser reads too few bytes.
 
 ## What counts as breaking
 
@@ -101,7 +108,7 @@ whose layout is treated as unknown.
 
 | Tier | Meaning | Rules |
 |---|---|---|
-| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Instruction removed; duplicate instruction name; instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap); account moved to another position; account removed mid-list; arg added, removed, retyped or moved; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed, retyped or moved, enum variant inserted mid-list, removed or moved, variant payload changed, alias target changed, type removed while still referenced, `serialization` or `repr` changed so that a field of a zero-copy type moves, including a nested type's `repr` (such as a converter dropping `bytemuckunsafe`) |
+| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Instruction removed; duplicate instruction name, or two names that differ only by ASCII case (Shipstern gives them one generated helper); instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap); account moved to another position; account removed mid-list; arg added, removed, retyped or moved; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed, retyped or moved, enum variant inserted mid-list, removed or moved, variant payload changed, alias target changed, type removed while still referenced, `serialization` or `repr` changed so that a field of a zero-copy type moves, including a nested type's `repr` (such as a converter dropping `bytemuckunsafe`) |
 | **Dangerous** | Existing positions and tags hold, but the parser must grow or its names change. Review. | Enum variant appended; account appended to an instruction; optional account removed from the tail; account `writable`, `signer` or `optional` flag changed; a field, arg, account or variant renamed in place (same type, same position, and neither name used elsewhere on the other side, otherwise it moved); discriminator collision carried over; the set of account counts under a shared discriminator changed; `serialization` or `repr` changed with no field moving but the zero-copy size changing (trailing padding) |
 | **Additive** | New surface; old parsers are unaffected. | New instruction, account type or event type |
 | **Cosmetic** | No byte a parser reads changes. | Any of the layout changes above on an unreachable type; `serialization` or `repr` changed with no zero-copy field moving, or on a type only ever read as Borsh |

@@ -81,6 +81,8 @@ for f in fixtures/real/*.json; do
   expect "$(basename "$f")" 0 "$DRIFT" inspect "$f"
 done
 
+expect "voltr idl.json --layout" 0 "$DRIFT" inspect --layout fixtures/live/voltr_vault/idl.json
+
 echo
 echo "== idl-verify: fixtures/live =="
 for entry in \

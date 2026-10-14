@@ -29,6 +29,7 @@ pub enum ChangeKind {
     InstructionAdded,
     InstructionRemoved,
     InstructionDuplicate,
+    InstructionNameCollision,
     DiscriminatorReused,
     DiscriminatorChanged,
     DiscriminatorOffsetChanged,
@@ -143,20 +144,24 @@ impl Report {
 /// compared in camelCase, so `deposit_vault` and `depositVault` are the same instruction.
 #[must_use]
 pub fn diff(old: &Idl, new: &Idl) -> Report {
-    if old.format == new.format {
-        return diff_names_as_given(old, new);
-    }
-    let mut old = old.with_camel_case_names();
-    let mut new = new.with_camel_case_names();
-    // Codama inlines struct args; Borsh writes a struct as its fields, so the bytes match.
-    inline_struct_args(&mut old);
-    inline_struct_args(&mut new);
-    // Anchor IDLs can't describe an event envelope, so there is nothing to compare.
-    if old.format != Format::Codama || new.format != Format::Codama {
-        clear_envelopes(&mut old);
-        clear_envelopes(&mut new);
-    }
-    diff_names_as_given(&old, &new)
+    let mut r = if old.format == new.format {
+        diff_names_as_given(old, new)
+    } else {
+        let mut old = old.with_camel_case_names();
+        let mut new = new.with_camel_case_names();
+        // Codama inlines struct args; Borsh writes a struct as its fields, so the bytes match.
+        inline_struct_args(&mut old);
+        inline_struct_args(&mut new);
+        // Anchor IDLs can't describe an event envelope, so there is nothing to compare.
+        if old.format != Format::Codama || new.format != Format::Codama {
+            clear_envelopes(&mut old);
+            clear_envelopes(&mut new);
+        }
+        diff_names_as_given(&old, &new)
+    };
+    // On the names as written: the camelCase step above can split names that collide.
+    report_generated_name_collisions(&new.instructions, &mut r);
+    r
 }
 
 /// Replace each arg whose type is a non-generic struct with that struct's fields.
@@ -1234,6 +1239,47 @@ fn report_duplicate_names(instructions: &[crate::model::Instruction], r: &mut Re
             );
         }
     }
+}
+
+/// Shipstern names each instruction helper `parse_{to_snake_case(name)}`, which lowercases
+/// ASCII only, so `ABC` and `Abc` give one helper and the generated parser fails to compile.
+fn report_generated_name_collisions(instructions: &[crate::model::Instruction], r: &mut Report) {
+    let mut by_helper: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for ix in instructions {
+        by_helper
+            .entry(shipstern_snake_case(&ix.name))
+            .or_default()
+            .insert(ix.name.as_str());
+    }
+    for (helper, names) in by_helper {
+        // One distinct name repeated is an exact duplicate, reported on its own.
+        if names.len() > 1 {
+            let list = names.into_iter().collect::<Vec<_>>().join(", ");
+            r.push(
+                Severity::Breaking,
+                ChangeKind::InstructionNameCollision,
+                &helper,
+                format!("instructions [{list}] share the generated helper `parse_{helper}`: a Shipstern parser built from this IDL fails to compile"),
+            );
+        }
+    }
+}
+
+/// Shipstern's `to_snake_case` (`crates/proc-macro/src/utils.rs`).
+fn shipstern_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev_upper = chars[i - 1].is_uppercase();
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if !prev_upper || next_lower {
+                out.push('_');
+            }
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 fn collect_defined_refs(t: &Type, out: &mut Vec<String>) {

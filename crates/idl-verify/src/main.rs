@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use idl_drift::model::Idl;
 use idl_verify::rpc::{sample, Limits};
-use idl_verify::{verify, Error, Reference, Report, Samples};
+use idl_verify::{run_decoder, verify, Error, Reference, Report, Samples};
 use serde_json::{json, Value};
 
 /// Check a Solana program IDL against real account and instruction data.
@@ -41,8 +41,12 @@ struct Cli {
     #[arg(long, value_name = "ID", requires = "rpc")]
     program: Option<String>,
     /// Reference decoder output to compare values with (see tools/reference).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "decoder")]
     reference: Option<PathBuf>,
+    /// Decoder under test: a command that reads one JSON line per sample on stdin and
+    /// answers one per line (see README, "Decoder under test"). Split on whitespace.
+    #[arg(long, value_name = "CMD")]
+    decoder: Option<String>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -79,9 +83,18 @@ fn run(cli: &Cli) -> Result<u8, Error> {
         let call = |method: &str, params: Value| rpc_call(&agent, url, method, &params);
         sample(call, &idl, program, &Limits::default())?
     };
-    let reference = match &cli.reference {
-        Some(path) => Some(Reference::from_json(&read(path)?, &samples)?),
-        None => None,
+    let reference = match (&cli.reference, &cli.decoder) {
+        (Some(path), _) => Some(Reference::from_json(&read(path)?, &samples)?),
+        (None, Some(command)) => {
+            let words: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+            let program = cli
+                .program
+                .as_deref()
+                .or(samples.program_id.as_deref())
+                .unwrap_or(&idl.address);
+            Some(run_decoder(&words, &samples, program)?)
+        }
+        (None, None) => None,
     };
 
     let report = verify(&idl, &samples, reference.as_ref());

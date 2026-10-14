@@ -1,7 +1,9 @@
-//! Find fields whose layout the converter could not resolve (`Type::Generic`).
+//! Find fields whose layout the converter could not resolve (`Type::Generic`), and lay out
+//! every zero-copy type field by field.
 
 use crate::diff::reachable_types;
-use crate::model::{EnumFields, Idl, Type, TypeDefTy};
+use crate::layout::{LayoutError, Reading, StructLayout, TypeIndex};
+use crate::model::{EnumFields, Idl, Repr, Type, TypeDefTy};
 
 /// A field or instruction arg whose type is or contains `Type::Generic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,5 +149,72 @@ fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
         | Type::Bytes
         | Type::String
         | Type::Pubkey => {}
+    }
+}
+
+/// The memory layout of one zero-copy type, next to the size Borsh would read.
+#[derive(Debug, Clone)]
+pub struct TypeLayout {
+    pub name: String,
+    pub serialization: String,
+    pub repr: Option<Repr>,
+    /// `repr(C)` offsets and gaps, or why they cannot be computed.
+    pub layout: Result<StructLayout, LayoutError>,
+    /// `None` when a field has no fixed Borsh size.
+    pub borsh_size: Option<usize>,
+}
+
+/// Every `bytemuck` and `bytemuckunsafe` type, in IDL order. A converter that drops the
+/// `serialization` field makes this list empty, which is itself the finding.
+#[must_use]
+pub fn layouts(idl: &Idl) -> Vec<TypeLayout> {
+    let index = TypeIndex::new(idl);
+    idl.types
+        .iter()
+        .filter(|td| td.is_zero_copy())
+        .map(|td| {
+            let ty = Type::Defined {
+                name: td.name.clone(),
+                generics: Vec::new(),
+            };
+            TypeLayout {
+                name: td.name.clone(),
+                serialization: td.serialization.clone(),
+                repr: td.repr,
+                layout: index.struct_layout(td),
+                borsh_size: index.reading_size(&ty, Reading::Borsh).ok(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn voltr(file: &str) -> Idl {
+        let path = format!(
+            "{}/fixtures/live/voltr_vault/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        Idl::from_json(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn voltr_receipt_shows_its_gap_and_both_sizes() {
+        let report = layouts(&voltr("idl.json"));
+        let receipt = report
+            .iter()
+            .find(|t| t.name == "AdaptorAddReceipt")
+            .expect("zero-copy type listed");
+        let layout = receipt.layout.as_ref().unwrap();
+        assert_eq!((layout.size, receipt.borsh_size), (144, Some(137)));
+        let gaps: Vec<String> = layout.padding.iter().map(ToString::to_string).collect();
+        assert_eq!(gaps, ["7 bytes before `last_updated_epoch`"]);
+    }
+
+    #[test]
+    fn converter_that_drops_serialization_lists_no_zero_copy_types() {
+        assert!(layouts(&voltr("idl.js-codama.json")).is_empty());
     }
 }

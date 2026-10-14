@@ -103,7 +103,7 @@ explorer.
 
 | Check (`--json` name) | Severity | What it means |
 |---|---|---|
-| `discriminator` | error | A sample's discriminator matches nothing in the IDL: the program uses an account type or instruction the IDL lacks, or the IDL has no discriminators at all. For legacy (pre-0.30) Anchor IDLs, which leave them out, they are computed from the names the way Anchor does. |
+| `discriminator` | error | A sample's discriminator matches nothing in the IDL: the program uses an account type or instruction the IDL lacks, or the IDL has no discriminators at all. For legacy (pre-0.30) Anchor IDLs, which leave them out, they are computed from the names the way Anchor does. An account type with no discriminator is matched by exact data length: the IDL's `size` (or Codama size discriminator), else the type's fixed size. |
 | `missing_type` | error | An account has no entry in `types`, so it cannot be decoded. |
 | `decode` | error | The data does not fit the IDL: too short, an invalid bool, option tag, enum tag or UTF-8 string. The message names the field and offset. When every failing account is shorter than the layout, the hint says so: those accounts may predate an upgrade. |
 | `bytes_used` | error, warning or note | The IDL accounts for fewer bytes than the data holds. See [unused bytes](#unused-bytes). For instructions, any trailing byte is an error: instruction data has no slack, so the IDL is missing or narrowing an argument. |
@@ -203,6 +203,23 @@ don't line up. Field names compare case-insensitively and without underscores.
 Borsh and misreads every field after implicit padding. Types with padding are skipped
 (with a note) rather than reported as mismatches. On `fixtures/live`, idl-verify and anchor
 agree on all 31 comparable accounts and all 40 instructions.
+
+## Decoder under test
+
+The same comparison runs against any decoder that speaks a one-line protocol, such as a
+binary built from Shipstern's `include_shipstern_parser!` or a Carbon decoder:
+
+```bash
+idl-verify --idl idl.json --samples samples.json --decoder "./target/release/my-decoder spl_governance"
+```
+
+idl-verify writes one JSON line per sample to the child's stdin, accounts first:
+`{"kind":"account","program":"<base58>","address":"...","data":"<base64>"}` then
+`{"kind":"instruction","program":"<base58>","signature":"...","data":"<base64>","accounts":["<base58>"]}`.
+The child answers one line per sample, in order: `{"status":"ok","value":...}` or
+`{"status":"error","error":"..."}`. An instruction value is `{"name":"...","data":{...}}`.
+Values may use serde's plain shapes: bare numbers, unit variants as names, tuples as arrays.
+A generated parser reads zero-copy padding, so padded types are compared, not skipped.
 
 ## JSON output
 

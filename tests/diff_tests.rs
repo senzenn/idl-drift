@@ -1620,3 +1620,23 @@ fn camel_case_splits_anchor_type_paths() {
     let report = diff(&parse(flat), &parse(path));
     assert!(report.changes.is_empty(), "{:#?}", report.changes);
 }
+
+#[test]
+fn instruction_names_equal_up_to_ascii_case_are_breaking() {
+    // Shipstern turns both into `parse_abc` and the generated parser fails to compile.
+    let idl = |a: &str, b: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"c","version":"1","spec":"0.1.0"}},
+              "instructions":[{{"name":"{a}","discriminator":[1],"accounts":[],"args":[]}},
+                              {{"name":"{b}","discriminator":[2],"accounts":[],"args":[]}}]}}"#
+        )
+    };
+    let colliding = idl("ABC", "Abc");
+    assert_eq!(
+        kinds(&colliding, &colliding),
+        [(Severity::Breaking, ChangeKind::InstructionNameCollision)]
+    );
+    // Non-ASCII case stays apart in Shipstern's conversion, so this IDL compiles.
+    let unicode = idl("ä", "Ä");
+    assert!(kinds(&unicode, &unicode).is_empty());
+}

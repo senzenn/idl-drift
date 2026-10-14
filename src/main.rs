@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use idl_drift::model::Idl;
-use idl_drift::{coverage, diff, Change, CoverageReport, Report, Severity};
+use idl_drift::{coverage, diff, layouts, Change, CoverageReport, Report, Severity, TypeLayout};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
@@ -39,6 +39,9 @@ enum Cmd {
     Inspect {
         /// IDL to scan: Anchor or Codama JSON.
         idl: PathBuf,
+        /// Also print every zero-copy type field by field, with its gaps and both sizes.
+        #[arg(long)]
+        layout: bool,
     },
 }
 
@@ -70,7 +73,7 @@ fn main() -> ExitCode {
             json,
             fail_on,
         } => run_diff(&old, &new, json, fail_on.into()),
-        Cmd::Inspect { idl } => run_inspect(&idl),
+        Cmd::Inspect { idl, layout } => run_inspect(&idl, layout),
     };
     match result {
         Ok(code) => ExitCode::from(code),
@@ -98,10 +101,56 @@ fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8,
     Ok(code)
 }
 
-fn run_inspect(path: &Path) -> Result<u8, String> {
-    let report = coverage(&load(path)?);
+fn run_inspect(path: &Path, layout: bool) -> Result<u8, String> {
+    let idl = load(path)?;
+    let report = coverage(&idl);
     print_coverage(&report).map_err(|e| format!("write report: {e}"))?;
+    if layout {
+        print_layouts(&layouts(&idl)).map_err(|e| format!("write report: {e}"))?;
+    }
     Ok(u8::from(!report.fully_mapped()))
+}
+
+fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "zero-copy types: {}", types.len())?;
+    for t in types {
+        let repr = t
+            .repr
+            .map_or_else(|| "no repr".to_string(), |r| r.to_string());
+        let borsh = t
+            .borsh_size
+            .map_or_else(|| "varies".to_string(), |n| n.to_string());
+        match &t.layout {
+            Ok(layout) => {
+                writeln!(
+                    out,
+                    "\n{} ({} {repr}): repr(C) size {}, Borsh size {borsh}, padding {}",
+                    t.name,
+                    t.serialization,
+                    layout.size,
+                    layout.padding_len()
+                )?;
+                writeln!(out, "  offset  size  align  field")?;
+                for f in &layout.fields {
+                    writeln!(
+                        out,
+                        "  {:>6}  {:>4}  {:>5}  {}",
+                        f.offset, f.size, f.align, f.name
+                    )?;
+                }
+                for gap in &layout.padding {
+                    writeln!(out, "  gap at {}: {gap}", gap.offset)?;
+                }
+            }
+            Err(e) => writeln!(
+                out,
+                "\n{} ({} {repr}): cannot compute the zero-copy layout: {e}",
+                t.name, t.serialization
+            )?,
+        }
+    }
+    Ok(())
 }
 
 fn print_coverage(report: &CoverageReport) -> io::Result<()> {

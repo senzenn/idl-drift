@@ -34,7 +34,14 @@ pub fn from_codama(root: RootNode) -> Idl {
                 name: a.name.to_string(),
                 discriminator: disc,
                 discriminator_offset: offset,
-                size: a.size.and_then(|n| usize::try_from(n).ok()),
+                // A size discriminator is the account's length, so it doubles as its size.
+                size: a
+                    .size
+                    .or(match a.discriminators.first() {
+                        Some(DiscriminatorNode::Size(d)) => Some(d.size),
+                        _ => None,
+                    })
+                    .and_then(|n| usize::try_from(n).ok()),
                 payload_offset: numeric_constant_discriminator(a).then_some(0),
             }
         })
