@@ -6,21 +6,32 @@
 
 use std::fmt::Write as _;
 
+use idl_drift::model::Idl;
 use serde::Deserialize;
 use serde_json::{json, Map, Value as Json};
 
-use crate::decode::Value;
+use crate::decode::{Decoder, Value};
 use crate::error::Error;
-use crate::samples::Samples;
+use crate::layout::TypeIndex;
+use crate::samples::{InstructionSample, Samples};
+use crate::verify::{
+    disc_table, longest_match, pick_by_account_count, prefix_hex, sized_account_types, Disc,
+};
 
 /// Reference decodes, aligned with the samples by index.
 #[derive(Debug, Clone)]
 pub struct Reference {
     pub(crate) accounts: Vec<Outcome>,
     pub(crate) instructions: Vec<Outcome>,
+    /// Empty when the other side does not decode events.
+    pub(crate) events: Vec<Outcome>,
     /// `@coral-xyz/anchor` reads zero-copy types as Borsh, so padded types are skipped.
     /// A generated parser under test reads the padding, so it is compared.
     pub(crate) honors_padding: bool,
+    /// Names the other side in findings: the reference decoder, the decoder under test or
+    /// the old IDL. A failure on the user's own parser or IDL is an error, not a warning.
+    pub(crate) label: &'static str,
+    pub(crate) failures_are_errors: bool,
 }
 
 /// One reference decode.
@@ -28,6 +39,8 @@ pub struct Reference {
 pub(crate) enum Outcome {
     Ok(Json),
     Failed(String),
+    /// The decoder does not decode this kind of sample, such as a parser built without events.
+    Skipped(String),
 }
 
 #[derive(Deserialize)]
@@ -84,18 +97,162 @@ impl Reference {
         Ok(Self {
             accounts: outcomes(raw.accounts),
             instructions: outcomes(raw.instructions),
+            events: Vec::new(),
             honors_padding: false,
+            label: "the reference decoder",
+            failures_are_errors: false,
         })
     }
 
     /// Outcomes from a decoder under test, already aligned with the samples.
-    pub(crate) fn from_decoder(accounts: Vec<Outcome>, instructions: Vec<Outcome>) -> Self {
+    pub(crate) fn from_decoder(
+        accounts: Vec<Outcome>,
+        instructions: Vec<Outcome>,
+        events: Vec<Outcome>,
+    ) -> Self {
         Self {
             accounts,
             instructions,
+            events,
             honors_padding: true,
+            label: "the decoder under test",
+            failures_are_errors: true,
         }
     }
+
+    /// Outcomes from decoding `samples` with `old`, a second IDL of the program `new`
+    /// describes. A sample that `old` classifies by another discriminator fails, naming both.
+    #[must_use]
+    pub fn from_idl(old: &Idl, new: &Idl, samples: &Samples) -> Self {
+        let (ours, theirs) = (Classifier::new(new), Classifier::new(old));
+        let decoder = Decoder::new(TypeIndex::new(old));
+        let accounts = samples
+            .accounts
+            .iter()
+            .map(|sample| {
+                let Some(t) = theirs.account(&sample.data) else {
+                    return Outcome::Failed(
+                        "no account discriminator in the old IDL matches".into(),
+                    );
+                };
+                let nd = &old.accounts[t];
+                let disc = (nd.discriminator_offset, nd.discriminator.as_slice());
+                if let Some(o) = ours.account(&sample.data) {
+                    let n = &new.accounts[o];
+                    let new_disc = (n.discriminator_offset, n.discriminator.as_slice());
+                    if new_disc != disc {
+                        return Outcome::Failed(other_disc("account", &nd.name, disc, new_disc));
+                    }
+                }
+                let Some(td) = decoder.types().get(&nd.name) else {
+                    return Outcome::Failed(format!("the old IDL has no type `{}`", nd.name));
+                };
+                let start = nd.payload_start();
+                let body = sample.data.get(start..).unwrap_or_default();
+                match decoder.type_def(td, body) {
+                    Ok(d) => Outcome::Ok(to_json(&d.value)),
+                    Err(e) => Outcome::Failed(e.offset_by(start).to_string()),
+                }
+            })
+            .collect();
+        let instructions = samples
+            .instructions
+            .iter()
+            .map(|sample| {
+                let Some(t) = theirs.instruction(sample) else {
+                    return Outcome::Failed(
+                        "no instruction discriminator in the old IDL matches".into(),
+                    );
+                };
+                let ix = &old.instructions[t];
+                let disc = (ix.discriminator_offset, ix.discriminator.as_slice());
+                if let Some(o) = ours.instruction(sample) {
+                    let n = &new.instructions[o];
+                    let new_disc = (n.discriminator_offset, n.discriminator.as_slice());
+                    if new_disc != disc {
+                        return Outcome::Failed(other_disc(
+                            "instruction",
+                            &ix.name,
+                            disc,
+                            new_disc,
+                        ));
+                    }
+                }
+                let start = disc.0.saturating_add(disc.1.len());
+                let body = sample.data.get(start..).unwrap_or_default();
+                match decoder.borsh_fields(&ix.args, body) {
+                    Ok(d) => Outcome::Ok(json!({ "name": ix.name, "data": to_json(&d.value) })),
+                    Err(e) => Outcome::Failed(e.offset_by(start).to_string()),
+                }
+            })
+            .collect();
+        Self {
+            label: "the old IDL",
+            ..Self::from_decoder(accounts, instructions, Vec::new())
+        }
+    }
+}
+
+/// Picks the IDL entry for a sample as `verify` does: the longest discriminator, then
+/// account size for accounts without one, then account count for shared instruction ones.
+struct Classifier<'a> {
+    idl: &'a Idl,
+    accounts: Vec<(Disc<'a>, usize)>,
+    sized: Vec<(usize, usize)>,
+    instructions: Vec<(Disc<'a>, usize)>,
+}
+
+impl<'a> Classifier<'a> {
+    fn new(idl: &'a Idl) -> Self {
+        let sized = sized_account_types(idl);
+        Self {
+            idl,
+            accounts: disc_table(
+                idl.accounts
+                    .iter()
+                    .map(|a| (a.discriminator_offset, a.discriminator.as_slice())),
+            ),
+            sized,
+            instructions: disc_table(
+                idl.instructions
+                    .iter()
+                    .map(|ix| (ix.discriminator_offset, ix.discriminator.as_slice())),
+            ),
+        }
+    }
+
+    fn account(&self, data: &[u8]) -> Option<usize> {
+        if let Some(found) = longest_match(&self.accounts, data) {
+            return found.first().copied();
+        }
+        let mut fits = self.sized.iter().filter(|(_, size)| *size == data.len());
+        match (fits.next(), fits.next()) {
+            (Some((t, _)), None) => Some(*t),
+            _ => None,
+        }
+    }
+
+    fn instruction(&self, sample: &InstructionSample) -> Option<usize> {
+        let candidates = longest_match(&self.instructions, &sample.data)?;
+        Some(pick_by_account_count(
+            &self.idl.instructions,
+            &candidates,
+            sample.accounts.len(),
+        ))
+    }
+}
+
+fn other_disc(kind: &str, name: &str, old: Disc<'_>, new: Disc<'_>) -> String {
+    let by = |(offset, disc): Disc<'_>| match (offset, disc.is_empty()) {
+        (_, true) => "by size".to_string(),
+        (0, false) => format!("by discriminator {}", prefix_hex(disc)),
+        (at, false) => format!("by discriminator {} at offset {at}", prefix_hex(disc)),
+    };
+    format!(
+        "the old IDL classifies it as {kind} `{name}` {}, the new IDL {}",
+        by(old),
+        by(new)
+    )
 }
 
 /// Entries must match the samples one to one; an id, when given, must be the sample's.
@@ -515,6 +672,7 @@ fn short(value: &Json) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Severity;
 
     #[test]
     fn json_form_matches_anchor_plain_output() {
@@ -671,6 +829,84 @@ mod tests {
                 ours: "2".into(),
                 theirs: "3".into()
             })
+        );
+    }
+
+    fn voltr(file: &str) -> String {
+        let path = format!(
+            "{}/../../fixtures/live/voltr_vault/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn idl_that_drops_padding_reads_other_values() {
+        let anchor = Idl::from_json(&voltr("idl.json")).unwrap();
+        let codama = Idl::from_json(&voltr("idl.js-codama.json")).unwrap();
+        let mut samples = Samples::from_json(&voltr("samples.json")).unwrap();
+        let errors = |samples: &Samples| {
+            let reference = Reference::from_idl(&codama, &anchor, samples);
+            let report = crate::verify(&anchor, samples, Some(&reference));
+            let messages: Vec<String> = report
+                .findings
+                .into_iter()
+                .filter(|f| f.severity == crate::Severity::Error)
+                .map(|f| format!("{}: {}", f.subject, f.message))
+                .collect();
+            messages
+        };
+        // The fixtures hold zeros after the gap, so both IDLs read the same values.
+        assert_eq!(errors(&samples), Vec::<String>::new());
+        let receipt = [105, 99, 219, 155, 77, 241, 7, 119];
+        let sample = samples
+            .accounts
+            .iter_mut()
+            .find(|a| a.data.starts_with(&receipt))
+            .unwrap();
+        // Write `last_updated_epoch` at its repr(C) offset; the unpadded read starts 7 bytes early.
+        sample.data[88..96].copy_from_slice(&987_654_321u64.to_le_bytes());
+        assert_eq!(
+            errors(&samples),
+            ["account AdaptorAddReceipt: values differ from the old IDL in 1 of 5 samples, first at `_reserved[0]`: idl-verify read 0, the old IDL 104"]
+        );
+    }
+
+    #[test]
+    fn old_idl_with_another_discriminator_is_a_finding() {
+        let idl = |instructions: &str| {
+            Idl::from_json(&format!(
+                r#"{{"address":"P","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},"instructions":{instructions}}}"#
+            ))
+            .unwrap()
+        };
+        let new = idl(r#"[{"name":"go","discriminator":[1]}]"#);
+        let old =
+            idl(r#"[{"name":"go","discriminator":[2]},{"name":"stop","discriminator":[1,0]}]"#);
+        let samples = Samples {
+            program_id: None,
+            accounts: Vec::new(),
+            instructions: vec![InstructionSample {
+                signature: "sig".into(),
+                data: vec![1, 0],
+                accounts: Vec::new(),
+            }],
+            events: Vec::new(),
+        };
+        let report = crate::verify(
+            &new,
+            &samples,
+            Some(&Reference::from_idl(&old, &new, &samples)),
+        );
+        // A different discriminator under the old IDL is an error: the two IDLs route it apart.
+        let found: Vec<(Severity, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.severity, f.message.as_str()))
+            .collect();
+        assert!(
+            found.contains(&(Severity::Error, "the old IDL failed on 1 of 1 sample: the old IDL classifies it as instruction `stop` by discriminator 0x0100, the new IDL by discriminator 0x01")),
+            "{found:#?}"
         );
     }
 }

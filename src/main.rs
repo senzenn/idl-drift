@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use idl_drift::inspect::{shared_types, SharedType};
 use idl_drift::model::Idl;
 use idl_drift::{coverage, diff, layouts, Change, CoverageReport, Report, Severity, TypeLayout};
 use owo_colors::OwoColorize;
@@ -13,7 +14,8 @@ use serde::Serialize;
 #[command(name = "idl-drift", version, about)]
 #[command(after_help = "Exit codes:
   0  diff: no change at or above --fail-on; inspect: every field resolved
-  1  diff: at least one change at or above --fail-on; inspect: unmapped fields
+  1  diff: at least one change at or above --fail-on; inspect: unmapped fields,
+     or a padded zero-copy type that Borsh also reads
   2  a file could not be read or parsed")]
 struct Cli {
     #[command(subcommand)]
@@ -35,7 +37,8 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Tier::Breaking)]
         fail_on: Tier,
     },
-    /// Report fields whose byte layout could not be resolved.
+    /// Report fields whose byte layout could not be resolved, and padded zero-copy types
+    /// that Borsh also reads.
     Inspect {
         /// IDL to scan: Anchor or Codama JSON.
         idl: PathBuf,
@@ -104,11 +107,12 @@ fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8,
 fn run_inspect(path: &Path, layout: bool) -> Result<u8, String> {
     let idl = load(path)?;
     let report = coverage(&idl);
-    print_coverage(&report).map_err(|e| format!("write report: {e}"))?;
+    let shared = shared_types(&idl);
+    print_coverage(&report, &shared).map_err(|e| format!("write report: {e}"))?;
     if layout {
         print_layouts(&layouts(&idl)).map_err(|e| format!("write report: {e}"))?;
     }
-    Ok(u8::from(!report.fully_mapped()))
+    Ok(u8::from(!report.fully_mapped() || !shared.is_empty()))
 }
 
 fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
@@ -153,7 +157,7 @@ fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
     Ok(())
 }
 
-fn print_coverage(report: &CoverageReport) -> io::Result<()> {
+fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(
         out,
@@ -163,6 +167,20 @@ fn print_coverage(report: &CoverageReport) -> io::Result<()> {
     writeln!(out, "unmapped (Generic) fields: {}", report.unmapped.len())?;
     for u in &report.unmapped {
         writeln!(out, "UNMAPPED: {} -> Generic(\"{}\")", u.path, u.kind)?;
+    }
+    writeln!(
+        out,
+        "padded zero-copy types also read as Borsh: {}",
+        shared.len()
+    )?;
+    for t in shared {
+        let gaps: Vec<String> = t.padding.iter().map(ToString::to_string).collect();
+        writeln!(
+            out,
+            "SHARED: {} -> padding {}; Borsh reads it without the padding",
+            t.name,
+            gaps.join(", ")
+        )?;
     }
     Ok(())
 }

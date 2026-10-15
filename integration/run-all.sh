@@ -88,7 +88,8 @@ echo "== idl-verify: fixtures/live =="
 for entry in \
   "voltr_vault|idl.json|0" \
   "voltr_vault|idl.js-codama.json|1" \
-  "jupiter_vaults|idl.json|0"; do
+  "jupiter_vaults|idl.json|0" \
+  "pump_fun|idl.json|1"; do
   IFS='|' read -r program idl want <<<"$entry"
   dir="fixtures/live/$program"
   expect "$program/$idl" "$want" "$VERIFY" --idl "$dir/$idl" --samples "$dir/samples.json"

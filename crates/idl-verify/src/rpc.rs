@@ -9,12 +9,8 @@ use std::collections::{HashMap, HashSet};
 use idl_drift::model::Idl;
 
 use crate::error::Error;
-use crate::samples::{AccountSample, InstructionSample, Samples};
-use crate::verify::{disc_table, longest_match, prefix_hex};
-
-/// Anchor's `EVENT_IX_TAG` in little-endian. `emit_cpi!` calls the program itself with this
-/// prefix, which is an event, not an instruction in the IDL.
-const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+use crate::samples::{AccountSample, EventSample, EventSource, InstructionSample, Samples};
+use crate::verify::{cpi_envelopes, disc_table, event_body, longest_match, prefix_hex, Disc};
 
 #[derive(Deserialize)]
 struct Transaction {
@@ -30,6 +26,8 @@ struct Meta {
     inner_instructions: Option<Vec<InnerInstructions>>,
     #[serde(default)]
     loaded_addresses: Option<LoadedAddresses>,
+    #[serde(default)]
+    log_messages: Option<Vec<String>>,
 }
 
 /// Keys a v0 transaction loads from address lookup tables. Instruction indices continue
@@ -68,16 +66,25 @@ struct CompiledInstruction {
     data: String,
 }
 
+/// What one transaction holds for a program.
+#[derive(Debug, Default)]
+pub struct TransactionSamples {
+    pub instructions: Vec<InstructionSample>,
+    pub events: Vec<EventSample>,
+}
+
 /// The instructions in one `getTransaction` result (`json` encoding) that call
-/// `program_id`, with their account keys resolved.
+/// `program_id`, with their account keys resolved, and the events the program emitted.
+/// `idl` gives the envelopes that mark a self-CPI event.
 ///
 /// # Errors
 ///
 /// When the transaction JSON does not have the shape the RPC documents.
-pub fn instructions_from_transaction(
+pub fn samples_from_transaction(
+    idl: &Idl,
     program_id: &str,
     tx: &Value,
-) -> Result<Vec<InstructionSample>, Error> {
+) -> Result<TransactionSamples, Error> {
     let tx = Transaction::deserialize(tx).map_err(|e| Error::RpcResponse(e.to_string()))?;
     let signature = tx
         .transaction
@@ -131,7 +138,8 @@ pub fn instructions_from_transaction(
             std::iter::once(top).chain(cpis.flat_map(|g| &g.instructions))
         });
 
-    let mut out = Vec::new();
+    let cpi = cpi_envelopes(idl);
+    let mut out = TransactionSamples::default();
     for ix in executed {
         if key(ix.program_id_index)? != program_id {
             continue;
@@ -139,10 +147,15 @@ pub fn instructions_from_transaction(
         let data = bs58::decode(&ix.data)
             .into_vec()
             .map_err(|e| Error::RpcResponse(format!("{signature}: instruction data: {e}")))?;
-        if data.starts_with(&EVENT_IX_TAG) {
+        if cpi.iter().any(|e| e.wraps(&data)) {
+            out.events.push(EventSample {
+                signature: signature.clone(),
+                source: EventSource::Cpi,
+                data,
+            });
             continue;
         }
-        out.push(InstructionSample {
+        out.instructions.push(InstructionSample {
             signature: signature.clone(),
             data,
             accounts: ix
@@ -151,6 +164,57 @@ pub fn instructions_from_transaction(
                 .map(|&i| key(i))
                 .collect::<Result<_, _>>()?,
         });
+    }
+
+    let logs = tx
+        .meta
+        .as_ref()
+        .and_then(|m| m.log_messages.as_deref())
+        .unwrap_or_default();
+    let logged = log_events(program_id, logs)
+        .map_err(|e| Error::RpcResponse(format!("{signature}: Program data log: {e}")))?;
+    out.events
+        .extend(logged.into_iter().map(|data| EventSample {
+            signature: signature.clone(),
+            source: EventSource::Log,
+            data,
+        }));
+    Ok(out)
+}
+
+/// The `Program data:` payloads logged while `program_id` is the innermost running program.
+/// A nested program's lines are its own, as in Shipstern's `resolve_events_from_logs`.
+fn log_events(program_id: &str, logs: &[String]) -> Result<Vec<Vec<u8>>, base64::DecodeError> {
+    let mut frames: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    // The runtime drops every line after this marker, so frames can stay open.
+    for line in logs.iter().take_while(|l| *l != "Log truncated") {
+        if let Some(encoded) = line.strip_prefix("Program data: ") {
+            if frames.last() == Some(&program_id) {
+                let mut data = Vec::new();
+                // `sol_log_data` writes one base64 chunk per slice, separated by spaces.
+                for chunk in encoded.split_whitespace() {
+                    data.extend(STANDARD.decode(chunk)?);
+                }
+                out.push(data);
+            }
+            continue;
+        }
+        let Some((id, rest)) = line
+            .strip_prefix("Program ")
+            .and_then(|l| l.split_once(' '))
+        else {
+            continue;
+        };
+        // Program ids are base58, so labels such as `log:` and `return:` never match.
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if rest.starts_with("invoke [") {
+            frames.push(id);
+        } else if rest == "success" || rest.starts_with("failed: ") {
+            frames.pop();
+        }
     }
     Ok(out)
 }
@@ -206,11 +270,15 @@ pub fn accounts_from_rpc(
 }
 
 /// How much to take from a live cluster.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Limits {
-    /// Recent signatures to read; failed transactions among them are skipped.
-    pub signatures: usize,
-    pub instructions: usize,
+    /// Successful transactions to read at most; failed ones are skipped unread.
+    pub max_transactions: usize,
+    /// Stop after this many successful transactions in a row bring no new instruction or
+    /// event kind.
+    pub stall: usize,
+    /// Samples per instruction discriminator, per event discriminator, and per unknown prefix.
+    pub per_instruction: usize,
     /// Accounts per IDL account type, and per unknown discriminator.
     pub per_type: usize,
 }
@@ -218,15 +286,118 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            signatures: 40,
-            instructions: 20,
+            max_transactions: 40,
+            stall: 40,
+            per_instruction: 5,
             per_type: 5,
         }
     }
 }
 
-/// Samples of `program_id` from recent successful transactions and the accounts they pass.
-/// `rpc` sends one JSON-RPC request and returns its `result`.
+/// Why a live sampling run stopped reading transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Every IDL instruction with a discriminator has its quota of samples.
+    Quota,
+    /// `stall` transactions in a row brought no new instruction or event kind.
+    Stall,
+    /// `max_transactions` successful transactions were read.
+    MaxTransactions,
+    /// The program has no older signatures.
+    History,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Quota => "every IDL instruction has its quota of samples",
+            Self::Stall => "the last --stall transactions brought no new kind",
+            Self::MaxTransactions => "--max-tx transactions were read",
+            Self::History => "the program has no older transactions",
+        })
+    }
+}
+
+/// What a live sampling run took, and why it stopped.
+#[derive(Debug)]
+pub struct Sampled {
+    pub samples: Samples,
+    /// Successful transactions read.
+    pub transactions: usize,
+    pub stop_reason: StopReason,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Group {
+    Instruction,
+    LogEvent,
+    CpiEvent,
+}
+
+/// Caps the samples of each kind: an IDL discriminator, or the first bytes of data that
+/// match none.
+struct Quota<'a> {
+    instructions: Vec<(Disc<'a>, usize)>,
+    events: Vec<(Disc<'a>, usize)>,
+    per_kind: usize,
+    taken: HashMap<(Group, Option<usize>, String), usize>,
+    /// IDL instructions whose discriminator has its quota.
+    full: HashSet<usize>,
+}
+
+impl<'a> Quota<'a> {
+    fn new(idl: &'a Idl, per_kind: usize) -> Self {
+        Self {
+            instructions: disc_table(
+                idl.instructions
+                    .iter()
+                    .map(|ix| (ix.discriminator_offset, ix.discriminator.as_slice())),
+            ),
+            events: disc_table(idl.events.iter().map(|e| (0, e.discriminator.as_slice()))),
+            per_kind,
+            taken: HashMap::new(),
+            full: HashSet::new(),
+        }
+    }
+
+    /// Whether to keep a sample of `data`, and whether its kind is new.
+    fn take(&mut self, group: Group, data: &[u8]) -> (bool, bool) {
+        let table = match group {
+            Group::Instruction => &self.instructions,
+            Group::LogEvent | Group::CpiEvent => &self.events,
+        };
+        let matched = longest_match(table, data);
+        let kind = match matched.as_ref().and_then(|m| m.first()) {
+            Some(&index) => (Some(index), String::new()),
+            None => (None, prefix_hex(data)),
+        };
+        let mut new = false;
+        let count = self
+            .taken
+            .entry((group, kind.0, kind.1))
+            .or_insert_with(|| {
+                new = true;
+                0
+            });
+        let keep = *count < self.per_kind;
+        if keep {
+            *count += 1;
+        }
+        if group == Group::Instruction && *count >= self.per_kind {
+            self.full.extend(matched.into_iter().flatten());
+        }
+        (keep, new)
+    }
+
+    /// An IDL with no instruction discriminators never fills, so it never stops a run.
+    fn filled(&self) -> bool {
+        !self.instructions.is_empty() && self.full.len() == self.instructions.len()
+    }
+}
+
+/// Samples of `program_id` from successful transactions, newest first, and the accounts they
+/// pass. Pages back through the program's history until a [`StopReason`] holds. `rpc` sends
+/// one JSON-RPC request and returns its `result`.
 ///
 /// # Errors
 ///
@@ -236,33 +407,84 @@ pub fn sample(
     idl: &Idl,
     program_id: &str,
     limits: &Limits,
-) -> Result<Samples, Error> {
-    let signatures = rpc(
-        "getSignaturesForAddress",
-        json!([program_id, { "limit": limits.signatures }]),
-    )?;
-    let signatures = Vec::<SignatureInfo>::deserialize(&signatures)
-        .map_err(|e| Error::RpcResponse(format!("getSignaturesForAddress: {e}")))?;
-
-    // Failed transactions can carry data the program rejected, which is not a fault of the IDL.
+) -> Result<Sampled, Error> {
+    let mut quota = Quota::new(idl, limits.per_instruction);
+    let cpi = cpi_envelopes(idl);
     let mut instructions = Vec::new();
-    for info in signatures.iter().filter(|s| s.err.is_none()) {
-        // The highest version this parser reads; the RPC refuses newer ones with an error.
-        let tx = rpc(
-            "getTransaction",
-            json!([info.signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
-        )?;
-        instructions.extend(instructions_from_transaction(program_id, &tx)?);
-    }
-
+    let mut events = Vec::new();
+    // Accounts of instructions over quota are still sampled.
+    let mut keys: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
-    let keys: Vec<String> = instructions
-        .iter()
-        .flat_map(|ix| &ix.accounts)
-        .filter(|k| seen.insert(k.as_str()))
-        .cloned()
-        .collect();
-    instructions.truncate(limits.instructions);
+    let mut read = 0usize;
+    let mut quiet = 0usize;
+    let mut before: Option<String> = None;
+
+    let stop_reason = 'pages: loop {
+        if read >= limits.max_transactions {
+            break StopReason::MaxTransactions;
+        }
+        let mut config = json!({ "limit": SIGNATURES_PER_PAGE });
+        if let Some(signature) = &before {
+            config["before"] = json!(signature);
+        }
+        let page = rpc("getSignaturesForAddress", json!([program_id, config]))?;
+        let page = Vec::<SignatureInfo>::deserialize(&page)
+            .map_err(|e| Error::RpcResponse(format!("getSignaturesForAddress: {e}")))?;
+        // An RPC that ignores `before` would return the same page forever.
+        match page.last() {
+            Some(last) if before.as_deref() != Some(last.signature.as_str()) => {
+                before = Some(last.signature.clone());
+            }
+            _ => break StopReason::History,
+        }
+
+        // Failed transactions can carry data the program rejected, which is not a fault of the IDL.
+        for info in page.iter().filter(|s| s.err.is_none()) {
+            // The highest version this parser reads; the RPC refuses newer ones with an error.
+            let tx = rpc(
+                "getTransaction",
+                json!([info.signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
+            )?;
+            read += 1;
+            let found = samples_from_transaction(idl, program_id, &tx)?;
+            let mut new = false;
+            for ix in found.instructions {
+                for key in &ix.accounts {
+                    if seen.insert(key.clone()) {
+                        keys.push(key.clone());
+                    }
+                }
+                let (keep, fresh) = quota.take(Group::Instruction, &ix.data);
+                new |= fresh;
+                if keep {
+                    instructions.push(ix);
+                }
+            }
+            for event in found.events {
+                let (keep, fresh) = match event.source {
+                    EventSource::Log => quota.take(Group::LogEvent, &event.data),
+                    EventSource::Cpi => quota.take(
+                        Group::CpiEvent,
+                        event_body(&event, &cpi).unwrap_or_default(),
+                    ),
+                };
+                new |= fresh;
+                if keep {
+                    events.push(event);
+                }
+            }
+            quiet = if new { 0 } else { quiet + 1 };
+            if quota.filled() {
+                break 'pages StopReason::Quota;
+            }
+            if quiet >= limits.stall {
+                break 'pages StopReason::Stall;
+            }
+            if read >= limits.max_transactions {
+                break 'pages StopReason::MaxTransactions;
+            }
+        }
+    };
 
     let mut values = Vec::new();
     for chunk in keys.chunks(MAX_ACCOUNTS_PER_REQUEST) {
@@ -276,12 +498,20 @@ pub fn sample(
     }
     let accounts = accounts_from_rpc(idl, program_id, &keys, &values, limits.per_type)?;
 
-    Ok(Samples {
-        program_id: Some(program_id.to_string()),
-        accounts,
-        instructions,
+    Ok(Sampled {
+        samples: Samples {
+            program_id: Some(program_id.to_string()),
+            accounts,
+            instructions,
+            events,
+        },
+        transactions: read,
+        stop_reason,
     })
 }
+
+/// The `getSignaturesForAddress` maximum per request.
+const SIGNATURES_PER_PAGE: usize = 1000;
 
 /// One entry of `getSignaturesForAddress`; `err` is set when the transaction failed.
 #[derive(Deserialize)]
@@ -309,6 +539,7 @@ struct RpcAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::EVENT_IX_TAG;
     use serde_json::json;
 
     fn idl() -> Idl {
@@ -389,7 +620,9 @@ mod tests {
                 _ => Value::Null,
             })
         };
-        let samples = sample(rpc, &idl(), "Prog", &Limits::default()).unwrap();
+        let samples = sample(rpc, &idl(), "Prog", &Limits::default())
+            .unwrap()
+            .samples;
 
         let fetched: Vec<&Value> = calls
             .iter()
@@ -409,7 +642,51 @@ mod tests {
     }
 
     #[test]
-    fn the_instruction_limit_keeps_the_accounts_of_dropped_instructions() {
+    fn self_cpi_events_use_the_envelope_the_idl_declares() {
+        let idl = Idl::from_json(
+            r#"{"address":"Prog","metadata":{"name":"t","version":"0","spec":"0.1.0"},"events":[
+                {"name":"A","discriminator":[7],"envelope_discriminator":[254]},
+                {"name":"B","discriminator":[8],"envelope_discriminator":[254]}]}"#,
+        )
+        .unwrap();
+        let data = |bytes: &[u8]| bs58::encode(bytes).into_string();
+        let rpc = |method: &str, _: Value| {
+            Ok(match method {
+                "getSignaturesForAddress" => json!([{ "signature": "S1", "err": null }]),
+                "getTransaction" => tx(
+                    &["Payer", "Prog"],
+                    &json!([
+                        { "programIdIndex": 1, "accounts": [0], "data": data(&[254, 7, 1]) },
+                        { "programIdIndex": 1, "accounts": [0], "data": data(&[254, 8, 2]) },
+                        { "programIdIndex": 1, "accounts": [0], "data": data(&[1]) }
+                    ]),
+                ),
+                _ => json!({ "value": [Value::Null] }),
+            })
+        };
+        // One sample per kind: the two events count as two kinds only after the envelope is removed.
+        let limits = Limits {
+            per_instruction: 1,
+            ..Limits::default()
+        };
+        let samples = sample(rpc, &idl, "Prog", &limits).unwrap().samples;
+        let events: Vec<(EventSource, &[u8])> = samples
+            .events
+            .iter()
+            .map(|e| (e.source, e.data.as_slice()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (EventSource::Cpi, &[254, 7, 1][..]),
+                (EventSource::Cpi, &[254, 8, 2][..])
+            ]
+        );
+        assert_eq!(samples.instructions.len(), 1);
+    }
+
+    #[test]
+    fn the_instruction_quota_keeps_the_accounts_of_dropped_instructions() {
         let rpc = |method: &str, params: Value| {
             Ok(match method {
                 "getSignaturesForAddress" => json!([{ "signature": "S1", "err": null }]),
@@ -417,7 +694,7 @@ mod tests {
                     &["A", "B", "Prog"],
                     &json!([
                         { "programIdIndex": 2, "accounts": [0], "data": "2" },
-                        { "programIdIndex": 2, "accounts": [1], "data": "3" }
+                        { "programIdIndex": 2, "accounts": [1], "data": "2" }
                     ]),
                 ),
                 _ => json!({ "value": params[0].as_array().unwrap().iter()
@@ -425,10 +702,10 @@ mod tests {
             })
         };
         let limits = Limits {
-            instructions: 1,
+            per_instruction: 1,
             ..Limits::default()
         };
-        let samples = sample(rpc, &idl(), "Prog", &limits).unwrap();
+        let samples = sample(rpc, &idl(), "Prog", &limits).unwrap().samples;
         assert_eq!(samples.instructions.len(), 1);
         let addresses: Vec<&str> = samples
             .accounts
@@ -459,8 +736,108 @@ mod tests {
             }
             _ => Ok(json!({ "value": [Value::Null] })),
         };
-        let samples = sample(rpc, &idl(), "Prog", &Limits::default()).unwrap();
+        let samples = sample(rpc, &idl(), "Prog", &Limits::default())
+            .unwrap()
+            .samples;
         assert_eq!(samples.instructions.len(), 1);
+    }
+
+    /// Instructions `a` and `b` with one-byte discriminators 1 and 2.
+    fn idl_ab() -> Idl {
+        Idl::from_json(
+            r#"{"address":"Prog","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+                "instructions":[{"name":"a","discriminator":[1]},{"name":"b","discriminator":[2]}]}"#,
+        )
+        .unwrap()
+    }
+
+    /// A program history, newest first, where transaction `S<i>` calls the program with the
+    /// data `[history[i]]`. Pages honor `limit` and `before` as the RPC documents.
+    fn history(history: Vec<u8>) -> impl FnMut(&str, Value) -> Result<Value, Error> {
+        let index =
+            |signature: &Value| -> usize { signature.as_str().unwrap()[1..].parse().unwrap() };
+        move |method, params| {
+            Ok(match method {
+                "getSignaturesForAddress" => {
+                    let limit = usize::try_from(params[1]["limit"].as_u64().unwrap()).unwrap();
+                    let start = params[1].get("before").map_or(0, |b| index(b) + 1);
+                    let page: Vec<Value> = (start..history.len())
+                        .take(limit)
+                        .map(|i| json!({ "signature": format!("S{i}"), "err": null }))
+                        .collect();
+                    json!(page)
+                }
+                "getTransaction" => {
+                    let data = bs58::encode([history[index(&params[0])]]).into_string();
+                    tx(
+                        &["Payer", "Prog"],
+                        &json!([{ "programIdIndex": 1, "accounts": [0], "data": data }]),
+                    )
+                }
+                _ => json!({ "value": params[0].as_array().unwrap().iter()
+                    .map(|_| Value::Null).collect::<Vec<_>>() }),
+            })
+        }
+    }
+
+    fn data_of(sampled: &Sampled) -> Vec<u8> {
+        let ixs = &sampled.samples.instructions;
+        ixs.iter().flat_map(|ix| ix.data.clone()).collect()
+    }
+
+    #[test]
+    fn paging_finds_a_rare_instruction_on_page_two() {
+        let mut calls = vec![1; SIGNATURES_PER_PAGE];
+        calls.push(2);
+
+        let first = sample(
+            history(calls.clone()),
+            &idl_ab(),
+            "Prog",
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(!data_of(&first).contains(&2));
+        assert_eq!(first.stop_reason, StopReason::MaxTransactions);
+
+        let limits = Limits {
+            max_transactions: 2000,
+            stall: 2000,
+            ..Limits::default()
+        };
+        let paged = sample(history(calls), &idl_ab(), "Prog", &limits).unwrap();
+        assert_eq!(data_of(&paged), [1, 1, 1, 1, 1, 2]);
+        assert_eq!(paged.transactions, SIGNATURES_PER_PAGE + 1);
+        assert_eq!(paged.stop_reason, StopReason::History);
+    }
+
+    #[test]
+    fn stops_when_transactions_bring_no_new_kind() {
+        let limits = Limits {
+            stall: 3,
+            ..Limits::default()
+        };
+        let sampled = sample(history(vec![1; 30]), &idl_ab(), "Prog", &limits).unwrap();
+        assert_eq!(sampled.transactions, 4);
+        assert_eq!(sampled.stop_reason, StopReason::Stall);
+    }
+
+    #[test]
+    fn the_quota_caps_a_common_instruction_and_stops_when_all_are_full() {
+        let limits = Limits {
+            per_instruction: 2,
+            ..Limits::default()
+        };
+        let sampled = sample(
+            history(vec![1, 1, 1, 2, 2, 1, 2]),
+            &idl_ab(),
+            "Prog",
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(data_of(&sampled), [1, 1, 2, 2]);
+        assert_eq!(sampled.transactions, 5);
+        assert_eq!(sampled.stop_reason, StopReason::Quota);
     }
 
     fn tx(keys: &[&str], instructions: &Value) -> Value {
@@ -483,7 +860,9 @@ mod tests {
             &["Payer", "Vault", "Prog"],
             &json!([{ "programIdIndex": 2, "accounts": [1, 0], "data": "Ldp" }]),
         );
-        let ixs = instructions_from_transaction("Prog", &tx).unwrap();
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
         assert_eq!(ixs.len(), 1);
         assert_eq!(ixs[0].signature, "Sig1");
         assert_eq!(ixs[0].accounts, ["Vault", "Payer"]);
@@ -503,7 +882,9 @@ mod tests {
             { "programIdIndex": 2, "accounts": [1], "data": "4", "stackHeight": 2 },
             { "programIdIndex": 1, "accounts": [], "data": "5", "stackHeight": 2 }
         ]}]);
-        let ixs = instructions_from_transaction("Prog", &tx).unwrap();
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
         let got: Vec<_> = ixs
             .iter()
             .map(|ix| (ix.data.clone(), ix.accounts.clone()))
@@ -524,12 +905,14 @@ mod tests {
             &json!([{ "programIdIndex": 1, "accounts": [3, 2, 4, 0], "data": "2" }]),
         );
         tx["meta"]["loadedAddresses"] = json!({ "writable": ["W1"], "readonly": ["R1", "R2"] });
-        let ixs = instructions_from_transaction("Prog", &tx).unwrap();
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
         assert_eq!(ixs[0].accounts, ["R1", "W1", "R2", "Payer"]);
     }
 
     #[test]
-    fn skips_self_cpi_events() {
+    fn keeps_self_cpi_events_as_events_with_their_tag() {
         let event = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d, 7, 7];
         let tx = tx(
             &["Payer", "Prog"],
@@ -538,9 +921,67 @@ mod tests {
                 { "programIdIndex": 1, "accounts": [0], "data": "2" }
             ]),
         );
-        let ixs = instructions_from_transaction("Prog", &tx).unwrap();
-        assert_eq!(ixs.len(), 1);
-        assert_eq!(ixs[0].data, [1]);
+        let found = samples_from_transaction(&idl(), "Prog", &tx).unwrap();
+        assert_eq!(found.instructions.len(), 1);
+        assert_eq!(found.instructions[0].data, [1]);
+        assert_eq!(found.events.len(), 1);
+        assert_eq!(found.events[0].source, EventSource::Cpi);
+        assert_eq!(found.events[0].data, event);
+    }
+
+    fn with_logs(logs: &[&str]) -> Value {
+        let mut tx = tx(&["Payer", "Prog"], &json!([]));
+        tx["meta"]["logMessages"] = json!(logs);
+        tx
+    }
+
+    #[test]
+    fn keeps_data_lines_only_in_the_programs_own_frame() {
+        let tx = with_logs(&[
+            "Program Prog invoke [1]",
+            "Program log: Instruction: Deposit",
+            "Program data: AQ==",
+            "Program Other invoke [2]",
+            "Program data: Ag==",
+            "Program Other success",
+            "Program data: Aw==",
+            "Program Prog consumed 5000 of 200000 compute units",
+            "Program Prog success",
+            "Program data: BA==",
+        ]);
+        let events = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .events;
+        let got: Vec<(EventSource, &[u8])> = events
+            .iter()
+            .map(|e| (e.source, e.data.as_slice()))
+            .collect();
+        assert_eq!(
+            got,
+            [(EventSource::Log, &[1][..]), (EventSource::Log, &[3][..])]
+        );
+    }
+
+    #[test]
+    fn keeps_data_lines_before_a_log_truncation() {
+        let tx = with_logs(&[
+            "Program Prog invoke [1]",
+            "Program data: AQ==",
+            "Log truncated",
+            "Program data: Ag==",
+        ]);
+        let events = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, [1]);
+    }
+
+    #[test]
+    fn bad_base64_in_a_data_line_is_a_response_error() {
+        let tx = with_logs(&["Program Prog invoke [1]", "Program data: %%%%"]);
+        let err = samples_from_transaction(&idl(), "Prog", &tx).unwrap_err();
+        assert!(matches!(err, Error::RpcResponse(_)), "{err}");
     }
 
     #[test]
@@ -549,7 +990,7 @@ mod tests {
             &["Payer\u{1b}[2J", "Prog"],
             &json!([{ "programIdIndex": 1, "accounts": [0], "data": "2" }]),
         );
-        let err = instructions_from_transaction("Prog", &tx)
+        let err = samples_from_transaction(&idl(), "Prog", &tx)
             .unwrap_err()
             .to_string();
         assert!(!err.contains('\u{1b}'), "{err:?}");
@@ -609,18 +1050,22 @@ mod tests {
                 "index": index, "instructions": ixs.iter().map(compiled).collect::<Vec<_>>()
             })).collect());
 
-            let result = instructions_from_transaction(&program_id, &tx);
+            let result = samples_from_transaction(&idl(), &program_id, &tx);
 
             let executed: Vec<&Ix> = top.iter().chain(inner.iter().flat_map(|(_, ixs)| ixs)).collect();
             let valid = executed.iter().all(|ix| ix.0 < n && ix.1.iter().all(|&a| a < n) && !ix.3);
             if valid {
                 proptest::prop_assert!(result.is_ok(), "{result:?}");
             }
-            if let Ok(samples) = result {
-                let to_program: Vec<&&Ix> = executed
+            if let Ok(found) = result {
+                let (events, to_program): (Vec<&&Ix>, Vec<&&Ix>) = executed
                     .iter()
-                    .filter(|ix| names.get(ix.0) == Some(&program_id) && !ix.2.starts_with(&EVENT_IX_TAG))
-                    .collect();
+                    .filter(|ix| names.get(ix.0) == Some(&program_id))
+                    .partition(|ix| ix.2.starts_with(&EVENT_IX_TAG));
+                let event_data: Vec<&[u8]> = events.iter().map(|ix| ix.2.as_slice()).collect();
+                let found_data: Vec<&[u8]> = found.events.iter().map(|e| e.data.as_slice()).collect();
+                proptest::prop_assert_eq!(found_data, event_data);
+                let samples = found.instructions;
                 proptest::prop_assert_eq!(samples.len(), to_program.len());
                 for sample in &samples {
                     proptest::prop_assert!(

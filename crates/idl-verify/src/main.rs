@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use idl_drift::model::Idl;
 use idl_verify::rpc::{sample, Limits};
-use idl_verify::{run_decoder, verify, Error, Reference, Report, Samples};
+use idl_verify::{run_decoder, verify, Error, Reference, Report, Samples, SamplingSummary};
 use serde_json::{json, Value};
 
 /// Check a Solana program IDL against real account and instruction data.
@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 #[command(after_help = "Exit codes:
   0  no errors (warnings and notes may be present)
   1  at least one error
-  2  a file could not be read or parsed")]
+  2  idl-verify could not run: a file could not be read or parsed, the RPC or the
+     decoder failed, or nothing was sampled")]
 struct Cli {
     /// Program IDL: Anchor (0.30+ spec) or Codama JSON.
     #[arg(long, value_name = "PATH")]
@@ -40,6 +41,16 @@ struct Cli {
     /// Program to sample with --rpc. Defaults to the IDL's address.
     #[arg(long, value_name = "ID", requires = "rpc")]
     program: Option<String>,
+    /// With --rpc: read at most this many successful transactions, paging back through
+    /// the program's history.
+    #[arg(long, value_name = "N", requires = "rpc", value_parser = at_least_one(),
+        default_value_t = Limits::default().max_transactions)]
+    max_tx: usize,
+    /// With --rpc: stop after this many successful transactions in a row bring no new
+    /// instruction or event kind.
+    #[arg(long, value_name = "N", requires = "rpc", value_parser = at_least_one(),
+        default_value_t = Limits::default().stall)]
+    stall: usize,
     /// Reference decoder output to compare values with (see tools/reference).
     #[arg(long, value_name = "PATH", conflicts_with = "decoder")]
     reference: Option<PathBuf>,
@@ -47,6 +58,13 @@ struct Cli {
     /// answers one per line (see README, "Decoder under test"). Split on whitespace.
     #[arg(long, value_name = "CMD")]
     decoder: Option<String>,
+    /// Another IDL of the same program, such as the one before a migration: decode the
+    /// samples with it too and compare values and discriminators.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["reference", "decoder"])]
+    compare_idl: Option<PathBuf>,
+    /// Write what a live run sampled to this file, to rerun it offline with --samples.
+    #[arg(long, value_name = "PATH", requires = "rpc")]
+    save_samples: Option<PathBuf>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -69,10 +87,25 @@ fn run(cli: &Cli) -> Result<u8, Error> {
         path: cli.idl.clone(),
         source,
     })?;
-    let samples = if let Some(path) = &cli.samples {
-        Samples::from_json(&read(path)?)?
+    let (samples, sampling) = if let Some(path) = &cli.samples {
+        let samples = Samples::from_json(&read(path)?)?;
+        if samples.accounts.is_empty()
+            && samples.instructions.is_empty()
+            && samples.events.is_empty()
+        {
+            return Err(Error::NothingSampled(format!(
+                "{} holds no samples",
+                path.display()
+            )));
+        }
+        (samples, None)
     } else {
-        let url = cli.rpc.as_deref().unwrap_or_default();
+        let url = cli.rpc.as_deref().unwrap_or_default().trim();
+        if url.is_empty() {
+            return Err(Error::Usage(
+                "the RPC URL is empty; set --rpc or IDL_VERIFY_RPC_URL".into(),
+            ));
+        }
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(30)))
@@ -80,24 +113,65 @@ fn run(cli: &Cli) -> Result<u8, Error> {
                 .build(),
         );
         let program = cli.program.as_deref().unwrap_or(&idl.address);
+        // A bad key gets an empty answer from the RPC, which would look like a quiet program.
+        if bs58::decode(program)
+            .into_vec()
+            .map_or(true, |k| k.len() != 32)
+        {
+            return Err(Error::Usage(format!(
+                "`{program}` is not a base58 program address; check --program or the IDL's address"
+            )));
+        }
         let call = |method: &str, params: Value| rpc_call(&agent, url, method, &params);
-        sample(call, &idl, program, &Limits::default())?
+        let limits = Limits {
+            max_transactions: cli.max_tx,
+            stall: cli.stall,
+            ..Limits::default()
+        };
+        let sampled = sample(call, &idl, program, &limits)?;
+        let s = &sampled.samples;
+        // A run that saw nothing has checked nothing; passing it would hide a wrong address.
+        if s.accounts.is_empty() && s.instructions.is_empty() && s.events.is_empty() {
+            return Err(Error::NothingSampled(format!(
+                "read {} successful transactions of {program} and found no instruction, account or event of it; check the program address",
+                sampled.transactions
+            )));
+        }
+        if let Some(path) = &cli.save_samples {
+            std::fs::write(path, s.to_json()).map_err(|source| Error::Save {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        let summary = SamplingSummary {
+            transactions: sampled.transactions,
+            stop_reason: sampled.stop_reason.to_string(),
+        };
+        (sampled.samples, Some(summary))
     };
-    let reference = match (&cli.reference, &cli.decoder) {
-        (Some(path), _) => Some(Reference::from_json(&read(path)?, &samples)?),
-        (None, Some(command)) => {
+    let reference = match (&cli.reference, &cli.decoder, &cli.compare_idl) {
+        (_, _, Some(path)) => {
+            let old = Idl::from_json(&read(path)?).map_err(|source| Error::Idl {
+                path: path.clone(),
+                source,
+            })?;
+            Some(Reference::from_idl(&old, &idl, &samples))
+        }
+        (Some(path), _, None) => Some(Reference::from_json(&read(path)?, &samples)?),
+        (None, Some(command), None) => {
             let words: Vec<String> = command.split_whitespace().map(str::to_string).collect();
             let program = cli
                 .program
                 .as_deref()
                 .or(samples.program_id.as_deref())
                 .unwrap_or(&idl.address);
-            Some(run_decoder(&words, &samples, program)?)
+            Some(run_decoder(&words, &samples, program, &idl)?)
         }
-        (None, None) => None,
+        (None, None, None) => None,
     };
 
-    let report = verify(&idl, &samples, reference.as_ref());
+    let mut report = verify(&idl, &samples, reference.as_ref());
+    report.sampling = sampling;
     print(&report, cli.json).map_err(Error::Write)?;
     Ok(report.exit_code())
 }
@@ -135,6 +209,10 @@ fn rpc_call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
     Err(fail(
         "still rate limited or failing after 5 attempts".into(),
     ))
+}
+
+fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::new().range(1..)
 }
 
 fn read(path: &Path) -> Result<String, Error> {

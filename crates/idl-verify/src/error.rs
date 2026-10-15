@@ -23,6 +23,11 @@ pub enum Error {
     },
     #[error("cannot write the report: {0}")]
     Write(std::io::Error),
+    #[error("cannot write {path}: {source}")]
+    Save {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("reference file is not valid JSON: {0}")]
     ReferenceJson(serde_json::Error),
     #[error("reference file does not match the samples: {0}")]
@@ -33,4 +38,8 @@ pub enum Error {
     Rpc(String),
     #[error("decoder under test: {0}")]
     Decoder(String),
+    #[error("nothing to check: {0}")]
+    NothingSampled(String),
+    #[error("{0}")]
+    Usage(String),
 }

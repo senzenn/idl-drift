@@ -1,6 +1,6 @@
 # idl-verify
 
-Checks a Solana program IDL against real account and instruction data.
+Checks a Solana program IDL against real account, instruction and event data.
 
 `idl-drift diff` catches an IDL that changed between two versions. `idl-verify` catches an
 IDL that is wrong today: one that a parser decodes without any error, reading the wrong
@@ -28,6 +28,9 @@ idl-verify --idl idl.json --samples samples.json --json
 idl-verify --idl idl.json --samples samples.json --reference reference.json
 IDL_VERIFY_RPC_URL=<url> idl-verify --idl idl.json
 IDL_VERIFY_RPC_URL=<url> idl-verify --idl idl.json --program <program id>
+IDL_VERIFY_RPC_URL=<url> idl-verify --idl idl.json --max-tx 400 --stall 150 --save-samples samples.json
+idl-verify --idl idl.json --samples samples.json --decoder ./target/release/verify-decoder
+idl-verify --idl new.json --samples samples.json --compare-idl old.json
 ```
 
 `--idl` takes an Anchor IDL (0.30+ spec, with discriminators) or a Codama `rootNode` file.
@@ -87,7 +90,7 @@ how many accounts the samples pass and `idl accounts` how many the IDL lists.
 |---|---|
 | `0` | No errors. Warnings and notes may be present. |
 | `1` | At least one error. |
-| `2` | A file could not be read or parsed. |
+| `2` | idl-verify could not run: a file could not be read or parsed, the RPC or the decoder under test failed, or nothing was sampled. A run never passes on data it did not check. |
 
 The same contract as `idl-drift diff`, so CI can gate on it:
 
@@ -103,16 +106,17 @@ explorer.
 
 | Check (`--json` name) | Severity | What it means |
 |---|---|---|
-| `discriminator` | error | A sample's discriminator matches nothing in the IDL: the program uses an account type or instruction the IDL lacks, or the IDL has no discriminators at all. For legacy (pre-0.30) Anchor IDLs, which leave them out, they are computed from the names the way Anchor does. An account type with no discriminator is matched by exact data length: the IDL's `size` (or Codama size discriminator), else the type's fixed size. |
+| `discriminator` | error | A sample's discriminator matches nothing in the IDL: the program uses an account type, instruction or event the IDL lacks, or the IDL has no discriminators at all. Event samples against an IDL with no `events` give one error. For legacy (pre-0.30) Anchor IDLs, which leave them out, they are computed from the names the way Anchor does. An account type with no discriminator is matched by exact data length: the IDL's `size` (or Codama size discriminator), else the type's fixed size. |
 | `missing_type` | error | An account has no entry in `types`, so it cannot be decoded. |
 | `decode` | error | The data does not fit the IDL: too short, an invalid bool, option tag, enum tag or UTF-8 string. The message names the field and offset. When every failing account is shorter than the layout, the hint says so: those accounts may predate an upgrade. |
-| `bytes_used` | error, warning or note | The IDL accounts for fewer bytes than the data holds. See [unused bytes](#unused-bytes). For instructions, any trailing byte is an error: instruction data has no slack, so the IDL is missing or narrowing an argument. |
+| `bytes_used` | error, warning or note | The IDL accounts for fewer bytes than the data holds. See [unused bytes](#unused-bytes). For instructions, any trailing byte is an error: instruction data has no slack, so the IDL is missing or narrowing an argument. For events, bytes after the payload are an error when any is non-zero, else a note. When every sample has the same trailing bytes, the hint names an N-byte missing field, and an `Option` shape when it fits. |
+| `envelope` | error | A self-CPI event sample does not start with the expected envelope: the IDL's, else Anchor's event tag. |
 | `layout` | error or warning | Error: a `bytemuck` (Pod) type whose computed layout has padding, which Pod forbids, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not pin down (an option, vec, enum, generic or `repr(Rust)` inside it); it is reported as unverifiable instead of guessed. |
 | `size_distribution` | note | A fixed-size account type comes in several sizes, such as accounts created before an upgrade. |
 | `account_count` | error, warning or note | Error: samples pass fewer accounts than the IDL lists, naming the missing accounts and their fixed addresses. A parser that checks the account count rejects every such instruction. Warning: only optional accounts are missing. Note: samples pass more accounts than the IDL lists (remaining accounts). |
 | `fixed_address` | error | An account the IDL pins to an address (a program or sysvar) holds another key. The IDL's account order does not match the program. An absent optional account passed as the program id is accepted. |
 | `program_id` | warning | The samples' `programId` is not the IDL's `address`. |
-| `reference` | error, warning or note | Decoded values disagree with the reference decoder (error), the reference failed (warning), or a type was skipped (note). See [reference comparison](#reference-comparison). |
+| `reference` | error, warning or note | Decoded values disagree with the other decoder (error). The other side failed: an error for the decoder under test or the old IDL, a warning for the reference decoder. A type was skipped, or the decoder under test skipped a sample kind it does not decode (note). See [reference comparison](#reference-comparison). |
 
 ### Unused bytes
 
@@ -151,6 +155,9 @@ with SBF alignment rules:
   ],
   "instructions": [
     { "signature": "5uXzA4qK...", "data": "9lI54oPe/fk...", "accounts": ["ST999VUT...", "4sycXz9X..."] }
+  ],
+  "events": [
+    { "signature": "5uXzA4qK...", "source": "log", "data": "eKpmsOmLc5I..." }
   ]
 }
 ```
@@ -162,25 +169,37 @@ with SBF alignment rules:
 - `instructions[].accounts`: that instruction's account keys, in order, resolved through the
   transaction's account keys and, for v0 transactions, its loaded addresses.
 - Include only instructions addressed to the program; inner (CPI) instructions count too.
+- `events[]`, optional: what the program emitted. `"source": "log"` is a `Program data:`
+  line, base64-decoded, from inside the program's own invoke frame. `"source": "cpi"` is a
+  self-CPI event instruction's data, envelope included.
 - `programId`, `address` and `signature` are optional but make the report useful. Other
   keys, such as a `type` label, are ignored: samples are classified by discriminator only.
 
-`fixtures/live/*/samples.json` are real examples, captured from mainnet.
+`fixtures/live/*/samples.json` are real examples, captured from mainnet. `--save-samples`
+writes a live run in this format, so it can be rerun offline or in CI with no RPC.
 
 ## Live sampling
 
 `--rpc <url>` samples the program (`--program`, or the IDL's `address`) over JSON-RPC:
 
-- The 40 most recent signatures, from `getSignaturesForAddress`. Failed transactions are
-  skipped, since they can carry data the program rejected.
+- Signatures from `getSignaturesForAddress`, paged back through history 1000 at a time.
+  Failed transactions are skipped, since they can carry data the program rejected.
 - From each transaction (`getTransaction`, versions 0 and 1): every instruction that calls
-  the program, top level and CPI, with keys resolved through address lookup tables. Anchor
-  self-CPI events are skipped. At most 20 instructions are kept.
+  the program, top level and CPI, with keys resolved through address lookup tables; every
+  self-CPI event, as a `cpi` event; and every `Program data:` log line written while
+  the program is the innermost running frame, as a `log` event. A line from a program it
+  calls is not credited to it. A self-CPI event is an instruction to the program that starts
+  with the IDL's envelope, else Anchor's event tag, as in Shipstern.
+- At most 5 samples per instruction discriminator, per unknown prefix and per event kind.
+- Sampling stops when every IDL instruction has 5 samples, when `--stall` transactions in a
+  row bring no new instruction or event kind (default 40), or after `--max-tx` successful
+  transactions (default 40). The report says how many it read and why it stopped.
 - The accounts those instructions pass that the program owns (`getMultipleAccounts`), at
   most 5 per account type. Accounts with an unknown discriminator are kept, so the
   `discriminator` check can report them.
 
-A failed request exits 2: a run never passes on samples it could not fetch. Rate limits
+A run that finds nothing of the program exits 2, as does an empty URL or a program address
+that is not base58: a typo must not look like a quiet program. A failed request exits 2: a run never passes on samples it could not fetch. Rate limits
 and server errors are retried 5 times. The URL is never printed, since providers put the
 API key in it.
 
@@ -213,19 +232,48 @@ binary built from Shipstern's `include_shipstern_parser!` or a Carbon decoder:
 idl-verify --idl idl.json --samples samples.json --decoder "./target/release/my-decoder spl_governance"
 ```
 
-idl-verify writes one JSON line per sample to the child's stdin, accounts first:
-`{"kind":"account","program":"<base58>","address":"...","data":"<base64>"}` then
-`{"kind":"instruction","program":"<base58>","signature":"...","data":"<base64>","accounts":["<base58>"]}`.
-The child answers one line per sample, in order: `{"status":"ok","value":...}` or
-`{"status":"error","error":"..."}`. An instruction value is `{"name":"...","data":{...}}`.
+idl-verify writes one JSON line per sample to the child's stdin: accounts, then
+instructions, then events:
+`{"kind":"account","program":"<base58>","address":"...","data":"<base64>"}`,
+`{"kind":"instruction","program":"<base58>","signature":"...","data":"<base64>","accounts":["<base58>"]}`,
+`{"kind":"event","program":"<base58>","signature":"...","source":"log"|"cpi","data":"<base64>"}`.
+Event data is `[discriminator][payload]`: idl-verify removes the self-CPI envelope first.
+The child answers one line per sample, in order: `{"status":"ok","value":...}`,
+`{"status":"error","error":"..."}`, or `{"status":"skip","reason":"..."}` for a kind it does
+not decode (a skip is a note, not an error). An instruction or event value is
+`{"name":"...","data":{...}}`.
 Values may use serde's plain shapes: bare numbers, unit variants as names, tuples as arrays.
 A generated parser reads zero-copy padding, so padded types are compared, not skipped.
+A decoder that does not answer within 60 s is stopped, and the run exits 2.
+
+## Compare two IDLs
+
+`--compare-idl <old.json>` decodes the same samples with a second IDL of the program, such
+as the legacy Anchor IDL before a move to 0.30, or a Codama conversion. It compares the
+values as `--reference` does, and cannot be combined with `--reference` or `--decoder`. A
+sample the old IDL classifies by another discriminator, or by none, is an error that names
+both. Equal values do not prove equal layouts: voltr's Codama IDL drops 7 bytes of padding
+in `AdaptorAddReceipt`, but every captured sample holds zeros after the gap. Run idl-verify
+on the old IDL alone to see its unused bytes.
+
+## Events
+
+A `log` event is `[discriminator][payload]`. A `cpi` event first loses its envelope: the
+IDL's, else Anchor's `EVENT_IX_TAG` (`e445a52e51cb9a1d`), since an Anchor IDL cannot describe
+one. A Codama IDL gives the envelope as Shipstern reads it: an all-constant discriminator
+chain, where the constant at offset 0 is the tag and the next one starts the event. The rest is classified by event discriminator and decoded as
+the `types` entry with the event's name. Sizes and offsets count from the discriminator.
+
+On mainnet, 2026-10-14: pump.fun emits each event both as a log line and as a self-CPI, and
+its `TradeEvent` carries 24 bytes that its on-chain IDL lacks, in every sample.
 
 ## JSON output
 
 `--json` prints the whole report: `program`, `samples_program_id`, `account_coverage` and
-`instruction_coverage` (`sampled`, `classified`, `not_sampled`), per-type `accounts` and
-`instructions` summaries, `reference` when compared, `findings`, `counts` (`errors`,
+`instruction_coverage` and `event_coverage` (`sampled`, `classified`, `not_sampled`),
+per-type `accounts`, `instructions` and `events` summaries (events add `sources`: `log`
+and `cpi` counts), `reference` when compared, `sampling` for a live run (`transactions`,
+`stop_reason`), `findings`, `counts` (`errors`,
 `warnings`, `notes`) and `exit_code`. Each finding has `severity`, `check`, `subject`,
 `message`, and optionally `hint` and `example`.
 
@@ -251,9 +299,13 @@ decoder over the IDL model and the `repr(C)` layout calculator.
 
 ## Limitations
 
-- **Live sampling sees recent activity only.** Account types and instructions that the last
-  40 transactions don't touch are not sampled; the report lists them under "not sampled".
-- **Events are not checked.** Neither `Program data:` logs nor self-CPI events.
+- **Live sampling sees recent activity only.** Instructions and events that the sampled
+  transactions don't touch are not checked; the report lists them under "not sampled".
+  Raise `--max-tx` and `--stall` to look further back.
+- **A narrowed last field can hide.** When the bytes a narrower type leaves unread are zero,
+  such as the high half of a small timestamp, they look like spare room: a note, not an
+  error.
+- **The decoder under test sees accounts and instructions, not events.**
 - **Spare allocation is a heuristic.** "Rounded up to 8" is a common allocation pattern,
   not proof; it is a warning for that reason.
 - **The reference decoder reads the same IDL.** A reference mismatch means one of the two

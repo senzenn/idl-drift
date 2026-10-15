@@ -118,3 +118,26 @@ fn reads_the_rpc_url_from_the_environment() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("getSignaturesForAddress"), "{stderr}");
 }
+
+#[test]
+fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
+    let empty = std::env::temp_dir().join("idl-verify-empty-samples.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let cases: [(&[&str], &str); 3] = [
+        (&["--samples", empty.to_str().unwrap()], "holds no samples"),
+        (&["--rpc", " "], "the RPC URL is empty"),
+        (
+            &["--rpc", "http://127.0.0.1:9/k", "--program", "not-a-key"],
+            "is not a base58 program address",
+        ),
+    ];
+    let idl = live("voltr_vault/idl.json");
+    for (args, message) in cases {
+        let mut all = vec!["--idl", idl.as_str()];
+        all.extend_from_slice(args);
+        let out = idl_verify(&all);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+}

@@ -30,6 +30,8 @@ pub enum Check {
     SizeDistribution,
     AccountCount,
     FixedAddress,
+    /// A self-CPI event sample without the envelope the IDL (or Anchor) puts before events.
+    Envelope,
     Reference,
 }
 
@@ -37,7 +39,8 @@ pub enum Check {
 pub struct Finding {
     pub severity: Severity,
     pub check: Check,
-    /// What the finding is about: `account Vault`, `instruction deposit` or `program`.
+    /// What the finding is about: `account Vault`, `instruction deposit`, `event Swap` or
+    /// `program`.
     pub subject: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +86,26 @@ pub struct InstructionSummary {
     pub data_sizes: Range,
 }
 
+/// How many samples of an event came from each source.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct EventSources {
+    /// `Program data:` log lines.
+    pub log: usize,
+    /// Self-CPI event instructions.
+    pub cpi: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventSummary {
+    pub name: String,
+    pub samples: usize,
+    pub sources: EventSources,
+    /// Observed sizes, discriminator included, self-CPI envelope excluded.
+    pub sizes: Vec<SizeCount>,
+    /// Bytes the decoder used, discriminator included; `None` when nothing decoded.
+    pub bytes_used: Option<Range>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Range {
     pub min: usize,
@@ -117,7 +140,7 @@ impl std::fmt::Display for Range {
 pub struct Coverage {
     pub sampled: usize,
     pub classified: usize,
-    /// Types or instructions in the IDL that no sample exercises.
+    /// Types, instructions or events in the IDL that no sample exercises.
     pub not_sampled: Vec<String>,
 }
 
@@ -127,6 +150,8 @@ pub struct ReferenceSummary {
     pub accounts_matched: usize,
     pub instructions_compared: usize,
     pub instructions_matched: usize,
+    pub events_compared: usize,
+    pub events_matched: usize,
     /// Samples not compared, such as zero-copy types with padding.
     pub skipped: usize,
 }
@@ -139,9 +164,22 @@ pub struct Report {
     pub accounts: Vec<AccountSummary>,
     pub instruction_coverage: Coverage,
     pub instructions: Vec<InstructionSummary>,
+    pub event_coverage: Coverage,
+    pub events: Vec<EventSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<ReferenceSummary>,
+    /// How a live run sampled; absent for a samples file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingSummary>,
     pub findings: Vec<Finding>,
+}
+
+/// What a live `--rpc` run read before it stopped.
+#[derive(Debug, Clone, Serialize)]
+pub struct SamplingSummary {
+    /// Successful transactions read.
+    pub transactions: usize,
+    pub stop_reason: String,
 }
 
 impl Report {
@@ -197,17 +235,30 @@ impl Report {
     pub fn write_human(&self, out: &mut impl Write, color: bool) -> io::Result<()> {
         let p = &self.program;
         writeln!(out, "{} {}  {}", p.name, p.version, p.address)?;
+        if let Some(s) = &self.sampling {
+            writeln!(
+                out,
+                "sampled {} transactions; stopped because {}",
+                s.transactions, s.stop_reason
+            )?;
+        }
         self.write_tables(out)?;
 
         let unsampled_types = self.account_coverage.not_sampled.len();
         let unsampled_ixs = self.instruction_coverage.not_sampled.len();
-        if unsampled_types + unsampled_ixs > 0 {
-            writeln!(
+        let unsampled_events = self.event_coverage.not_sampled.len();
+        if unsampled_types + unsampled_ixs + unsampled_events > 0 {
+            write!(
                 out,
                 "\nnot sampled: {unsampled_types} of {} account types, {unsampled_ixs} of {} instructions",
                 unsampled_types + self.accounts.len(),
                 unsampled_ixs + self.instructions.len(),
             )?;
+            let events = unsampled_events + self.events.len();
+            if events > 0 {
+                write!(out, ", {unsampled_events} of {events} events")?;
+            }
+            writeln!(out)?;
         }
 
         if let Some(r) = &self.reference {
@@ -219,6 +270,13 @@ impl Report {
                 r.instructions_matched,
                 r.instructions_compared
             )?;
+            if r.events_compared > 0 {
+                write!(
+                    out,
+                    ", {} of {} events match",
+                    r.events_matched, r.events_compared
+                )?;
+            }
             if r.skipped > 0 {
                 write!(out, " ({} samples skipped)", r.skipped)?;
             }
@@ -287,6 +345,35 @@ impl Report {
             write_table(
                 out,
                 ["name", "samples", "accounts", "idl accounts", "data"],
+                &rows,
+            )?;
+        }
+
+        let ec = &self.event_coverage;
+        writeln!(
+            out,
+            "\nevents: {} sampled, {} classified",
+            ec.sampled, ec.classified
+        )?;
+        if !self.events.is_empty() {
+            let rows: Vec<[String; 6]> = self
+                .events
+                .iter()
+                .map(|e| {
+                    [
+                        e.name.clone(),
+                        e.samples.to_string(),
+                        e.sources.log.to_string(),
+                        e.sources.cpi.to_string(),
+                        sizes_cell(&e.sizes),
+                        e.bytes_used
+                            .map_or_else(|| "-".to_string(), |r| r.to_string()),
+                    ]
+                })
+                .collect();
+            write_table(
+                out,
+                ["name", "samples", "log", "cpi", "size", "used"],
                 &rows,
             )?;
         }

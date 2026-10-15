@@ -52,10 +52,11 @@ pub fn from_codama(root: RootNode) -> Idl {
         .iter()
         .map(|e| {
             types.push(event_as_type_def(e));
-            let (envelope_discriminator, envelope_payload_offset) = extract_event_envelope(e);
+            let (discriminator, envelope_discriminator, envelope_payload_offset) =
+                extract_event_parts(e);
             Event {
                 name: e.name.to_string(),
-                discriminator: extract_event_discriminator(e).0,
+                discriminator,
                 envelope_discriminator,
                 envelope_payload_offset,
             }
@@ -412,23 +413,30 @@ fn extract_event_discriminator(e: &EventNode) -> (Discriminator, usize) {
     })
 }
 
-/// The self-CPI envelope: the constant bytes of a `hiddenPrefixTypeNode` around the event
-/// payload, and the payload offset they imply. A bare struct has no envelope.
-fn extract_event_envelope(e: &EventNode) -> (Discriminator, Option<usize>) {
-    let TypeNode::HiddenPrefix(hp) = e.data.as_ref() else {
-        return (Vec::new(), None);
-    };
-    let mut bytes = Vec::new();
-    for constant in &hp.prefix {
-        if let Some(chunk) = value_to_bytes(constant.value.as_ref(), constant.r#type.as_ref()) {
-            bytes.extend(chunk);
-        }
+/// The event discriminator and the self-CPI envelope, by Shipstern's rule
+/// (`proc-macro/src/parse.rs`): Codama has no node for the envelope, so in an all-constant
+/// chain sorted by offset, one constant at offset 0 is the tag and the next one starts the
+/// event. The `hiddenPrefix` around the data only hides those bytes from the struct.
+fn extract_event_parts(e: &EventNode) -> (Discriminator, Discriminator, Option<usize>) {
+    let mut constants: Vec<(usize, Vec<u8>)> = e
+        .discriminators
+        .iter()
+        .filter_map(|d| match d {
+            DiscriminatorNode::Constant(c) => Some((
+                usize::try_from(c.offset).ok()?,
+                value_to_bytes(c.constant.value.as_ref(), c.constant.r#type.as_ref())?,
+            )),
+            _ => None,
+        })
+        .collect();
+    // Shipstern accepts an envelope only in an all-constant chain.
+    if constants.len() != e.discriminators.len() {
+        constants.clear();
     }
-    if bytes.is_empty() {
-        (Vec::new(), None)
-    } else {
-        let len = bytes.len();
-        (bytes, Some(len))
+    constants.sort_by_key(|(offset, _)| *offset);
+    match constants.as_slice() {
+        [(0, tag), (offset, disc), ..] if *offset > 0 => (disc.clone(), tag.clone(), Some(*offset)),
+        _ => (extract_event_discriminator(e).0, Vec::new(), None),
     }
 }
 

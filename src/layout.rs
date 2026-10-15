@@ -596,6 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn i128_aligns_to_8_on_sbf() {
+        let l = layout(
+            r#"[{"name":"S","type":{"kind":"struct","fields":[
+                {"name":"a","type":"u8"},{"name":"b","type":"i128"}]}}]"#,
+            "S",
+        )
+        .unwrap();
+        assert_eq!((l.fields[1].offset, l.size, l.align), (8, 24, 8));
+    }
+
+    #[test]
+    fn pubkey_aligns_to_1() {
+        let l = layout(
+            r#"[{"name":"S","type":{"kind":"struct","fields":[
+                {"name":"a","type":"u8"},{"name":"b","type":"pubkey"}]}}]"#,
+            "S",
+        )
+        .unwrap();
+        assert_eq!((l.fields[1].offset, l.size, l.align), (1, 33, 1));
+    }
+
+    #[test]
     fn align_modifier_rounds_the_size() {
         let l = layout(
             r#"[{"name":"S","repr":{"kind":"c","align":16},"type":{"kind":"struct","fields":[

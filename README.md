@@ -85,8 +85,17 @@ idl-drift inspect idl.json --layout
 Lists the fields whose byte layout `idl-drift` could not resolve, such as inline structs or
 Codama encodings with no Borsh equivalent (big-endian numbers, non-`u32` length prefixes,
 zeroable options). A change to such a field can't be classified, and `idl-verify` can't
-decode it, so run this before trusting a `diff` on a new IDL. Exit code 1 means at least
-one unresolved field.
+decode it, so run this before trusting a `diff` on a new IDL.
+
+It also lists padded zero-copy types that Borsh also reads (`SHARED:` lines). A type inside
+a `bytemuckunsafe` account sits at `repr(C)` offsets, with implicit padding. When an
+instruction argument, an event or a Borsh account reaches the same type, Borsh reads it
+without the padding, so one definition cannot describe both reads. Shipstern's converter
+rejects this case as `PaddedBorshType`. None of the 170 IDLs in the Shipstern parity corpus
+has one: only voltr_vault has padded types in zero-copy memory (`AdaptorAddReceipt`,
+`RequestWithdrawVaultReceipt`), and no Borsh read reaches them.
+
+Exit code 1 means at least one unresolved field or one shared padded type.
 
 `--layout` also prints every `bytemuck` and `bytemuckunsafe` type field by field: offset,
 size and alignment under SBF `repr(C)`, each implicit gap, and the zero-copy size next to the
@@ -135,7 +144,7 @@ and a self-CPI event envelope that changes length (Anchor's 8-byte tag to Pinocc
 | `src/model.rs` | The flat IDL model, and legacy Anchor normalization |
 | `src/codama_convert.rs` | Codama `rootNode` to the flat model |
 | `src/diff.rs` | Reachability and every classification rule |
-| `src/inspect.rs` | The unresolved-field scan |
+| `src/inspect.rs` | The unresolved-field scan, zero-copy layouts and shared padded types |
 | `src/main.rs` | The `idl-drift` CLI |
 | `crates/idl-verify/` | `idl-verify`: decoder, zero-copy layout, checks and report |
 | `tests/diff_tests.rs` | One or more tests per diff rule |

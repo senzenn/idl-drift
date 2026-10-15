@@ -885,12 +885,13 @@ fn limit_order_v1_to_v2_is_breaking() {
             .collect::<Vec<_>>()
     );
 
-    // v1 events are bare structs; v2 wraps them in a self-CPI envelope.
+    // v2's Codama events hide only their own discriminator, so no envelope change: Codama
+    // has no node for a self-CPI tag, and Shipstern infers one only from a discriminator chain.
     assert!(
-        r.changes.iter().any(|c| {
-            c.severity == Severity::Breaking && c.message.to_lowercase().contains("envelope")
-        }),
-        "expected event-envelope Breaking for bare->CPI-wrapped; got {:?}",
+        !r.changes
+            .iter()
+            .any(|c| c.message.to_lowercase().contains("envelope")),
+        "{:?}",
         r.changes
     );
 
@@ -1639,4 +1640,42 @@ fn instruction_names_equal_up_to_ascii_case_are_breaking() {
     // Non-ASCII case stays apart in Shipstern's conversion, so this IDL compiles.
     let unicode = idl("ä", "Ä");
     assert!(kinds(&unicode, &unicode).is_empty());
+}
+
+#[test]
+fn codama_event_envelope_comes_from_the_discriminator_chain() {
+    // [tag @0, event discriminator @8] is Shipstern's envelope rule; one discriminator is none.
+    let event = |discriminators: &str| {
+        format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.5.1","program":{{
+            "kind":"programNode","name":"e","publicKey":"11111111111111111111111111111111",
+            "version":"0.1.0","accounts":[],"instructions":[],"definedTypes":[],"pdas":[],
+            "errors":[],"events":[{{"kind":"eventNode","name":"trade","discriminators":[{discriminators}],
+            "data":{{"kind":"structTypeNode","fields":[]}}}}]}}}}"#
+        )
+    };
+    let constant = |hex: &str, offset: u8| {
+        format!(
+            r#"{{"kind":"constantDiscriminatorNode","offset":{offset},"constant":{{"kind":"constantValueNode",
+            "type":{{"kind":"fixedSizeTypeNode","size":8,"type":{{"kind":"bytesTypeNode"}}}},
+            "value":{{"kind":"bytesValueNode","data":"{hex}","encoding":"base16"}}}}}}"#
+        )
+    };
+    // Declared out of order on purpose: Shipstern sorts the chain by offset.
+    let chained = parse(&event(&format!(
+        "{},{}",
+        constant("0102030405060708", 8),
+        constant("e445a52e51cb9a1d", 0)
+    )));
+    let e = &chained.events[0];
+    assert_eq!(e.discriminator, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        e.envelope_discriminator,
+        [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d]
+    );
+    assert_eq!(e.envelope_payload_offset, Some(8));
+    let single = parse(&event(&constant("0102030405060708", 0)));
+    let e = &single.events[0];
+    assert_eq!(e.discriminator, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(e.envelope_discriminator.is_empty());
 }

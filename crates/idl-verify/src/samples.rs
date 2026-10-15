@@ -4,7 +4,8 @@
 //! {
 //!   "programId": "vVoLTRjQmtFpiYoegx285Ze4gsLJ8ZxgFKVcuvmG1a8",
 //!   "accounts": [{ "address": "...", "data": "<base64>" }],
-//!   "instructions": [{ "signature": "...", "data": "<base64>", "accounts": ["<base58>"] }]
+//!   "instructions": [{ "signature": "...", "data": "<base64>", "accounts": ["<base58>"] }],
+//!   "events": [{ "signature": "...", "source": "log", "data": "<base64>" }]
 //! }
 //! ```
 //!
@@ -23,6 +24,7 @@ pub struct Samples {
     pub program_id: Option<String>,
     pub accounts: Vec<AccountSample>,
     pub instructions: Vec<InstructionSample>,
+    pub events: Vec<EventSample>,
 }
 
 /// One account's raw data.
@@ -40,6 +42,24 @@ pub struct InstructionSample {
     pub accounts: Vec<String>,
 }
 
+/// Where an event sample came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventSource {
+    /// A `Program data:` log line inside the program's own invoke frame.
+    Log,
+    /// A self-CPI event instruction; `data` still holds the envelope, such as Anchor's tag.
+    Cpi,
+}
+
+/// One event the program emitted, as raw bytes.
+#[derive(Debug, Clone)]
+pub struct EventSample {
+    pub signature: String,
+    pub source: EventSource,
+    pub data: Vec<u8>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SamplesJson {
@@ -49,6 +69,16 @@ struct SamplesJson {
     accounts: Vec<AccountJson>,
     #[serde(default)]
     instructions: Vec<InstructionJson>,
+    #[serde(default)]
+    events: Vec<EventJson>,
+}
+
+#[derive(Deserialize)]
+struct EventJson {
+    #[serde(default)]
+    signature: String,
+    source: EventSource,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -98,11 +128,63 @@ impl Samples {
                 })
             })
             .collect::<Result<_, Error>>()?;
+        let events = raw
+            .events
+            .into_iter()
+            .enumerate()
+            .map(|(index, e)| {
+                Ok(EventSample {
+                    data: decode_base64(&e.data, "events", index)?,
+                    signature: e.signature,
+                    source: e.source,
+                })
+            })
+            .collect::<Result<_, Error>>()?;
         Ok(Self {
             program_id: raw.program_id.filter(|id| !id.is_empty()),
             accounts,
             instructions,
+            events,
         })
+    }
+}
+
+impl Samples {
+    /// The samples as `samples.json` text, so a live run can be saved and rerun offline.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let accounts: Vec<serde_json::Value> = self
+            .accounts
+            .iter()
+            .map(|a| serde_json::json!({ "address": a.address, "data": STANDARD.encode(&a.data) }))
+            .collect();
+        let instructions: Vec<serde_json::Value> = self
+            .instructions
+            .iter()
+            .map(|ix| {
+                serde_json::json!({ "signature": ix.signature, "data": STANDARD.encode(&ix.data),
+                                    "accounts": ix.accounts })
+            })
+            .collect();
+        let events: Vec<serde_json::Value> = self
+            .events
+            .iter()
+            .map(|e| {
+                let source = match e.source {
+                    EventSource::Log => "log",
+                    EventSource::Cpi => "cpi",
+                };
+                serde_json::json!({ "signature": e.signature, "source": source,
+                                    "data": STANDARD.encode(&e.data) })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "programId": self.program_id,
+            "accounts": accounts,
+            "instructions": instructions,
+            "events": events,
+        });
+        serde_json::to_string_pretty(&doc).unwrap_or_default()
     }
 }
 
@@ -130,6 +212,29 @@ mod tests {
         assert_eq!(samples.accounts[0].data, [1, 2, 3]);
         assert_eq!(samples.instructions[0].data, [4]);
         assert_eq!(samples.instructions[0].accounts, ["X", "Y"]);
+    }
+
+    #[test]
+    fn events_are_optional_and_keep_their_source() {
+        let samples = Samples::from_json(
+            r#"{"events":[{"signature":"S","source":"cpi","data":"5EWlLlHLmh0="}]}"#,
+        )
+        .unwrap();
+        assert_eq!(samples.events[0].source, EventSource::Cpi);
+        assert_eq!(samples.events[0].data[..2], [0xe4, 0x45]);
+        assert!(Samples::from_json("{}").unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn saved_samples_load_back_unchanged() {
+        let src = r#"{"programId":"P","accounts":[{"address":"A","data":"AQID"}],
+            "instructions":[{"signature":"S","data":"BA==","accounts":["X"]}],
+            "events":[{"signature":"S","source":"log","data":"BQY="}]}"#;
+        let samples = Samples::from_json(src).unwrap();
+        let again = Samples::from_json(&samples.to_json()).unwrap();
+        assert_eq!(again.to_json(), samples.to_json());
+        assert_eq!(again.events[0].source, EventSource::Log);
+        assert_eq!(again.instructions[0].accounts, ["X"]);
     }
 
     #[test]

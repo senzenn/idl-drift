@@ -83,6 +83,8 @@ fn voltr_vault_anchor_idl_is_clean() {
     assert_eq!(report.count(Severity::Warning), 0, "{:#?}", report.findings);
     assert_eq!(report.account_coverage.classified, 16);
     assert_eq!(report.instruction_coverage.classified, 20);
+    // 25 mainnet events over 7 types, captured with --save-samples on 2026-10-14.
+    assert_eq!(report.event_coverage.classified, 25);
     let receipt = report
         .accounts
         .iter()
@@ -403,4 +405,51 @@ fn numeric_constant_discriminator_is_the_body_first_field() {
     // Another first byte is another account type, not a shifted read of this one.
     let report = run(&idl, &samples(vec![account(13, 7)]));
     assert_eq!(only_error(&report).check, Check::Discriminator);
+}
+
+#[test]
+fn event_field_the_idl_leaves_out_is_flagged() {
+    // Without its last field, a timestamp, DepositVaultEvent leaves 8 non-zero bytes unread.
+    // Narrowing that u64 to a u32 would not do: its high 4 bytes are zero, so a note.
+    let mut idl = json("voltr_vault/idl.json");
+    let ty = idl["types"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["name"] == "DepositVaultEvent")
+        .unwrap();
+    ty["type"]["fields"].as_array_mut().unwrap().pop();
+    let report = run(&idl, &json("voltr_vault/samples.json"));
+    let error = only_error(&report);
+    assert_eq!(
+        (error.check, error.subject.as_str()),
+        (Check::BytesUsed, "event DepositVaultEvent")
+    );
+    assert!(
+        error.message.starts_with("8 bytes after the payload"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn pump_fun_trade_event_carries_fields_its_idl_lacks() {
+    // Mainnet, 2026-10-14: pump.fun emits each event as a log line and as a self-CPI, and
+    // writes 24 bytes past the on-chain IDL's TradeEvent in both.
+    let report = run_fixture("pump_fun");
+    let error = only_error(&report);
+    assert_eq!(error.subject, "event TradeEvent");
+    assert!(
+        error
+            .message
+            .starts_with("24 bytes after the payload in 10 of 10 samples"),
+        "{}",
+        error.message
+    );
+    let trade = report
+        .events
+        .iter()
+        .find(|e| e.name == "TradeEvent")
+        .unwrap();
+    assert_eq!((trade.sources.log, trade.sources.cpi), (5, 5));
 }

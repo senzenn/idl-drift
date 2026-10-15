@@ -3,16 +3,19 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use idl_drift::model::{Account, AccountItem, Idl, Instruction, NamedDisc, Type, TypeDef};
+use idl_drift::model::{Account, AccountItem, Event, Idl, Instruction, NamedDisc, Type, TypeDef};
 
 use crate::decode::{DecodeError, Decoder, Value};
 use crate::layout::{Reading, StructLayout, TypeIndex};
 use crate::reference::{first_difference, normalize, to_json, Outcome, Reference};
 use crate::report::{
-    AccountSummary, Check, Coverage, Finding, InstructionSummary, ProgramInfo, Range,
-    ReferenceSummary, Report, Severity, SizeCount,
+    AccountSummary, Check, Coverage, EventSources, EventSummary, Finding, InstructionSummary,
+    ProgramInfo, Range, ReferenceSummary, Report, Severity, SizeCount,
 };
-use crate::samples::Samples;
+use crate::samples::{EventSample, EventSource, Samples};
+
+/// Anchor's `EVENT_IX_TAG` in little-endian: the envelope `emit_cpi!` puts before an event.
+pub(crate) const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
 /// Check `samples` against `idl`, optionally comparing values with a reference decoder.
 #[must_use]
@@ -29,6 +32,7 @@ pub fn verify(idl: &Idl, samples: &Samples, reference: Option<&Reference>) -> Re
     v.check_program_id();
     let (account_coverage, accounts) = v.check_accounts();
     let (instruction_coverage, instructions) = v.check_instructions();
+    let (event_coverage, events) = v.check_events();
     let Verifier {
         findings,
         reference_summary,
@@ -45,7 +49,10 @@ pub fn verify(idl: &Idl, samples: &Samples, reference: Option<&Reference>) -> Re
         accounts,
         instruction_coverage,
         instructions,
+        event_coverage,
+        events,
         reference: reference.map(|_| reference_summary),
+        sampling: None,
         findings,
     }
 }
@@ -123,7 +130,7 @@ impl Verifier<'_> {
                 .map(|a| (a.discriminator_offset, a.discriminator.as_slice())),
         );
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); idl.accounts.len()];
-        let sized = self.sized_account_types();
+        let sized = sized_account_types(self.idl);
         let by_size = table.is_empty() && !sized.is_empty();
         // Key: the head of the error message, so each kind of miss groups on its own.
         let mut unknown: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -216,34 +223,6 @@ impl Verifier<'_> {
             not_sampled,
         };
         (coverage, summaries)
-    }
-
-    /// Account types with no discriminator and a known size: the IDL's declared `size`, else
-    /// the type's fixed size. Codama's size discriminator tells such accounts apart by length.
-    fn sized_account_types(&self) -> Vec<(usize, usize)> {
-        let index = TypeIndex::new(self.idl);
-        self.idl
-            .accounts
-            .iter()
-            .enumerate()
-            .filter(|(_, nd)| nd.discriminator.is_empty())
-            .filter_map(|(i, nd)| {
-                let computed = || {
-                    let td = index.get(&nd.name)?;
-                    let reading = if td.is_zero_copy() {
-                        Reading::ZeroCopy
-                    } else {
-                        Reading::Borsh
-                    };
-                    let ty = Type::Defined {
-                        name: nd.name.clone(),
-                        generics: Vec::new(),
-                    };
-                    index.reading_size(&ty, reading).ok()
-                };
-                nd.size.or_else(computed).map(|size| (i, size))
-            })
-            .collect()
     }
 
     fn check_account_type(&mut self, nd: &NamedDisc, idxs: &[usize]) -> AccountSummary {
@@ -469,6 +448,11 @@ impl Verifier<'_> {
             }
         }
         let total = outcomes.len();
+        let tails: Vec<&[u8]> = outcomes
+            .iter()
+            .filter_map(|(i, r)| accounts[*i].data.get(r.as_ref().ok()?.1..))
+            .collect();
+        let missing_field = missing_field_hint(&tails);
         for ((size, used), idxs) in classes {
             let unused = size - used;
             let count = of_samples(idxs.len(), total);
@@ -503,7 +487,7 @@ impl Verifier<'_> {
                     "the account size is the data size rounded up to 8 bytes, which suggests spare allocation; confirm against the program source".to_string(),
                 )
             } else {
-                let mut hint = "the IDL may be missing fields or padding, or the program allocates more space than the type needs".to_string();
+                let mut hint = missing_field.clone().unwrap_or_else(|| "the IDL may be missing fields or padding, or the program allocates more space than the type needs".to_string());
                 if nd.size == Some(used) {
                     let _ = write!(
                         hint,
@@ -549,6 +533,12 @@ impl Verifier<'_> {
         let total = outcomes.len();
         if let Some(&first) = nonzero.first() {
             let example = accounts[first].address.clone();
+            let tails: Vec<&[u8]> = outcomes
+                .iter()
+                .filter_map(|(i, r)| accounts[*i].data.get(r.as_ref().ok()?.1..))
+                .collect();
+            let hint = missing_field_hint(&tails)
+                .unwrap_or_else(|| "the IDL may be missing trailing fields".into());
             self.push(
                 Severity::Warning,
                 Check::BytesUsed,
@@ -557,7 +547,7 @@ impl Verifier<'_> {
                     "non-zero bytes follow the decoded data in {}",
                     of_samples(nonzero.len(), total)
                 ),
-                Some("the IDL may be missing trailing fields".into()),
+                Some(hint),
                 Some(&example),
             );
         } else if !affected.is_empty() {
@@ -625,9 +615,25 @@ impl Verifier<'_> {
         entries: &[(usize, Option<&Outcome>, &Value)],
         id: impl Fn(usize) -> String,
     ) -> (usize, usize) {
+        let (label, failure_severity) =
+            self.reference
+                .map_or(("the reference decoder", Severity::Warning), |r| {
+                    let severity = if r.failures_are_errors {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    };
+                    (r.label, severity)
+                });
+        let theirs_name = if label == "the reference decoder" {
+            "the reference"
+        } else {
+            label
+        };
         let mut compared = 0;
         let mut mismatches = Vec::new();
         let mut failures = Vec::new();
+        let mut skipped = Vec::new();
         for &(i, outcome, value) in entries {
             match outcome {
                 Some(Outcome::Ok(theirs)) => {
@@ -637,8 +643,23 @@ impl Verifier<'_> {
                     }
                 }
                 Some(Outcome::Failed(err)) => failures.push((i, err.clone())),
+                Some(Outcome::Skipped(why)) => skipped.push(why.clone()),
                 None => {}
             }
+        }
+        if let Some(why) = skipped.first() {
+            self.reference_summary.skipped += skipped.len();
+            self.push(
+                Severity::Note,
+                Check::Reference,
+                subject,
+                format!(
+                    "not compared: {label} skipped {}: {why}",
+                    of_samples(skipped.len(), entries.len())
+                ),
+                None,
+                None,
+            );
         }
         if let Some((i, d)) = mismatches.first() {
             let at = if d.path.is_empty() {
@@ -652,7 +673,7 @@ impl Verifier<'_> {
                 Check::Reference,
                 subject,
                 format!(
-                    "values differ from the reference decoder in {}{at}: idl-verify read {}, the reference {}",
+                    "values differ from {label} in {}{at}: idl-verify read {}, {theirs_name} {}",
                     of_samples(mismatches.len(), entries.len()),
                     d.ours,
                     d.theirs
@@ -664,14 +685,15 @@ impl Verifier<'_> {
         if let Some((i, err)) = failures.first() {
             let example = id(*i);
             self.push(
-                Severity::Warning,
+                failure_severity,
                 Check::Reference,
                 subject,
                 format!(
-                    "the reference decoder failed on {}: {err}",
+                    "{label} failed on {}: {err}",
                     of_samples(failures.len(), entries.len())
                 ),
-                None,
+                (failure_severity == Severity::Error)
+                    .then(|| format!("{label} rejects data that the IDL decodes")),
                 Some(&example),
             );
         }
@@ -807,6 +829,14 @@ impl Verifier<'_> {
             None => return,
         };
         let example = samples[first].signature.clone();
+        let tails: Vec<&[u8]> = outcomes
+            .iter()
+            .filter_map(|(i, r)| samples[*i].data.get(r.as_ref().ok()?.1..))
+            .collect();
+        let hint = missing_field_hint(&tails).unwrap_or_else(|| {
+            "the IDL may be missing arguments, or declares one narrower than the program reads"
+                .into()
+        });
         self.push(
             Severity::Error,
             Check::BytesUsed,
@@ -815,10 +845,7 @@ impl Verifier<'_> {
                 "{extra} after the arguments in {}",
                 of_samples(trailing.len(), outcomes.len())
             ),
-            Some(
-                "the IDL may be missing arguments, or declares one narrower than the program reads"
-                    .into(),
-            ),
+            Some(hint),
             Some(&example),
         );
     }
@@ -827,44 +854,71 @@ impl Verifier<'_> {
         let Some(reference) = self.reference else {
             return;
         };
+        let lone_arg = match ix.args.as_slice() {
+            [arg] => Some(arg.name.as_str()),
+            _ => None,
+        };
+        let (compared, matched) = self.compare_named(
+            subject,
+            &ix.name,
+            lone_arg,
+            outcomes,
+            &reference.instructions,
+            |i| self.samples.instructions[i].signature.clone(),
+        );
+        self.reference_summary.instructions_compared += compared;
+        self.reference_summary.instructions_matched += matched;
+    }
+
+    /// Compare `{name, data}` replies: the name first, then the data. Returns
+    /// (compared, matched).
+    fn compare_named(
+        &mut self,
+        subject: &str,
+        name: &str,
+        lone_arg: Option<&str>,
+        outcomes: &Outcomes,
+        theirs: &[Outcome],
+        id: impl Fn(usize) -> String,
+    ) -> (usize, usize) {
         let mut entries = Vec::new();
         let mut wrong_name = Vec::new();
         for (i, result) in outcomes {
             let Ok((value, _)) = result else { continue };
-            match reference.instructions.get(*i) {
-                // The reference reports `{name, data}`; compare the name, then the data.
-                Some(Outcome::Ok(theirs)) => {
-                    let name = theirs
+            match theirs.get(*i) {
+                Some(Outcome::Ok(reply)) => {
+                    let their_name = reply
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or_default();
-                    if normalize(name) == normalize(&ix.name) {
-                        let mut data = theirs.get("data").cloned().unwrap_or_default();
+                    if normalize(their_name) == normalize(name) {
+                        let mut data = reply.get("data").cloned().unwrap_or_default();
                         // Shipstern writes a lone struct argument as the struct itself.
-                        if let [arg] = ix.args.as_slice() {
-                            let named = data.as_object().is_some_and(|o| {
-                                o.keys().any(|k| normalize(k) == normalize(&arg.name))
-                            });
+                        if let Some(arg) = lone_arg {
+                            let named = data
+                                .as_object()
+                                .is_some_and(|o| o.keys().any(|k| normalize(k) == normalize(arg)));
                             if !named {
-                                data = serde_json::json!({ arg.name.clone(): data });
+                                data = serde_json::json!({ arg: data });
                             }
                         }
                         entries.push((*i, Some(Outcome::Ok(data)), value));
                     } else {
-                        wrong_name.push((*i, name.to_string()));
+                        wrong_name.push((*i, their_name.to_string()));
                     }
                 }
                 other => entries.push((*i, other.cloned(), value)),
             }
         }
-        if let Some((i, name)) = wrong_name.first() {
-            let example = self.samples.instructions[*i].signature.clone();
+        if let Some((i, their_name)) = wrong_name.first() {
+            let example = id(*i);
             self.push(
                 Severity::Error,
                 Check::Reference,
                 subject,
                 format!(
-                    "the reference decoder names it `{name}` in {}",
+                    "{} names it `{their_name}` in {}",
+                    self.reference.map_or("the reference decoder", |r| r.label),
                     of_samples(wrong_name.len(), outcomes.len())
                 ),
                 None,
@@ -875,11 +929,8 @@ impl Verifier<'_> {
             .iter()
             .map(|(i, o, v)| (*i, o.as_ref(), *v))
             .collect();
-        let (compared, matched) = self.compare(subject, &borrowed, |i| {
-            self.samples.instructions[i].signature.clone()
-        });
-        self.reference_summary.instructions_compared += compared + wrong_name.len();
-        self.reference_summary.instructions_matched += matched;
+        let (compared, matched) = self.compare(subject, &borrowed, &id);
+        (compared + wrong_name.len(), matched)
     }
 
     fn report_account_counts(&mut self, subject: &str, flat: &[&Account], idxs: &[usize]) {
@@ -981,6 +1032,354 @@ impl Verifier<'_> {
             }
         }
     }
+
+    // --- events ------------------------------------------------------------------------
+
+    fn check_events(&mut self) -> (Coverage, Vec<EventSummary>) {
+        let idl = self.idl;
+        let samples = &self.samples.events;
+        if idl.events.is_empty() {
+            if let Some(first) = samples.first() {
+                self.push(
+                    Severity::Error,
+                    Check::Discriminator,
+                    "events",
+                    format!(
+                        "the IDL declares no events, but the samples hold {} {}",
+                        samples.len(),
+                        plural(samples.len(), "event", "events")
+                    ),
+                    Some("the program emits events the IDL does not describe; add them to `events`, with their payload types in `types`".into()),
+                    Some(&first.signature),
+                );
+            }
+            let coverage = Coverage {
+                sampled: samples.len(),
+                classified: 0,
+                not_sampled: Vec::new(),
+            };
+            return (coverage, Vec::new());
+        }
+
+        let envelopes = envelopes(idl);
+        let bodies: Vec<Option<&[u8]>> =
+            samples.iter().map(|s| event_body(s, &envelopes)).collect();
+
+        let table = disc_table(idl.events.iter().map(|e| (0, e.discriminator.as_slice())));
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); idl.events.len()];
+        let mut no_envelope: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut unknown: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let Some(body) = body else {
+                no_envelope
+                    .entry(prefix_hex(&samples[i].data))
+                    .or_default()
+                    .push(i);
+                continue;
+            };
+            match longest_match(&table, body) {
+                Some(matches) => groups[matches[0]].push(i),
+                None => unknown.entry(prefix_hex(body)).or_default().push(i),
+            }
+        }
+        self.report_envelope_misses(&envelopes, &no_envelope);
+
+        let unknown_count: usize = unknown.values().map(Vec::len).sum();
+        if table.is_empty() && unknown_count > 0 {
+            self.push(
+                Severity::Error,
+                Check::Discriminator,
+                "events",
+                format!(
+                    "the IDL gives no event discriminators, so none of the {unknown_count} sampled events can be classified"
+                ),
+                Some("add the discriminators to the IDL; idl-verify computes them only for legacy (pre-0.30) Anchor IDLs".into()),
+                None,
+            );
+        } else {
+            for (prefix, idxs) in &unknown {
+                let example = samples[idxs[0]].signature.clone();
+                self.push(
+                    Severity::Error,
+                    Check::Discriminator,
+                    "events",
+                    format!(
+                        "{prefix} matches no event discriminator in the IDL, in {} {}",
+                        idxs.len(),
+                        plural(idxs.len(), "sample", "samples")
+                    ),
+                    Some("the program emits an event the IDL does not declare".into()),
+                    Some(&example),
+                );
+            }
+        }
+
+        let mut summaries = Vec::new();
+        let mut not_sampled = Vec::new();
+        for (ev, idxs) in idl.events.iter().zip(&groups) {
+            if idxs.is_empty() {
+                not_sampled.push(ev.name.clone());
+            } else {
+                summaries.push(self.check_event_type(ev, idxs, &bodies));
+            }
+        }
+        let missed = unknown_count + no_envelope.values().map(Vec::len).sum::<usize>();
+        let coverage = Coverage {
+            sampled: samples.len(),
+            classified: samples.len().saturating_sub(missed),
+            not_sampled,
+        };
+        (coverage, summaries)
+    }
+
+    fn report_envelope_misses(
+        &mut self,
+        envelopes: &[Envelope<'_>],
+        misses: &BTreeMap<String, Vec<usize>>,
+    ) {
+        let (expected, hint) = if envelopes == [ANCHOR_ENVELOPE] {
+            (
+                format!("Anchor's event tag {}", prefix_hex(&EVENT_IX_TAG)),
+                "the IDL gives no envelope, so idl-verify expects the tag Anchor's `emit_cpi!` writes; a program that wraps its events another way needs the envelope in the IDL (in Codama, the tag as a constant discriminator at offset 0, before the event's)",
+            )
+        } else {
+            let list: Vec<String> = envelopes.iter().map(ToString::to_string).collect();
+            (
+                format!("the IDL's envelope {}", list.join(" or ")),
+                "the IDL's envelope does not match how the program wraps its self-CPI events",
+            )
+        };
+        for (prefix, idxs) in misses {
+            let example = self.samples.events[idxs[0]].signature.clone();
+            self.push(
+                Severity::Error,
+                Check::Envelope,
+                "events",
+                format!(
+                    "self-CPI data {prefix} lacks {expected}, in {} {}",
+                    idxs.len(),
+                    plural(idxs.len(), "sample", "samples")
+                ),
+                Some(hint.into()),
+                Some(&example),
+            );
+        }
+    }
+
+    fn check_event_type(
+        &mut self,
+        ev: &Event,
+        idxs: &[usize],
+        bodies: &[Option<&[u8]>],
+    ) -> EventSummary {
+        let subject = format!("event {}", ev.name);
+        let samples = &self.samples.events;
+        let body = |i: usize| bodies[i].unwrap_or_default();
+        let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut sources = EventSources::default();
+        for &i in idxs {
+            *sizes.entry(body(i).len()).or_default() += 1;
+            match samples[i].source {
+                EventSource::Log => sources.log += 1,
+                EventSource::Cpi => sources.cpi += 1,
+            }
+        }
+        let mut summary = EventSummary {
+            name: ev.name.clone(),
+            samples: idxs.len(),
+            sources,
+            sizes: sizes
+                .iter()
+                .map(|(&size, &count)| SizeCount { size, count })
+                .collect(),
+            bytes_used: None,
+        };
+
+        let Some(td) = self.decoder.types().get(&ev.name) else {
+            self.push(
+                Severity::Error,
+                Check::MissingType,
+                &subject,
+                "has no entry in the IDL's `types`, so its payload cannot be decoded".into(),
+                None,
+                None,
+            );
+            return summary;
+        };
+        let disc = ev.discriminator.len();
+        let outcomes: Outcomes = idxs
+            .iter()
+            .map(|&i| {
+                let payload = body(i).get(disc..).unwrap_or_default();
+                let result = self
+                    .decoder
+                    .type_def(td, payload)
+                    .map(|d| (d.value, disc.saturating_add(d.len)))
+                    .map_err(|e| e.offset_by(disc));
+                (i, result)
+            })
+            .collect();
+        summary.bytes_used = Range::of(
+            outcomes
+                .iter()
+                .filter_map(|(_, r)| r.as_ref().ok().map(|(_, used)| *used)),
+        );
+
+        self.report_decode_failures(&subject, &outcomes, None, |v, i| {
+            v.samples.events[i].signature.clone()
+        });
+        self.report_event_leftover(&subject, &outcomes, bodies);
+        if let Some(reference) = self.reference {
+            let (compared, matched) = self.compare_named(
+                &subject,
+                &ev.name,
+                None,
+                &outcomes,
+                &reference.events,
+                |i| self.samples.events[i].signature.clone(),
+            );
+            self.reference_summary.events_compared += compared;
+            self.reference_summary.events_matched += matched;
+        }
+        summary
+    }
+
+    /// Event data has no allocation slack, so bytes after the payload are data the IDL
+    /// does not describe. Zeros alone may be a missing field that happens to be zero.
+    fn report_event_leftover(
+        &mut self,
+        subject: &str,
+        outcomes: &Outcomes,
+        bodies: &[Option<&[u8]>],
+    ) {
+        let mut affected = Vec::new();
+        let mut first_nonzero = None;
+        for (i, result) in outcomes {
+            let Ok((_, used)) = result else { continue };
+            let Some(rest) = bodies[*i]
+                .and_then(|b| b.get(*used..))
+                .filter(|r| !r.is_empty())
+            else {
+                continue;
+            };
+            affected.push((*i, rest.len()));
+            if first_nonzero.is_none() && rest.iter().any(|b| *b != 0) {
+                first_nonzero = Some(*i);
+            }
+        }
+        let (Some(&(first, _)), Some(extra)) = (
+            affected.first(),
+            Range::of(affected.iter().map(|(_, n)| *n)),
+        ) else {
+            return;
+        };
+        let extra = if extra.min == extra.max {
+            bytes(extra.min)
+        } else {
+            format!("{extra} bytes")
+        };
+        let (severity, what, hint, example) = match first_nonzero {
+            Some(i) => (
+                Severity::Error,
+                "",
+                "the IDL may be missing trailing fields, or declares one narrower than the program writes",
+                i,
+            ),
+            None => (
+                Severity::Note,
+                " of zeros",
+                "a trailing field the IDL lacks, or declares too narrow, may hold zero in these samples",
+                first,
+            ),
+        };
+        let example = self.samples.events[example].signature.clone();
+        self.push(
+            severity,
+            Check::BytesUsed,
+            subject,
+            format!(
+                "{extra}{what} after the payload in {}",
+                of_samples(affected.len(), outcomes.len())
+            ),
+            Some(hint.into()),
+            Some(&example),
+        );
+    }
+}
+
+/// The self-CPI envelope before an event: the bytes it starts with, and its length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Envelope<'a> {
+    prefix: &'a [u8],
+    len: usize,
+}
+
+const ANCHOR_ENVELOPE: Envelope<'static> = Envelope {
+    prefix: &EVENT_IX_TAG,
+    len: EVENT_IX_TAG.len(),
+};
+
+impl std::fmt::Display for Envelope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.prefix.is_empty() {
+            write!(f, "of {}", bytes(self.len))
+        } else {
+            f.write_str(&prefix_hex(self.prefix))
+        }
+    }
+}
+
+/// The IDL's envelope for `event`, else Anchor's: an Anchor IDL cannot describe one.
+fn envelope(event: &Event) -> Envelope<'_> {
+    match event.effective_payload_offset() {
+        Some(len) => Envelope {
+            prefix: &event.envelope_discriminator,
+            len,
+        },
+        None => ANCHOR_ENVELOPE,
+    }
+}
+
+/// The IDL's envelopes, longest prefix first, so an envelope wins over a shorter one it extends.
+pub(crate) fn envelopes(idl: &Idl) -> Vec<Envelope<'_>> {
+    let mut envelopes: Vec<Envelope<'_>> = idl.events.iter().map(envelope).collect();
+    envelopes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()).then(a.cmp(b)));
+    envelopes.dedup();
+    envelopes
+}
+
+/// The event bytes, `[discriminator][payload]`, with a self-CPI sample's envelope removed;
+/// `None` for a cpi sample that does not start with any envelope the IDL expects.
+pub(crate) fn event_body<'s>(
+    sample: &'s EventSample,
+    envelopes: &[Envelope<'_>],
+) -> Option<&'s [u8]> {
+    match sample.source {
+        EventSource::Log => Some(&sample.data),
+        EventSource::Cpi => envelopes
+            .iter()
+            .filter(|e| sample.data.starts_with(e.prefix))
+            .find_map(|e| sample.data.get(e.len..)),
+    }
+}
+
+/// The envelopes that mark a self-CPI event instruction. Shipstern uses Anchor's tag when
+/// the IDL declares none.
+pub(crate) fn cpi_envelopes(idl: &Idl) -> Vec<Envelope<'_>> {
+    let mut cpi: Vec<Envelope<'_>> = envelopes(idl)
+        .into_iter()
+        .filter(|e| !e.prefix.is_empty())
+        .collect();
+    if cpi.is_empty() {
+        cpi.push(ANCHOR_ENVELOPE);
+    }
+    cpi
+}
+
+impl Envelope<'_> {
+    pub(crate) fn wraps(&self, data: &[u8]) -> bool {
+        data.starts_with(self.prefix)
+    }
 }
 
 /// A discriminator: where it starts in the data, and its bytes.
@@ -1012,7 +1411,34 @@ pub(crate) fn longest_match(table: &[(Disc<'_>, usize)], data: &[u8]) -> Option<
 
 /// Among instructions sharing a discriminator, prefer an exact account count, then the
 /// largest count the sample satisfies (Shipstern's dispatch order).
-fn pick_by_account_count(
+/// Account types with no discriminator and a known size: the IDL's declared `size`, else
+/// the type's fixed size. Codama's size discriminator tells such accounts apart by length.
+pub(crate) fn sized_account_types(idl: &Idl) -> Vec<(usize, usize)> {
+    let index = TypeIndex::new(idl);
+    idl.accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, nd)| nd.discriminator.is_empty())
+        .filter_map(|(i, nd)| {
+            let computed = || {
+                let td = index.get(&nd.name)?;
+                let reading = if td.is_zero_copy() {
+                    Reading::ZeroCopy
+                } else {
+                    Reading::Borsh
+                };
+                let ty = Type::Defined {
+                    name: nd.name.clone(),
+                    generics: Vec::new(),
+                };
+                index.reading_size(&ty, reading).ok()
+            };
+            nd.size.or_else(computed).map(|size| (i, size))
+        })
+        .collect()
+}
+
+pub(crate) fn pick_by_account_count(
     instructions: &[Instruction],
     candidates: &[usize],
     passed: usize,
@@ -1057,6 +1483,40 @@ pub(crate) fn prefix_hex(data: &[u8]) -> String {
 fn padding_list(layout: &StructLayout) -> String {
     let parts: Vec<String> = layout.padding.iter().map(ToString::to_string).collect();
     parts.join(", ")
+}
+
+/// A hint when every sample ends in the same number of unread bytes, not all zero.
+fn missing_field_hint(tails: &[&[u8]]) -> Option<String> {
+    let n = tails.first()?.len();
+    if n == 0
+        || tails.iter().any(|t| t.len() != n)
+        || tails.iter().all(|t| t.iter().all(|b| *b == 0))
+    {
+        return None;
+    }
+    let article = if n == 11 || n == 18 || n.to_string().starts_with('8') {
+        "an"
+    } else {
+        "a"
+    };
+    let mut hint = format!(
+        "the same {} {} in every sample: the IDL is likely missing {article} {n}-byte field at the end",
+        bytes(n),
+        plural(n, "follows", "follow")
+    );
+    // A Borsh option is a 0 or 1 tag, then the value.
+    let option = match n {
+        2 => Some("u8"),
+        3 => Some("u16"),
+        5 => Some("u32"),
+        9 => Some("u64"),
+        17 => Some("u128"),
+        _ => None,
+    };
+    if let Some(ty) = option.filter(|_| tails.iter().all(|t| t.first().is_some_and(|b| *b <= 1))) {
+        let _ = write!(hint, "; it fits an Option of a {ty}");
+    }
+    Some(hint)
 }
 
 fn round_up_8(n: usize) -> Option<usize> {
@@ -1118,6 +1578,7 @@ mod tests {
                 })
                 .collect(),
             instructions: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -1133,6 +1594,7 @@ mod tests {
                     accounts: keys.iter().map(ToString::to_string).collect(),
                 })
                 .collect(),
+            events: Vec::new(),
         }
     }
 
@@ -1191,6 +1653,37 @@ mod tests {
         let f = only(&report);
         assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
         assert_eq!(f.message, "8 of 14 bytes unused in 1 of 1 sample");
+        assert_eq!(
+            f.hint.as_deref(),
+            Some("the same 8 bytes follow in every sample: the IDL is likely missing an 8-byte field at the end")
+        );
+    }
+
+    #[test]
+    fn constant_trailing_bytes_suggest_a_missing_field() {
+        let idl = idl("[]", r#"[{"name":"go","discriminator":[1]}]"#, "[]");
+        let some_u64: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let report = verify(
+            &idl,
+            &instructions(&[(some_u64, &[]), (some_u64, &[])]),
+            None,
+        );
+        assert_eq!(
+            only(&report).hint.as_deref(),
+            Some("the same 9 bytes follow in every sample: the IDL is likely missing a 9-byte field at the end; it fits an Option of a u64")
+        );
+        // Lengths that vary keep the general hint.
+        let report = verify(
+            &idl,
+            &instructions(&[(&[1, 5], &[]), (&[1, 5, 5], &[])]),
+            None,
+        );
+        assert_eq!(
+            only(&report).hint.as_deref(),
+            Some(
+                "the IDL may be missing arguments, or declares one narrower than the program reads"
+            )
+        );
     }
 
     #[test]
@@ -1269,6 +1762,7 @@ mod tests {
                 })
                 .collect(),
             instructions: Vec::new(),
+            events: Vec::new(),
         };
         // 4 bytes by the declared size, 16 by the computed Borsh size.
         let report = verify(&idl, &raw(&[&[1, 0, 0, 0], &[0; 16]]), None);
@@ -1332,5 +1826,251 @@ mod tests {
         );
         let report = verify(&idl, &instructions(&[(&[1], &["P"])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    const VOLTR_IDL: &str = include_str!("../../../fixtures/live/voltr_vault/idl.json");
+    /// `InitProtocolEvent` in the voltr IDL.
+    const INIT_PROTOCOL: [u8; 8] = [13, 81, 183, 132, 88, 43, 202, 213];
+
+    fn voltr(edit: impl FnOnce(&mut serde_json::Value)) -> Idl {
+        let mut json: serde_json::Value = serde_json::from_str(VOLTR_IDL).unwrap();
+        edit(&mut json);
+        Idl::from_json(&json.to_string()).unwrap()
+    }
+
+    /// `InitProtocolEvent { admin, treasury, operational_state: u16, initialized_ts: u64 }`.
+    fn init_protocol() -> Vec<u8> {
+        let mut out = INIT_PROTOCOL.to_vec();
+        out.extend([1; 32]);
+        out.extend([2; 32]);
+        out.extend(1u16.to_le_bytes());
+        out.extend(1_760_000_000u64.to_le_bytes());
+        out
+    }
+
+    fn events(list: &[(EventSource, Vec<u8>)]) -> Samples {
+        Samples {
+            program_id: None,
+            accounts: Vec::new(),
+            instructions: Vec::new(),
+            events: list
+                .iter()
+                .enumerate()
+                .map(|(i, (source, data))| EventSample {
+                    signature: format!("sig{i}"),
+                    source: *source,
+                    data: data.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn log(data: Vec<u8>) -> (EventSource, Vec<u8>) {
+        (EventSource::Log, data)
+    }
+
+    fn cpi(envelope: &[u8], body: &[u8]) -> (EventSource, Vec<u8>) {
+        (EventSource::Cpi, [envelope, body].concat())
+    }
+
+    /// The type of `field` in the IDL type `name`.
+    fn field_type<'j>(
+        json: &'j mut serde_json::Value,
+        name: &str,
+        field: &str,
+    ) -> &'j mut serde_json::Value {
+        let types = json["types"].as_array_mut().unwrap();
+        let td = types.iter_mut().find(|t| t["name"] == name).unwrap();
+        let fields = td["type"]["fields"].as_array_mut().unwrap();
+        let f = fields.iter_mut().find(|f| f["name"] == field).unwrap();
+        &mut f["type"]
+    }
+
+    #[test]
+    fn events_from_logs_and_self_cpi_are_decoded_and_summarized() {
+        let body = init_protocol();
+        let samples = events(&[log(body.clone()), cpi(&EVENT_IX_TAG, &body)]);
+        let report = verify(&voltr(|_| {}), &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.event_coverage.classified, 2);
+        assert_eq!(report.event_coverage.not_sampled.len(), 25);
+        let e = &report.events[0];
+        assert_eq!(
+            (e.name.as_str(), e.sources.log, e.sources.cpi),
+            ("InitProtocolEvent", 1, 1)
+        );
+        assert_eq!(e.bytes_used, Some(Range { min: 82, max: 82 }));
+
+        let mut human = Vec::new();
+        report.write_human(&mut human, false).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(
+            human.contains("\nevents: 2 sampled, 2 classified\n"),
+            "{human}"
+        );
+        assert!(
+            human.contains("InitProtocolEvent        2    1    1    82  82"),
+            "{human}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        assert_eq!(json["event_coverage"]["classified"], 2);
+        assert_eq!(json["events"][0]["sources"]["cpi"], 1);
+    }
+
+    #[test]
+    fn event_values_are_compared_with_the_decoder_under_test() {
+        let samples = events(&[
+            log(init_protocol()),
+            log(init_protocol()),
+            log(init_protocol()),
+        ]);
+        let reply = |ts: u64| {
+            Outcome::Ok(serde_json::json!({ "name": "InitProtocolEvent", "data": {
+                "admin": bs58::encode([1u8; 32]).into_string(),
+                "treasury": bs58::encode([2u8; 32]).into_string(),
+                "operational_state": 1, "initialized_ts": ts }}))
+        };
+        let reference = Reference::from_decoder(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                reply(1_760_000_000),
+                reply(7),
+                Outcome::Skipped("built without program-events".into()),
+            ],
+        );
+        let report = verify(&voltr(|_| {}), &samples, Some(&reference));
+        let found: Vec<(Severity, &str, Option<&str>)> = report
+            .findings
+            .iter()
+            .map(|f| (f.severity, f.message.as_str(), f.example.as_deref()))
+            .collect();
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(
+            found.iter().any(|(s, m, e)| *s == Severity::Error
+                && m.contains("values differ")
+                && m.contains("`initialized_ts`")
+                && *e == Some("sig1")),
+            "{found:#?}"
+        );
+        assert!(found.contains(&(
+            Severity::Note,
+            "not compared: the decoder under test skipped 1 of 3 samples: built without program-events",
+            None
+        )));
+        let r = report.reference.unwrap();
+        assert_eq!((r.events_compared, r.events_matched, r.skipped), (2, 1, 1));
+    }
+
+    #[test]
+    fn non_zero_bytes_after_an_event_payload_are_an_error() {
+        // The program writes a trailing u64 the IDL does not declare; it is zero in sig0.
+        let with = |v: u64| [init_protocol(), v.to_le_bytes().to_vec()].concat();
+        let samples = events(&[log(with(0)), log(with(5000))]);
+        let report = verify(&voltr(|_| {}), &samples, None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
+        assert_eq!(f.message, "8 bytes after the payload in 2 of 2 samples");
+        assert_eq!(f.example.as_deref(), Some("sig1"));
+    }
+
+    #[test]
+    fn narrowed_event_field_with_zero_high_bytes_is_a_note() {
+        // A u32 timestamp leaves the u64's zero high bytes after the payload.
+        let idl = voltr(|j| {
+            *field_type(j, "InitProtocolEvent", "initialized_ts") = "u32".into();
+        });
+        let report = verify(&idl, &events(&[log(init_protocol())]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Note, Check::BytesUsed));
+        assert_eq!(
+            f.message,
+            "4 bytes of zeros after the payload in 1 of 1 sample"
+        );
+    }
+
+    #[test]
+    fn unknown_event_discriminator_is_an_error() {
+        let mut body = init_protocol();
+        body[..8].copy_from_slice(&[9; 8]);
+        let report = verify(&voltr(|_| {}), &events(&[log(body)]), None);
+        let f = only(&report);
+        assert_eq!(
+            (f.severity, f.check),
+            (Severity::Error, Check::Discriminator)
+        );
+        assert_eq!(
+            f.message,
+            "0x0909090909090909 matches no event discriminator in the IDL, in 1 sample"
+        );
+        assert_eq!(report.event_coverage.classified, 0);
+    }
+
+    #[test]
+    fn event_decode_failure_names_the_field_and_offset() {
+        let mut body = init_protocol();
+        body.truncate(78);
+        let report = verify(&voltr(|_| {}), &events(&[log(body)]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::Decode));
+        assert_eq!(
+            f.message,
+            "fails to decode in 1 of 1 sample: `initialized_ts` at offset 74: needs 8 bytes, 4 left"
+        );
+    }
+
+    #[test]
+    fn event_without_a_payload_type_is_an_error() {
+        let idl = voltr(|j| {
+            let types = j["types"].as_array_mut().unwrap();
+            types.retain(|t| t["name"] != "InitProtocolEvent");
+        });
+        let report = verify(&idl, &events(&[log(init_protocol())]), None);
+        let f = only(&report);
+        assert_eq!(
+            (f.subject.as_str(), f.check),
+            ("event InitProtocolEvent", Check::MissingType)
+        );
+    }
+
+    #[test]
+    fn cpi_event_must_carry_the_expected_envelope() {
+        // Anchor IDLs cannot describe an envelope, so Anchor's tag is expected.
+        let wrong_tag = cpi(&[1, 2, 3, 4, 5, 6, 7, 8], &init_protocol());
+        let report = verify(&voltr(|_| {}), &events(&[wrong_tag]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::Envelope));
+        assert_eq!(
+            f.message,
+            "self-CPI data 0x0102030405060708 lacks Anchor's event tag 0xe445a52e51cb9a1d, in 1 sample"
+        );
+        // An envelope in the IDL replaces Anchor's tag.
+        let idl = voltr(|j| {
+            for ev in j["events"].as_array_mut().unwrap() {
+                ev["envelope_discriminator"] = serde_json::json!([9]);
+            }
+        });
+        let report = verify(&idl, &events(&[cpi(&[9], &init_protocol())]), None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn events_the_idl_cannot_classify_are_one_error() {
+        let three = events(&[log(vec![1]), log(vec![2]), log(vec![3])]);
+        let report = verify(&idl("[]", "[]", "[]"), &three, None);
+        assert_eq!(
+            only(&report).message,
+            "the IDL declares no events, but the samples hold 3 events"
+        );
+        // Events without discriminators cannot be told apart either.
+        let idl = voltr(|j| {
+            for ev in j["events"].as_array_mut().unwrap() {
+                ev["discriminator"] = serde_json::json!([]);
+            }
+        });
+        let report = verify(&idl, &three, None);
+        assert!(only(&report)
+            .message
+            .starts_with("the IDL gives no event discriminators"));
     }
 }
