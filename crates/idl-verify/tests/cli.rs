@@ -346,4 +346,111 @@ fn upgrade_impact_adds_its_json_object() {
             "broken": 0, "rent_total": 203_200})
     );
     assert_eq!(report["instructions"], serde_json::json!([]));
+
+    // A job summary gets the same table.
+    let out = idl_verify(&[
+        "--idl",
+        new.to_str().unwrap(),
+        "--samples",
+        &live("voltr_vault/samples.json"),
+        "--upgrade-impact",
+        "--markdown",
+    ]);
+    let md = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        md.contains("| Vault | 5 | 0 | 0 | 0 | 5 | 8 | 40640 |"),
+        "{md}"
+    );
+    assert!(
+        md.contains("extra rent for the 5 accounts that need a realloc\\: 203200 lamports"),
+        "{md}"
+    );
+}
+
+#[test]
+fn allow_file_allows_a_finding_and_rejects_a_typo() {
+    let allow = std::env::temp_dir().join("idl-verify-allow.txt");
+    let run = |text: &str| {
+        std::fs::write(&allow, text).unwrap();
+        idl_verify(&[
+            "--idl",
+            &live("voltr_vault/idl.js-codama.json"),
+            "--samples",
+            &live("voltr_vault/samples.json"),
+            "--json",
+            "--allow",
+            allow.to_str().unwrap(),
+        ])
+    };
+    let out = run(
+        "bytes_used account adaptorAddReceipt  # repr(C) padding, known\nbytes_used account vault\n",
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["counts"]["errors"], 0);
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == "bytes_used")
+        .unwrap();
+    assert_eq!(finding["allowed"], true);
+    assert_eq!(
+        report["unused_allows"],
+        serde_json::json!([{"line": 2, "rule": "bytes_used", "subject": "account vault"}])
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("line 2: no finding matches `bytes_used account vault`"),
+        "{stderr}"
+    );
+
+    // A typo stops the run, so that it cannot let a finding through by mistake.
+    let out = run("bytes_usd account adaptorAddReceipt\n");
+    assert_eq!(out.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let error = json["error"].as_str().unwrap();
+    assert!(
+        error.ends_with("line 1: unknown rule name `bytes_usd`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn markdown_report_lists_findings_with_hints() {
+    let out = idl_verify(&[
+        "--idl",
+        &live("voltr_vault/idl.js-codama.json"),
+        "--samples",
+        &live("voltr_vault/samples.json"),
+        "--markdown",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let md = String::from_utf8(out.stdout).unwrap();
+    assert!(md.starts_with("### idl-verify: "), "{md}");
+    assert!(
+        md.contains("| Error | 1 |\n| Warning | 0 |\n| Note | 2 |\n"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| Error | `bytes_used` | account adaptorAddReceipt | 7 of 152 bytes unused in 5 of 5 samples | 152 bytes is exactly the repr\\(C\\) layout"),
+        "{md}"
+    );
+
+    // A job summary shows why the run could not start.
+    let out = idl_verify(&[
+        "--idl",
+        "does-not-exist.json",
+        "--samples",
+        "x",
+        "--markdown",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let md = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        md.starts_with(
+            "**idl-verify could not run (exit code 2):** cannot read does\\-not\\-exist\\.json"
+        ),
+        "{md}"
+    );
 }

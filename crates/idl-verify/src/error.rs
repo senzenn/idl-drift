@@ -46,4 +46,9 @@ pub enum Error {
     Rent(String),
     #[error("{0}")]
     Usage(String),
+    #[error("allow file {path}: {source}")]
+    Allow {
+        path: PathBuf,
+        source: idl_drift::allow::AllowError,
+    },
 }

@@ -13,10 +13,12 @@
 //! ```
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
+pub mod allow;
 pub mod codama_convert;
 pub mod diff;
 pub mod inspect;
 pub mod layout;
+pub mod markdown;
 pub mod model;
 pub mod onchain;
 mod reach;

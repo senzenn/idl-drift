@@ -79,7 +79,9 @@ In the tables:
 | `--upgrade-impact` | Read `--idl` as the IDL of a program upgrade, and put each sampled account in a class: ok, shorter, needs a realloc or broken. See [upgrade impact](#upgrade-impact). |
 | `--min-coverage <PERCENT>` | Fail when less than this percent of the IDL's account types, instructions or events have a sample. |
 | `--fail-on <SEVERITY>` | The lowest severity that sets exit code 1: `error` (default) or `warning`. |
+| `--allow <FILE>` | Findings that you accept. They do not set exit code 1. See [Allow file](#allow-file). |
 | `--json` | Print the report as JSON. See [JSON output](#json-output). |
+| `--markdown` | Print the report as GitHub Markdown. See [Markdown output](#markdown-output). |
 
 Rules for the options:
 
@@ -89,6 +91,7 @@ Rules for the options:
 - `--save-samples` saves only live samples. With `--samples` it is a usage error (exit 2).
 - `--reference`, `--decoder` and `--compare-idl` cannot be combined. `--upgrade-impact`
   cannot be combined with `--reference` or `--decoder`.
+- `--json` and `--markdown` cannot be combined.
 - Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
 
 ## Exit codes
@@ -96,6 +99,28 @@ Rules for the options:
 The exit codes are in the [quick guide](../QUICKGUIDE.md#exit-codes). With the default
 `--fail-on error`, a run that exits 0 can still report warnings and notes. A run never
 passes on data that it did not check: it exits 2.
+
+## Allow file
+
+`--allow <FILE>` lists the findings that you accept. An allowed finding does not set exit
+code 1, but it stays in the report. The human report marks it `[ALLOWED]`, the JSON report
+adds `"allowed": true` to it, and the Markdown report puts it in a `<details>` block.
+
+Each line of the file holds one entry: a check name (the `check` of the finding), a space,
+and the `subject`, such as `account Vault`. Both must match the finding exactly. There are
+no wildcards. A `#` at the start of a line or after a space starts a comment, to the end of
+the line. Use the comment for the reason. Blank lines are ignored.
+
+```text
+# Known and accepted.
+bytes_used account adaptorAddReceipt   # repr(C) padding. Our parser reads the Anchor IDL.
+program_id program                     # We sample a devnet deployment.
+```
+
+- An entry that matches no finding gives a warning on stderr with its line number. The JSON
+  report lists it in `unused_allows`. It does not change the exit code.
+- A line with no subject, or a check name that idl-verify does not have, stops the run with
+  exit 2. Thus a typo cannot let a finding through.
 
 ## Checks
 
@@ -407,12 +432,26 @@ error: event TradeEvent: 24 bytes after the payload in 10 of 10 samples
 | `reference` | Only after a comparison: `accounts_compared`, `accounts_matched`, `instructions_compared`, `instructions_matched`, `events_compared`, `events_matched`, `skipped`. |
 | `sampling` | Only after a live run: `transactions` (successful transactions read) and `stop_reason`. |
 | `upgrade_impact` | Only with `--upgrade-impact`. `rent_source` (`rpc` or `formula`), `lamports_per_byte` (the offline rate, or `null` for `rpc`), `types`, `unknown` (accounts whose discriminator matches no account type, counted as broken) and `totals`. Each entry of `types` has `name`, `sampled`, `ok`, `shorter` (`count`, `bytes`), `realloc` (`count`, `bytes`, `rent_each`, `rent_total`) and `broken` (`count`, and `reasons`, each with `reason`, `count`, `detail` and `example`). `bytes` and `rent_each` are `min` and `max`, or `null` when `count` is 0. `totals` has `sampled`, `ok`, `shorter`, `realloc`, `broken` and `rent_total`. The counts are of the sample. Rent is in lamports. In this mode, `instructions` and `events` are empty. |
-| `findings` | Each finding: `severity`, `check`, `subject`, `message`, and when present `hint` and `example`. |
-| `counts` | `errors`, `warnings`, `notes`. |
+| `findings` | Each finding: `severity`, `check`, `subject`, `message`, and when present `hint` and `example`. An allowed finding also has `"allowed": true`. |
+| `unused_allows` | Only with `--allow`: the entries that match no finding, each with `line`, `rule` and `subject`. |
+| `counts` | `errors`, `warnings`, `notes`, other than allowed findings, so that they agree with the exit code. |
 | `exit_code` | The same value as the process exit code. |
 
 When the run exits 2, stdout holds only `{"error": "<message>", "exit_code": 2}`. The
 message also goes to stderr.
+
+## Markdown output
+
+`--markdown` prints GitHub Markdown for a job summary (`$GITHUB_STEP_SUMMARY`) or a pull
+request comment: a heading with the IDL and the samples, the program, the number of findings
+of each severity, the exit code, a table of the findings (severity, check, subject, message,
+hint), and the allowed findings in a `<details>` block. With `--upgrade-impact`, the upgrade
+impact table and the extra rent come before the findings. The [GitHub Action](ci.md) writes
+it to the job summary.
+
+IDL names and messages are escaped, so an IDL cannot add HTML, links or table rows. When the
+run exits 2, stdout holds one line, `**idl-verify could not run (exit code 2):** <message>`.
+The message also goes to stderr.
 
 ## Library
 

@@ -38,7 +38,7 @@ flowchart LR
 | `idl-verify` | Runtime decoder | Decodes bytes with the IDL model alone: Borsh types in order, zero-copy types at their `repr(C)` offsets. It returns the value and the number of bytes it read. |
 | `idl-verify` | Checks | Classifies each sample by discriminator (or by size, for an account type with no discriminator), decodes it, and runs each check. |
 | `idl-verify` | Value comparison | Compares its own decode with a reference file, a decoder under test, or a second IDL. It first removes differences in how decoders write the same value, such as wrappers, big integer forms and field name case. |
-| both | CLI and report | Parse the options, print the human or JSON report, and set the exit code from `--fail-on`. |
+| both | CLI and report | Parse the options, read the allow file, print the human, JSON or Markdown report, and set the exit code from `--fail-on`. |
 
 ## Design decisions
 

@@ -3,8 +3,10 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
+use idl_drift::allow::{json_name, AllowEntry, AllowList};
+use idl_drift::markdown::escape;
 use owo_colors::OwoColorize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::text::plural;
 
@@ -20,7 +22,7 @@ pub enum Severity {
 }
 
 /// The check that produced a finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Check {
     ProgramId,
@@ -59,6 +61,9 @@ pub struct Finding {
     /// Address or signature of one affected sample, to look up on an explorer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub example: Option<String>,
+    /// An allow file accepts this finding, so it does not count toward the exit code.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +191,9 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade_impact: Option<UpgradeImpact>,
     pub findings: Vec<Finding>,
+    /// With an allow file: the entries that match no finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unused_allows: Option<Vec<AllowEntry<Check>>>,
 }
 
 /// What a live `--rpc` run read before it stopped.
@@ -281,12 +289,33 @@ pub struct ImpactTotals {
 }
 
 impl Report {
+    /// The number of findings with this severity that are not allowed.
     #[must_use]
     pub fn count(&self, severity: Severity) -> usize {
         self.findings
             .iter()
-            .filter(|f| f.severity == severity)
+            .filter(|f| f.severity == severity && !f.allowed)
             .count()
+    }
+
+    /// Mark each finding that `list` allows, and keep the entries that match no finding in
+    /// `unused_allows`.
+    pub fn allow(&mut self, list: &AllowList<Check>) {
+        for f in &mut self.findings {
+            f.allowed = list.allows(&f.check, &f.subject);
+        }
+        let unused = list
+            .entries()
+            .iter()
+            .filter(|e| {
+                !self
+                    .findings
+                    .iter()
+                    .any(|f| f.check == e.rule && f.subject == e.subject)
+            })
+            .cloned()
+            .collect();
+        self.unused_allows = Some(unused);
     }
 
     /// Add an error for each kind of IDL item (account types, instructions, events) where
@@ -321,18 +350,23 @@ impl Report {
                     "with --rpc, raise --max-tx and --stall to read more transactions; else add samples of the items under \"not sampled\"".to_string(),
                 ),
                 example: None,
+                allowed: false,
             });
         }
         self.findings.extend(short);
     }
 
-    /// `true` when any finding is at `threshold` or above, for a stricter CI gate.
+    /// `true` when any finding that is not allowed is at `threshold` or above, for a
+    /// stricter CI gate.
     #[must_use]
     pub fn fails_at(&self, threshold: Severity) -> bool {
-        self.findings.iter().any(|f| f.severity >= threshold)
+        self.findings
+            .iter()
+            .any(|f| f.severity >= threshold && !f.allowed)
     }
 
-    /// 1 when any finding is an error, else 0. (2, for I/O and parse errors, is the CLI's.)
+    /// 1 when a finding that is not allowed is an error, else 0. (2, for I/O and parse
+    /// errors, is the CLI's.)
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         u8::from(self.fails_at(Severity::Error))
@@ -447,13 +481,97 @@ impl Report {
             let n = self.count(severity);
             format!("{n} {}", plural(n, one, many))
         };
-        writeln!(
+        write!(
             out,
             "\nsummary: {}, {}, {}",
             count(Severity::Error, "error", "errors"),
             count(Severity::Warning, "warning", "warnings"),
             count(Severity::Note, "note", "notes")
-        )
+        )?;
+        let allowed = self.allowed();
+        if allowed > 0 {
+            write!(out, ", {allowed} allowed")?;
+        }
+        writeln!(out)
+    }
+
+    fn allowed(&self) -> usize {
+        self.findings.iter().filter(|f| f.allowed).count()
+    }
+
+    /// The GitHub Markdown report: a heading with `inputs`, the counts per severity, the
+    /// exit code, a table of findings, and the allowed findings in a `<details>` block.
+    ///
+    /// # Errors
+    ///
+    /// When writing to `out` fails.
+    pub fn write_markdown(
+        &self,
+        out: &mut impl Write,
+        inputs: &str,
+        fail_on: Severity,
+        exit_code: u8,
+    ) -> io::Result<()> {
+        let p = &self.program;
+        writeln!(out, "### idl-verify: {}\n", escape(inputs))?;
+        writeln!(
+            out,
+            "Program: {} {} {}\n",
+            escape(&p.name),
+            escape(&p.version),
+            escape(&p.address)
+        )?;
+        if let Some(s) = &self.sampling {
+            writeln!(
+                out,
+                "Sampled {} transactions; stopped because {}.\n",
+                s.transactions,
+                escape(&s.stop_reason)
+            )?;
+        }
+        writeln!(out, "| Severity | Findings |\n|---|---:|")?;
+        for severity in [Severity::Error, Severity::Warning, Severity::Note] {
+            writeln!(out, "| {} | {} |", severity.title(), self.count(severity))?;
+        }
+        let allowed = self.allowed();
+        if allowed > 0 {
+            writeln!(out, "| Allowed | {allowed} |")?;
+        }
+        let result = if exit_code == 0 {
+            "no finding"
+        } else {
+            "at least one finding"
+        };
+        writeln!(
+            out,
+            "\nExit code {exit_code}: {result} at or above `{}`.",
+            json_name(&fail_on)
+        )?;
+        if let Some(impact) = &self.upgrade_impact {
+            write_upgrade_impact_markdown(out, impact)?;
+        }
+        let mut findings: Vec<&Finding> = self.findings.iter().collect();
+        findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+        if findings.len() > allowed {
+            writeln!(out)?;
+            write_finding_table(out, findings.iter().filter(|f| !f.allowed))?;
+        }
+        if allowed > 0 {
+            writeln!(
+                out,
+                "\n<details>\n<summary>{allowed} allowed {}</summary>\n",
+                plural(allowed, "finding", "findings")
+            )?;
+            write_finding_table(out, findings.iter().filter(|f| f.allowed))?;
+            writeln!(out, "\n</details>")?;
+        }
+        if let Some(unused) = self.unused_allows.as_ref().filter(|u| !u.is_empty()) {
+            writeln!(out, "\nAllow entries that match no finding:\n")?;
+            for entry in unused {
+                writeln!(out, "- line {}: {}", entry.line, escape(&entry.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn write_tables(&self, out: &mut impl Write) -> io::Result<()> {
@@ -551,6 +669,9 @@ impl Report {
         let mut findings: Vec<&Finding> = self.findings.iter().collect();
         findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
         for f in findings {
+            if f.allowed {
+                write!(out, "[ALLOWED] ")?;
+            }
             let label = match f.severity {
                 Severity::Error => paint("error", color, |s| s.red().bold().to_string()),
                 Severity::Warning => paint("warning", color, |s| s.yellow().bold().to_string()),
@@ -568,11 +689,18 @@ impl Report {
     }
 }
 
-fn write_upgrade_impact(out: &mut impl Write, impact: &UpgradeImpact) -> io::Result<()> {
-    writeln!(
-        out,
-        "\nupgrade impact under the new IDL (sample counts, not all accounts of the program):"
-    )?;
+const IMPACT_HEADER: [&str; 8] = [
+    "type",
+    "sampled",
+    "ok",
+    "shorter",
+    "broken",
+    "realloc",
+    "bytes",
+    "rent each",
+];
+
+fn impact_rows(impact: &UpgradeImpact) -> Vec<[String; 8]> {
     let row = |name: &str, counts: [usize; 5], bytes: Option<String>, rent: Option<String>| {
         let [sampled, ok, shorter, broken, realloc] = counts.map(|n| n.to_string());
         let dash = |cell: Option<String>| cell.unwrap_or_else(|| "-".to_string());
@@ -618,36 +746,87 @@ fn write_upgrade_impact(out: &mut impl Write, impact: &UpgradeImpact) -> io::Res
         Some(String::new()),
         Some(String::new()),
     ));
-    write_table(
-        out,
-        [
-            "type",
-            "sampled",
-            "ok",
-            "shorter",
-            "broken",
-            "realloc",
-            "bytes",
-            "rent each",
-        ],
-        &rows,
-    )?;
+    rows
+}
+
+/// The extra rent line, or `None` when no account needs a realloc.
+fn impact_rent(impact: &UpgradeImpact) -> Option<String> {
+    let t = &impact.totals;
     if t.realloc == 0 {
-        return Ok(());
+        return None;
     }
     let accounts = plural(t.realloc, "account that needs", "accounts that need");
-    match impact.lamports_per_byte {
-        None => writeln!(
-            out,
+    Some(match impact.lamports_per_byte {
+        None => format!(
             "extra rent for the {} {accounts} a realloc: {} lamports, from getMinimumBalanceForRentExemption",
             t.realloc, t.rent_total
         ),
-        Some(rate) => writeln!(
-            out,
+        Some(rate) => format!(
             "extra rent for the {} {accounts} a realloc: {} lamports, estimated offline as (128 + size) * {rate} lamports\n  {rate} lamports per byte is the mainnet rate since the SIMD-0437 feature set_lamports_per_byte_to_5080. A later SIMD-0437 step can lower it. A live run (--rpc) gets the exact value from the cluster.",
             t.realloc, t.rent_total
         ),
+    })
+}
+
+fn write_upgrade_impact(out: &mut impl Write, impact: &UpgradeImpact) -> io::Result<()> {
+    writeln!(
+        out,
+        "\nupgrade impact under the new IDL (sample counts, not all accounts of the program):"
+    )?;
+    write_table(out, IMPACT_HEADER, &impact_rows(impact))?;
+    if let Some(rent) = impact_rent(impact) {
+        writeln!(out, "{rent}")?;
     }
+    Ok(())
+}
+
+fn write_upgrade_impact_markdown(out: &mut impl Write, impact: &UpgradeImpact) -> io::Result<()> {
+    writeln!(
+        out,
+        "\nUpgrade impact under the new IDL (sample counts, not all accounts of the program):\n"
+    )?;
+    writeln!(out, "| {} |", IMPACT_HEADER.join(" | "))?;
+    writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|")?;
+    for row in impact_rows(impact) {
+        let cells: Vec<String> = row.iter().map(|c| escape(c)).collect();
+        writeln!(out, "| {} |", cells.join(" | "))?;
+    }
+    if let Some(rent) = impact_rent(impact) {
+        writeln!(out, "\n{}", escape(&rent))?;
+    }
+    Ok(())
+}
+
+impl Severity {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::Warning => "Warning",
+            Self::Note => "Note",
+        }
+    }
+}
+
+fn write_finding_table<'a>(
+    out: &mut impl Write,
+    findings: impl Iterator<Item = &'a &'a Finding>,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "| Severity | Check | Subject | Message | Hint |\n|---|---|---|---|---|"
+    )?;
+    for f in findings {
+        writeln!(
+            out,
+            "| {} | `{}` | {} | {} | {} |",
+            f.severity.title(),
+            json_name(&f.check),
+            escape(&f.subject),
+            escape(&f.message),
+            escape(f.hint.as_deref().unwrap_or_default())
+        )?;
+    }
+    Ok(())
 }
 
 fn paint(text: &str, color: bool, style: impl Fn(&str) -> String) -> String {

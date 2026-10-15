@@ -6,15 +6,17 @@ by its effect on a parser that was generated from the old IDL.
 ## Commands
 
 ```text
-idl-drift diff [--json] [--fail-on <TIER>] <OLD> <NEW>
-idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json] [--fail-on <TIER>] <PROGRAM> <NEW>
+idl-drift diff [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <OLD> <NEW>
+idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <PROGRAM> <NEW>
 idl-drift inspect [--layout] <IDL>
 ```
 
 | Option | Command | Meaning |
 |---|---|---|
 | `--json` | `diff` | Print the report as JSON. See [JSON output](#json-output). |
+| `--markdown` | `diff` | Print the report as GitHub Markdown. It cannot be combined with `--json`. See [Markdown output](#markdown-output). |
 | `--fail-on <TIER>` | `diff` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
+| `--allow <FILE>` | `diff` | Changes that you accept. They do not set exit code 1. See [Allow file](#allow-file). |
 | `--onchain` | `diff` | Read the first argument as a program id, and use the IDL that the program publishes on chain as the old IDL. See [On-chain IDL](#on-chain-idl). |
 | `--rpc <URL>` | `diff` | The JSON-RPC URL for `--onchain`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
 | `--source <SOURCE>` | `diff` | With `--onchain`, the account to read: `metadata` (the Program Metadata program) or `anchor` (the Anchor IDL account). |
@@ -185,8 +187,9 @@ Two rules follow Shipstern's dispatch:
 
 ## Rule names
 
-Each change has a `kind`: the rule that found it. Rule names are stable. To allow a known
-change in CI, match on `kind` and `subject`, not on the message text, which can change.
+Each change has a `kind`: the rule that found it. Rule names are stable. An
+[allow file](#allow-file) matches a change on `kind` and `subject`, not on the message text,
+which can change.
 
 | Area | `kind` | Tier |
 |---|---|---|
@@ -219,6 +222,31 @@ The `subject` names the item. A positional item has `#<position>`, counted from 
 | `size:4` | A collision on a Codama size discriminator of 4 bytes. |
 | `Pool#1` | Field or variant 1 of type `Pool`. |
 
+## Allow file
+
+`--allow <FILE>` lists the changes that you accept. An allowed change does not set exit
+code 1, but it stays in the report. The human report marks it `[ALLOWED]`, the JSON report
+adds `"allowed": true` to it, and the Markdown report puts it in a `<details>` block.
+
+Each line of the file holds one entry: a rule name (`kind`), a space, and the `subject`.
+Both must match the change exactly. There are no wildcards. A `#` at the start of a line or
+after a space starts a comment, to the end of the line. Use the comment for the reason.
+Blank lines are ignored.
+
+```text
+# Accepted for the v2 upgrade.
+field_changed Pool#1   # feeBps is now u32. All indexers read the new IDL.
+account_added swap#2   # The new oracle account.
+```
+
+The `#` in `Pool#1` is part of the subject, because no space comes before it.
+
+- An entry that matches no change gives a warning on stderr with its line number. The JSON
+  report lists it in `unused_allows`. It does not change the exit code. Remove the entry
+  after the release.
+- A line with no subject, or a rule name that idl-drift does not have, stops the run with
+  exit 2. Thus a typo cannot let a change through.
+
 ## Exit codes
 
 The exit codes are in the [quick guide](../QUICKGUIDE.md#exit-codes). A reader that closes
@@ -230,10 +258,14 @@ the pipe early, such as `head`, does not change the exit code.
 
 | Key | Content |
 |---|---|
-| `changes` | Each change, with `severity`, `kind`, `subject` and `message`. |
-| `breaking`, `dangerous`, `additive`, `cosmetic` | The messages of each tier. |
-| `counts` | The number of changes in each tier. |
+| `changes` | Each change, with `severity`, `kind`, `subject` and `message`. An allowed change also has `"allowed": true`. |
+| `breaking`, `dangerous`, `additive`, `cosmetic` | The messages of each tier, other than allowed changes. |
+| `counts` | The number of changes in each tier, other than allowed changes. |
+| `unused_allows` | Only with `--allow`: the entries that match no change, each with `line`, `rule` and `subject`. |
 | `exit_code` | The same value as the process exit code. |
+
+`counts` and the tier lists do not include allowed changes, so they agree with the exit
+code. `changes` holds all of them.
 
 One entry of `changes` for the `amm_old.json` and `amm_new.json` pair in
 `crates/idl-drift/tests/fixtures/`:
@@ -250,14 +282,16 @@ One entry of `changes` for the `amm_old.json` and `amm_new.json` pair in
 When the run exits 2, stdout holds only `{"error": "<message>", "exit_code": 2}`. The
 message also goes to stderr.
 
-To allow a known change in CI, filter it out by `kind` and `subject`. This `jq` command
-counts the Breaking changes other than a known field change on `Pool#1`:
+## Markdown output
 
-```bash
-idl-drift diff old.json new.json --json \
-  | jq '[.changes[] | select(.severity == "breaking")
-         | select(.kind != "field_changed" or .subject != "Pool#1")] | length'
-```
+`idl-drift diff --markdown` prints GitHub Markdown for a job summary (`$GITHUB_STEP_SUMMARY`)
+or a pull request comment: a heading with the two inputs, the number of changes in each
+tier, the exit code, a table of the changes (tier, rule, subject, message), and the allowed
+changes in a `<details>` block. The [GitHub Action](ci.md) writes it to the job summary.
+
+IDL names and messages are escaped, so an IDL cannot add HTML, links or table rows. When the
+run exits 2, stdout holds one line, `**idl-drift could not run (exit code 2):** <message>`.
+The message also goes to stderr.
 
 ## inspect
 

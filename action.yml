@@ -1,0 +1,74 @@
+name: idl-drift
+description: Diff a Solana program IDL with its old version, or check it against real data, and fail the job on drift.
+
+inputs:
+  command:
+    description: "`diff` compares the IDL with its old version (idl-drift). `verify` checks the IDL against real data (idl-verify)."
+    default: diff
+  idl:
+    description: Path of the new IDL.
+    required: true
+  old:
+    description: "diff: path of the old IDL. Default: the file at the same path on the base branch of the pull request."
+    default: ""
+  program:
+    description: "diff: compare with the IDL that this program publishes on chain, in place of `old`. verify: the program to sample. Default: the IDL's address."
+    default: ""
+  rpc-url:
+    description: "JSON-RPC URL for `program` with diff, and for live sampling with verify. Give a secret. The action masks it and gives it to the tool only in an environment variable."
+    default: ""
+  fail-on:
+    description: "The lowest tier (diff: breaking, dangerous, additive, cosmetic) or severity (verify: error, warning) that fails the step. Default: breaking for diff, error for verify."
+    default: ""
+  allow:
+    description: Path of an allow file. Its changes or findings stay in the report as allowed, and do not fail the step.
+    default: ""
+  args:
+    description: "More options for the tool, separated by spaces, such as `--min-coverage 50`. The action does not expand quotes, globs or variables in them."
+    default: ""
+  version:
+    description: "The idl-drift tag or commit SHA to install. Default: the ref of this action. A tag with a release downloads the binary; anything else builds from source."
+    default: ""
+
+outputs:
+  exit-code:
+    description: "The exit code of the tool: 0 clean, 1 drift at or above `fail-on`, 2 the tool could not run."
+    value: ${{ steps.run.outputs.exit-code }}
+  counts:
+    description: 'The `counts` object of the JSON report, such as {"breaking":0,"dangerous":1,"additive":1,"cosmetic":0}. Allowed items are not counted.'
+    value: ${{ steps.run.outputs.counts }}
+  report:
+    description: Path of the JSON report.
+    value: ${{ steps.run.outputs.report }}
+  samples:
+    description: "verify with live sampling: path of the samples that the run read, to run the check again with `--samples`."
+    value: ${{ steps.run.outputs.samples }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install idl-drift
+      id: install
+      shell: bash
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_VERSION: ${{ inputs.version }}
+        # The docs say to read github.action_ref in a composite action only through env.
+        ACTION_REF: ${{ github.action_ref }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/action.sh" install
+
+    - name: Run idl-drift or idl-verify
+      id: run
+      shell: bash
+      env:
+        IDL_DRIFT_BIN: ${{ steps.install.outputs.bin }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_IDL: ${{ inputs.idl }}
+        INPUT_OLD: ${{ inputs.old }}
+        INPUT_PROGRAM: ${{ inputs.program }}
+        INPUT_RPC_URL: ${{ inputs.rpc-url }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_ALLOW: ${{ inputs.allow }}
+        INPUT_ARGS: ${{ inputs.args }}
+        BASE_REF: ${{ github.base_ref }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/action.sh" run

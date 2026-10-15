@@ -96,6 +96,7 @@ impl<'a> Verifier<'a> {
             sampling: None,
             upgrade_impact: None,
             findings: self.findings,
+            unused_allows: None,
         }
     }
 }
@@ -117,6 +118,7 @@ impl Verifier<'_> {
             message,
             hint,
             example: example.filter(|e| !e.is_empty()).map(str::to_string),
+            allowed: false,
         });
     }
 

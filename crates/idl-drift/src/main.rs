@@ -4,11 +4,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use idl_drift::allow::{json_name, AllowEntry, AllowList};
 use idl_drift::inspect::{shared_types, SharedType};
+use idl_drift::markdown::escape;
 use idl_drift::model::Idl;
 use idl_drift::onchain::{self, OnchainIdl, Source};
-use idl_drift::{coverage, diff, layouts, Change, CoverageReport, Report, Severity, TypeLayout};
+use idl_drift::{
+    coverage, diff, layouts, Change, ChangeKind, CoverageReport, Report, Severity, TypeLayout,
+};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
@@ -29,35 +33,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Diff two IDLs and classify every change.
-    Diff {
-        /// Baseline (old) IDL: Anchor or Codama JSON. With --onchain, a program id.
-        old: PathBuf,
-        /// Current (new) IDL: Anchor or Codama JSON.
-        new: PathBuf,
-        /// Read OLD as a program id, and use the IDL that the program publishes on chain as
-        /// the baseline: `diff --onchain <PROGRAM> <NEW>`.
-        #[arg(long)]
-        onchain: bool,
-        /// JSON-RPC URL for --onchain. Prefer the env var: `ps` and shell history show a URL
-        /// given on the command line.
-        #[arg(
-            long,
-            value_name = "URL",
-            env = "IDL_DRIFT_RPC_URL",
-            hide_env_values = true
-        )]
-        rpc: Option<String>,
-        /// With --onchain, read the IDL from this account. Needed when the program has both,
-        /// because the two can differ.
-        #[arg(long, value_enum, requires = "onchain")]
-        source: Option<SourceArg>,
-        /// Print the report as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Lowest tier that sets exit code 1.
-        #[arg(long, value_enum, default_value_t = Tier::Breaking)]
-        fail_on: Tier,
-    },
+    Diff(DiffArgs),
     /// Report fields whose byte layout could not be resolved, and padded zero-copy types
     /// that Borsh also reads.
     Inspect {
@@ -67,6 +43,52 @@ enum Cmd {
         #[arg(long)]
         layout: bool,
     },
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    /// Baseline (old) IDL: Anchor or Codama JSON. With --onchain, a program id.
+    old: PathBuf,
+    /// Current (new) IDL: Anchor or Codama JSON.
+    new: PathBuf,
+    /// Read OLD as a program id, and use the IDL that the program publishes on chain as
+    /// the baseline: `diff --onchain <PROGRAM> <NEW>`.
+    #[arg(long)]
+    onchain: bool,
+    /// JSON-RPC URL for --onchain. Prefer the env var: `ps` and shell history show a URL
+    /// given on the command line.
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "IDL_DRIFT_RPC_URL",
+        hide_env_values = true
+    )]
+    rpc: Option<String>,
+    /// With --onchain, read the IDL from this account. Needed when the program has both,
+    /// because the two can differ.
+    #[arg(long, value_enum, requires = "onchain")]
+    source: Option<SourceArg>,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Print the report as GitHub Markdown, for a job summary or a pull request comment.
+    #[arg(long, conflicts_with = "json")]
+    markdown: bool,
+    /// Lowest tier that sets exit code 1.
+    #[arg(long, value_enum, default_value_t = Tier::Breaking)]
+    fail_on: Tier,
+    /// Allow file: one `<kind> <subject>` per line. A change that it lists does not set
+    /// exit code 1, and stays in the report as allowed.
+    #[arg(long, value_name = "FILE")]
+    allow: Option<PathBuf>,
+}
+
+/// How `diff` prints its report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Human,
+    Json,
+    Markdown,
 }
 
 /// `Severity` as a CLI value; the lib enum stays free of clap.
@@ -114,50 +136,33 @@ fn main() -> ExitCode {
     let (cli, matches) = match parsed {
         Ok(parsed) => parsed,
         Err(e) => {
-            // Help and version are not errors; a usage error exits 2, so JSON must say so.
-            if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+            // Help and version are not errors; a usage error exits 2, so JSON or Markdown says so.
+            if e.use_stderr() {
                 let text = e.to_string();
                 let text = text.trim();
-                print_error_json(text.strip_prefix("error: ").unwrap_or(text));
+                let text = text.strip_prefix("error: ").unwrap_or(text);
+                if std::env::args_os().any(|a| a == "--json") {
+                    print_error_json(text);
+                } else if std::env::args_os().any(|a| a == "--markdown") {
+                    print_error_markdown(text.lines().next().unwrap_or_default());
+                }
             }
             e.exit()
         }
     };
-    let json = matches!(cli.cmd, Cmd::Diff { json: true, .. });
+    let format = match &cli.cmd {
+        Cmd::Diff(DiffArgs { json: true, .. }) => Format::Json,
+        Cmd::Diff(DiffArgs { markdown: true, .. }) => Format::Markdown,
+        _ => Format::Human,
+    };
     let result = match cli.cmd {
-        Cmd::Diff {
-            old,
-            new,
-            onchain,
-            rpc,
-            source,
-            json,
-            fail_on,
-        } => {
+        Cmd::Diff(args) => {
             // A shell can keep the env var set for file diffs, so only the flag needs --onchain.
             let rpc_flag = matches
                 .subcommand_matches("diff")
                 .and_then(|m| m.value_source("rpc"))
                 == Some(ValueSource::CommandLine);
-            if onchain {
-                // A path that is not UTF-8 is also not a base58 address, so fetch rejects it.
-                let program = old.to_string_lossy();
-                run_onchain(
-                    &program,
-                    rpc.as_deref(),
-                    source.map(Into::into),
-                    &new,
-                    json,
-                    fail_on.into(),
-                )
-            } else if rpc_flag {
-                Err(Failure::Usage(
-                    "--rpc is the URL that --onchain reads from; add --onchain or drop --rpc"
-                        .into(),
-                ))
-            } else {
-                run_diff(&old, &new, json, fail_on.into())
-            }
+            run_diff(&args, rpc_flag, format)
         }
         Cmd::Inspect { idl, layout } => run_inspect(&idl, layout),
     };
@@ -165,9 +170,13 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let _ = writeln!(io::stderr(), "error: {e}");
-            // A failed report write can leave part of a JSON object; do not add a second one.
-            if json && !matches!(e, Failure::Write(_)) {
-                print_error_json(&e.to_string());
+            // A failed report write can leave part of a report; do not add to it.
+            if !matches!(e, Failure::Write(_)) {
+                match format {
+                    Format::Json => print_error_json(&e.to_string()),
+                    Format::Markdown => print_error_markdown(&e.to_string()),
+                    Format::Human => {}
+                }
             }
             ExitCode::from(2)
         }
@@ -204,6 +213,15 @@ fn print_error_json(message: &str) {
     );
 }
 
+/// The `--markdown` form of a run that exits 2, so that a job summary shows the cause.
+fn print_error_markdown(message: &str) {
+    let _ = writeln!(
+        io::stdout(),
+        "**idl-drift could not run (exit code 2):** {}",
+        escape(message)
+    );
+}
+
 /// A reader that stops early, such as `head`, closes the pipe. That does not change the
 /// result, so the exit code stays the same.
 fn written(result: io::Result<()>) -> Result<(), Failure> {
@@ -219,20 +237,65 @@ fn load(path: &Path) -> Result<Idl, Failure> {
     Idl::from_json(&src).map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))
 }
 
-fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8, Failure> {
-    let report = diff(&load(old)?, &load(new)?);
-    print_report(&report, None, json, fail_on)
+fn load_allow(path: &Path) -> Result<AllowList<ChangeKind>, Failure> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Failure::Input(format!("read {}: {e}", path.display())))?;
+    AllowList::parse(&text)
+        .map_err(|e| Failure::Usage(format!("allow file {}: {e}", path.display())))
 }
 
-fn run_onchain(
+fn run_diff(args: &DiffArgs, rpc_flag: bool, format: Format) -> Result<u8, Failure> {
+    if rpc_flag && !args.onchain {
+        return Err(Failure::Usage(
+            "--rpc is the URL that --onchain reads from; add --onchain or drop --rpc".into(),
+        ));
+    }
+    // Before any RPC request, so that a typo in the allow file costs nothing.
+    let allow = args.allow.as_deref().map(load_allow).transpose()?;
+    let (mut report, onchain) = if args.onchain {
+        let new = load(&args.new)?;
+        // A path that is not UTF-8 is also not a base58 address, so fetch rejects it.
+        let program = args.old.to_string_lossy();
+        let old = fetch_onchain(&program, args.rpc.as_deref(), args.source.map(Into::into))?;
+        (diff(&old.idl, &new), Some(old))
+    } else {
+        (diff(&load(&args.old)?, &load(&args.new)?), None)
+    };
+    let unused = allow.as_ref().map(|list| report.allow(list));
+    if let (Some(unused), Some(path)) = (&unused, &args.allow) {
+        for entry in unused {
+            let _ = writeln!(
+                io::stderr(),
+                "warning: allow file {}: line {}: no change matches `{entry}`",
+                path.display(),
+                entry.line
+            );
+        }
+    }
+    let fail_on = args.fail_on.into();
+    let code = u8::from(report.fails_at(fail_on));
+    let (old, new) = (args.old.to_string_lossy(), args.new.to_string_lossy());
+    let view = View {
+        old: &old,
+        new: &new,
+        onchain: onchain.as_ref(),
+        fail_on,
+        unused: unused.as_deref(),
+        exit_code: code,
+    };
+    written(match format {
+        Format::Human => print_human(&report, &view),
+        Format::Json => print_json(&report, &view),
+        Format::Markdown => print_markdown(&report, &view),
+    })?;
+    Ok(code)
+}
+
+fn fetch_onchain(
     program: &str,
     rpc: Option<&str>,
     source: Option<Source>,
-    new: &Path,
-    json: bool,
-    fail_on: Severity,
-) -> Result<u8, Failure> {
-    let new = load(new)?;
+) -> Result<OnchainIdl, Failure> {
     let url = rpc.unwrap_or_default().trim();
     if url.is_empty() {
         return Err(Failure::Usage(
@@ -246,9 +309,7 @@ fn run_onchain(
             .build(),
     );
     let call = |method: &str, params: serde_json::Value| rpc_call(&agent, url, method, &params);
-    let old = onchain::fetch(call, program, source).map_err(Failure::Onchain)?;
-    let report = diff(&old.idl, &new);
-    print_report(&report, Some(&old), json, fail_on)
+    onchain::fetch(call, program, source).map_err(Failure::Onchain)
 }
 
 /// The largest JSON-RPC answer to read: two accounts of the 10 MiB maximum, in base64.
@@ -301,19 +362,16 @@ fn rpc_call(
     ))
 }
 
-fn print_report(
-    report: &Report,
-    onchain: Option<&OnchainIdl>,
-    json: bool,
+/// What a diff report shows besides the changes.
+struct View<'a> {
+    /// OLD and NEW as given, for the Markdown heading.
+    old: &'a str,
+    new: &'a str,
+    onchain: Option<&'a OnchainIdl>,
     fail_on: Severity,
-) -> Result<u8, Failure> {
-    let code = u8::from(report.fails_at(fail_on));
-    written(if json {
-        print_json(report, onchain, code)
-    } else {
-        print_human(report, onchain, code)
-    })?;
-    Ok(code)
+    /// With --allow: the entries that match no change.
+    unused: Option<&'a [&'a AllowEntry<ChangeKind>]>,
+    exit_code: u8,
 }
 
 fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
@@ -397,35 +455,50 @@ fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<
     Ok(())
 }
 
-const TIERS: [(Severity, &str); 4] = [
-    (Severity::Breaking, "BREAKING"),
-    (Severity::Dangerous, "DANGEROUS"),
-    (Severity::Additive, "ADDITIVE"),
-    (Severity::Cosmetic, "COSMETIC"),
+const TIERS: [(Severity, &str, &str); 4] = [
+    (Severity::Breaking, "BREAKING", "Breaking"),
+    (Severity::Dangerous, "DANGEROUS", "Dangerous"),
+    (Severity::Additive, "ADDITIVE", "Additive"),
+    (Severity::Cosmetic, "COSMETIC", "Cosmetic"),
 ];
 
-fn print_human(report: &Report, onchain: Option<&OnchainIdl>, exit_code: u8) -> io::Result<()> {
+/// The changes in report order: by tier, Breaking first.
+fn by_tier(report: &Report) -> impl Iterator<Item = (&Change, &'static str, &'static str)> {
+    TIERS.into_iter().flat_map(move |(severity, tag, title)| {
+        report
+            .changes
+            .iter()
+            .filter(move |c| c.severity == severity)
+            .map(move |c| (c, tag, title))
+    })
+}
+
+fn print_human(report: &Report, view: &View) -> io::Result<()> {
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = io::stdout().lock();
-    if let Some(o) = onchain {
+    if let Some(o) = view.onchain {
         writeln!(out, "on-chain IDL: {} {}", o.source, o.account)?;
     }
-    for (severity, tag) in TIERS {
-        for change in report.changes.iter().filter(|c| c.severity == severity) {
-            writeln!(
-                out,
-                "  [{}] {}",
-                paint(tag, severity, color),
-                change.message
-            )?;
-        }
+    for (change, tag, _) in by_tier(report) {
+        let allowed = if change.allowed { "[ALLOWED] " } else { "" };
+        writeln!(
+            out,
+            "  {allowed}[{}] {}",
+            paint(tag, change.severity, color),
+            change.message
+        )?;
     }
     let (b, d, a, c) = report.counts();
-    writeln!(
+    write!(
         out,
         "summary: {b} breaking, {d} dangerous, {a} additive, {c} cosmetic"
     )?;
-    writeln!(out, "exit code: {exit_code}")
+    let allowed = report.changes.iter().filter(|c| c.allowed).count();
+    if allowed > 0 {
+        write!(out, ", {allowed} allowed")?;
+    }
+    writeln!(out)?;
+    writeln!(out, "exit code: {}", view.exit_code)
 }
 
 fn paint(tag: &str, severity: Severity, color: bool) -> String {
@@ -440,6 +513,88 @@ fn paint(tag: &str, severity: Severity, color: bool) -> String {
     }
 }
 
+/// GitHub Markdown: a heading, the counts per tier, the exit code, a table of changes, and
+/// the allowed changes in a `<details>` block.
+fn print_markdown(report: &Report, view: &View) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    if let Some(o) = view.onchain {
+        writeln!(
+            out,
+            "### idl-drift diff: on-chain IDL of {} to {}\n",
+            escape(view.old),
+            escape(view.new)
+        )?;
+        writeln!(out, "On-chain IDL: {} {}\n", o.source, escape(&o.account))?;
+    } else {
+        writeln!(
+            out,
+            "### idl-drift diff: {} to {}\n",
+            escape(view.old),
+            escape(view.new)
+        )?;
+    }
+    let (b, d, a, c) = report.counts();
+    let allowed = report.changes.iter().filter(|c| c.allowed).count();
+    writeln!(out, "| Tier | Changes |\n|---|---:|")?;
+    for ((_, _, title), n) in TIERS.iter().zip([b, d, a, c]) {
+        writeln!(out, "| {title} | {n} |")?;
+    }
+    if allowed > 0 {
+        writeln!(out, "| Allowed | {allowed} |")?;
+    }
+    let fail_on = json_name(&view.fail_on);
+    let result = if view.exit_code == 0 {
+        "no change"
+    } else {
+        "at least one change"
+    };
+    writeln!(
+        out,
+        "\nExit code {}: {result} at or above `{fail_on}`.",
+        view.exit_code
+    )?;
+    if report.changes.len() > allowed {
+        writeln!(out)?;
+        write_change_table(&mut out, by_tier(report).filter(|(c, _, _)| !c.allowed))?;
+    }
+    if allowed > 0 {
+        let noun = if allowed == 1 { "change" } else { "changes" };
+        writeln!(
+            out,
+            "\n<details>\n<summary>{allowed} allowed {noun}</summary>\n"
+        )?;
+        write_change_table(&mut out, by_tier(report).filter(|(c, _, _)| c.allowed))?;
+        writeln!(out, "\n</details>")?;
+    }
+    if let Some(unused) = view.unused.filter(|u| !u.is_empty()) {
+        writeln!(out, "\nAllow entries that match no change:\n")?;
+        for entry in unused {
+            writeln!(out, "- line {}: {}", entry.line, escape(&entry.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_change_table<'a>(
+    out: &mut impl Write,
+    changes: impl Iterator<Item = (&'a Change, &'static str, &'static str)>,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "| Tier | Rule | Subject | Message |\n|---|---|---|---|"
+    )?;
+    for (c, _, title) in changes {
+        writeln!(
+            out,
+            "| {title} | `{}` | {} | {} |",
+            json_name(&c.kind),
+            escape(&c.subject),
+            escape(&c.message)
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct JsonReport<'a> {
     /// The account that the old IDL came from, with --onchain.
@@ -452,6 +607,9 @@ struct JsonReport<'a> {
     additive: Vec<&'a str>,
     cosmetic: Vec<&'a str>,
     counts: JsonCounts,
+    /// With --allow: the entries that match no change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unused_allows: Option<&'a [&'a AllowEntry<ChangeKind>]>,
     exit_code: u8,
 }
 
@@ -469,18 +627,19 @@ struct JsonCounts {
     cosmetic: usize,
 }
 
-fn print_json(report: &Report, onchain: Option<&OnchainIdl>, exit_code: u8) -> io::Result<()> {
+fn print_json(report: &Report, view: &View) -> io::Result<()> {
+    // Allowed changes stay in `changes` only, so that the tier lists agree with `counts`.
     let messages = |severity| {
         report
             .changes
             .iter()
-            .filter(|c| c.severity == severity)
+            .filter(|c| c.severity == severity && !c.allowed)
             .map(|c| c.message.as_str())
             .collect()
     };
     let (breaking, dangerous, additive, cosmetic) = report.counts();
-    let view = JsonReport {
-        onchain: onchain.map(|o| JsonOnchain {
+    let json = JsonReport {
+        onchain: view.onchain.map(|o| JsonOnchain {
             source: o.source.key(),
             account: &o.account,
         }),
@@ -495,8 +654,9 @@ fn print_json(report: &Report, onchain: Option<&OnchainIdl>, exit_code: u8) -> i
             additive,
             cosmetic,
         },
-        exit_code,
+        unused_allows: view.unused,
+        exit_code: view.exit_code,
     };
-    let text = serde_json::to_string_pretty(&view).map_err(io::Error::other)?;
+    let text = serde_json::to_string_pretty(&json).map_err(io::Error::other)?;
     writeln!(io::stdout().lock(), "{text}")
 }

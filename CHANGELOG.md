@@ -57,4 +57,13 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
 - One exit code contract: 0 when clean, 1 on a finding at or above `--fail-on`, 2 when the
   tool cannot run. With `--json`, an exit 2 prints `{"error": "...", "exit_code": 2}`.
 - GitHub Actions examples: `idl-drift` on pull requests and a nightly `idl-verify` run.
+- `--allow <FILE>`: an allow file of `<rule> <subject>` lines. An allowed change or finding
+  does not set exit code 1, and stays in the report as allowed. An entry that matches
+  nothing gives a warning. A line that cannot be read stops the run with exit 2.
+- `--markdown`: a GitHub Markdown report for a job summary or a pull request comment. IDL
+  text in it is escaped.
+- A GitHub Action (`action.yml`) that installs the tool and runs `diff` or `verify` in one
+  step, with the Markdown report in the job summary. The example workflows use it.
+- A release workflow that builds both binaries for Linux and macOS, on x86_64 and arm64,
+  and publishes them with a sha256 file for each archive.
 - The minimum supported Rust version is 1.91, and CI checks it.

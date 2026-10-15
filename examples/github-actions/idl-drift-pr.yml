@@ -1,4 +1,4 @@
-# Diff each IDL that a pull request changes against the base branch with idl-drift.
+# Diff each IDL with its version on the base branch, on each pull request, with idl-drift.
 # Copy to .github/workflows/ in your repository. Setup and results: docs/ci.md in idl-drift.
 name: idl-drift
 
@@ -10,79 +10,31 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  # Lowest change tier that fails the job: breaking, dangerous, additive or cosmetic.
-  FAIL_ON: breaking
-  # idl-drift commit to build. Empty: the default branch. Pin a SHA for stable results.
-  IDL_DRIFT_REV: ""
-
 jobs:
   diff:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        idl:
+          - idls/my_program.json
     steps:
-      - uses: actions/checkout@v7
+      # The action fetches the base branch with these credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Fetch the base branch
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: git fetch -q --no-tags --depth 1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install idl-drift
-        run: |
-          cargo install --locked --git https://github.com/senzenn/idl-drift \
-            ${IDL_DRIFT_REV:+--rev "$IDL_DRIFT_REV"} idl-drift
-
-      - name: Diff changed IDLs
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/base" reports
-          # Not a process substitution: a failed git diff must fail the step, not skip each IDL.
-          changes=$(git diff --name-status -M "origin/$BASE_REF" HEAD -- ':(glob)**/idls/**/*.json')
-          failed=0
-          while IFS=$'\t' read -r status old new; do
-            case $status in
-              "")
-                continue
-                ;;
-              A)
-                echo "::notice file=$old::New IDL, no base version to diff."
-                continue
-                ;;
-              D)
-                echo "::warning file=$old::IDL removed, nothing to diff."
-                continue
-                ;;
-            esac
-            new=${new:-$old}
-            base="$RUNNER_TEMP/base/${old//\//-}"
-            git show "origin/$BASE_REF:$old" > "$base"
-            echo "== $old -> $new"
-            code=0
-            idl-drift diff "$base" "$new" --fail-on "$FAIL_ON" || code=$?
-            idl-drift diff "$base" "$new" --fail-on "$FAIL_ON" --json > "reports/${new//\//-}" || true
-            case $code in
-              0)
-                ;;
-              1)
-                echo "::error file=$new,title=IDL drift::This change has at least one $FAIL_ON change or worse. Each change is listed above and in the artifact."
-                failed=1
-                ;;
-              *)
-                echo "::error file=$new,title=idl-drift could not run::Exit code $code, so nothing was compared. The cause is printed above, such as a file that is not an Anchor or Codama IDL."
-                failed=1
-                ;;
-            esac
-          done <<< "$changes"
-          exit "$failed"
-
-      - uses: actions/upload-artifact@v7
-        if: always()
+      # For stable results, pin a full commit SHA here and set `version` to its tag.
+      - uses: senzenn/idl-drift@v0.1.0
+        id: drift
         with:
-          name: idl-drift-reports
-          path: reports/
-          if-no-files-found: ignore
+          idl: ${{ matrix.idl }}
+          # Lowest tier that fails the job: breaking, dangerous, additive or cosmetic.
+          fail-on: breaking
+          # Changes that you accept, one `<kind> <subject>` per line.
+          # allow: idls/allow.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.drift.outputs.report != ''
+        with:
+          name: idl-drift-report-${{ strategy.job-index }}
+          path: ${{ steps.drift.outputs.report }}

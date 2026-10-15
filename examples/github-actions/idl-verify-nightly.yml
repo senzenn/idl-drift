@@ -10,49 +10,8 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  # idl-drift commit to build. Empty: the default branch. Pin a SHA for stable results.
-  IDL_DRIFT_REV: ""
-  # Bin target of your decoder under test, such as verify-decoder. Empty: check the IDL alone.
-  DECODER_BIN: ""
-  # Package that holds DECODER_BIN. Empty: the package at the repository root.
-  DECODER_PACKAGE: ""
-  # Fail when less than this percent of the IDL's items have a sample. Empty: no minimum.
-  MIN_COVERAGE: ""
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install idl-verify
-        run: |
-          cargo install --locked --git https://github.com/senzenn/idl-drift \
-            ${IDL_DRIFT_REV:+--rev "$IDL_DRIFT_REV"} --root "$RUNNER_TEMP/tools" idl-verify
-
-      - name: Build the decoder under test
-        if: env.DECODER_BIN != ''
-        run: |
-          cargo build --release ${DECODER_PACKAGE:+-p "$DECODER_PACKAGE"} --bin "$DECODER_BIN"
-          cp "target/release/$DECODER_BIN" "$RUNNER_TEMP/tools/bin/"
-
-      # A tar keeps the executable bit, which the artifact zip drops.
-      - name: Pack binaries
-        run: tar -cf tools.tar -C "$RUNNER_TEMP/tools/bin" .
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: idl-verify-tools
-          path: tools.tar
-          retention-days: 1
-
   verify:
-    needs: build
     runs-on: ubuntu-latest
     # idl-verify stops a decoder that gives no reply for 60 s; this limit stops a slow RPC.
     timeout-minutes: 30
@@ -61,65 +20,32 @@ jobs:
       # Lower this if your RPC plan rate-limits parallel runs.
       max-parallel: 4
       matrix:
-        idl:
-          - idls/my_program.json
+        include:
+          - name: my_program
+            idl: idls/my_program.json
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: idl-verify-tools
+          persist-credentials: false
 
-      - name: Unpack binaries
-        run: |
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar -xf tools.tar -C "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Optional: build your decoder under test, and give it in `args` below.
+      # - run: cargo build --release --bin verify-decoder
 
-      # The URL comes only from the secret, through the env var that idl-verify reads.
-      # A URL on the command line shows in `ps` and in the job log.
-      - name: Run idl-verify
+      # For stable results, pin a full commit SHA here and set `version` to its tag.
+      - uses: senzenn/idl-drift@v0.1.0
         id: verify
-        env:
-          IDL: ${{ matrix.idl }}
-          IDL_VERIFY_RPC_URL: ${{ secrets.IDL_VERIFY_RPC_URL }}
-        run: |
-          name=${IDL//\//-}
-          echo "artifact=idl-verify-${name%.json}" >> "$GITHUB_OUTPUT"
-          if [ -z "$IDL_VERIFY_RPC_URL" ]; then
-            echo "::error title=idl-verify could not run::The repository secret IDL_VERIFY_RPC_URL is not set."
-            exit 2
-          fi
-          args=(--idl "$IDL" --json --save-samples samples.json)
-          if [ -n "$DECODER_BIN" ]; then
-            args+=(--decoder "$RUNNER_TEMP/bin/$DECODER_BIN")
-          fi
-          if [ -n "$MIN_COVERAGE" ]; then
-            args+=(--min-coverage "$MIN_COVERAGE")
-          fi
-          code=0
-          idl-verify "${args[@]}" > report.json || code=$?
-          if [ "$code" -le 1 ]; then
-            jq -r '.findings[] | "\(.severity): \(.subject): \(.message)"' report.json
-          fi
-          case $code in
-            0)
-              ;;
-            1)
-              echo "::error title=IDL drift::idl-verify found errors in $IDL: the program or your parser no longer matches the IDL. See report.json in the artifact."
-              exit 1
-              ;;
-            *)
-              echo "::error title=idl-verify could not run::Exit code $code on $IDL. The cause is printed above: the RPC, the decoder, or a file it could not read. This is not a finding about the IDL."
-              exit "$code"
-              ;;
-          esac
-
-      - uses: actions/upload-artifact@v7
-        if: always() && steps.verify.outputs.artifact != ''
         with:
-          name: ${{ steps.verify.outputs.artifact }}
+          command: verify
+          idl: ${{ matrix.idl }}
+          # The action gives the URL to idl-verify only in IDL_VERIFY_RPC_URL.
+          rpc-url: ${{ secrets.IDL_VERIFY_RPC_URL }}
+          # args: --decoder target/release/verify-decoder --min-coverage 50
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.verify.outputs.report != ''
+        with:
+          name: idl-verify-${{ matrix.name }}
           path: |
-            report.json
-            samples.json
+            ${{ steps.verify.outputs.report }}
+            ${{ steps.verify.outputs.samples }}
           if-no-files-found: ignore

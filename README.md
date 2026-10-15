@@ -66,7 +66,7 @@ error: account adaptorAddReceipt: 7 of 152 bytes unused in 5 of 5 samples
 | [idl-drift reference](docs/idl-drift.md) | Commands, tiers, each diff rule, rule names, JSON format. |
 | [idl-verify reference](docs/idl-verify.md) | Options, checks, samples format, live sampling, JSON format, limitations. |
 | [Decoder protocol](docs/decoder-protocol.md) | Test a generated parser with `--decoder`. |
-| [CI](docs/ci.md) | GitHub Actions workflows for both tools. |
+| [CI](docs/ci.md) | The GitHub Action and example workflows for both tools. |
 | [Architecture](docs/architecture.md) | Crates, parts and data flow. |
 | [Contributing](CONTRIBUTING.md) | Setup, checks, tests, and how to add a rule or a check. |
 | [Security](SECURITY.md) | How to report a security problem. |

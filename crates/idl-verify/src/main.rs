@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use idl_drift::allow::AllowList;
+use idl_drift::markdown::escape;
 use idl_drift::model::Idl;
+use idl_verify::report::Check;
 use idl_verify::rpc::{rent_exempt_minimum, sample, Limits};
 use idl_verify::{
     run_decoder, verify, verify_upgrade, Error, Reference, Report, Samples, SamplingSummary,
@@ -82,9 +85,16 @@ struct Cli {
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
+    /// Print the report as GitHub Markdown, for a job summary or a pull request comment.
+    #[arg(long, conflicts_with = "json")]
+    markdown: bool,
     /// Lowest severity that sets exit code 1.
     #[arg(long, value_enum, default_value_t = Tier::Error)]
     fail_on: Tier,
+    /// Allow file: one `<check> <subject>` per line. A finding that it lists does not set
+    /// exit code 1, and stays in the report as allowed.
+    #[arg(long, value_name = "FILE")]
+    allow: Option<PathBuf>,
 }
 
 /// `Severity` as a CLI value; the lib enum stays free of clap.
@@ -110,11 +120,16 @@ fn main() -> ExitCode {
     let (cli, matches) = match parsed {
         Ok(parsed) => parsed,
         Err(e) => {
-            // Help and version are not errors; a usage error exits 2, so JSON must say so.
-            if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+            // Help and version are not errors; a usage error exits 2, so JSON or Markdown says so.
+            if e.use_stderr() {
                 let text = e.to_string();
                 let text = text.trim();
-                print_error_json(text.strip_prefix("error: ").unwrap_or(text));
+                let text = text.strip_prefix("error: ").unwrap_or(text);
+                if std::env::args_os().any(|a| a == "--json") {
+                    print_error_json(text);
+                } else if std::env::args_os().any(|a| a == "--markdown") {
+                    print_error_markdown(text.lines().next().unwrap_or_default());
+                }
             }
             e.exit()
         }
@@ -123,9 +138,13 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let _ = writeln!(io::stderr(), "error: {e}");
-            // A failed report write can leave part of a JSON object; do not add a second one.
-            if cli.json && !matches!(e, Error::Write(_)) {
-                print_error_json(&e.to_string());
+            // A failed report write can leave part of a report; do not add to it.
+            if !matches!(e, Error::Write(_)) {
+                if cli.json {
+                    print_error_json(&e.to_string());
+                } else if cli.markdown {
+                    print_error_markdown(&e.to_string());
+                }
             }
             ExitCode::from(2)
         }
@@ -138,6 +157,15 @@ fn print_error_json(message: &str) {
         io::stdout(),
         "{:#}",
         json!({ "error": message, "exit_code": 2 })
+    );
+}
+
+/// The `--markdown` form of a run that exits 2, so that a job summary shows the cause.
+fn print_error_markdown(message: &str) {
+    let _ = writeln!(
+        io::stdout(),
+        "**idl-verify could not run (exit code 2):** {}",
+        escape(message)
     );
 }
 
@@ -173,6 +201,8 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
             "{flag} limits only live sampling, and --samples turns live sampling off; drop one of the two"
         )));
     }
+    // Before any RPC request, so that a typo in the allow file costs nothing.
+    let allow = cli.allow.as_deref().map(read_allow).transpose()?;
     let idl = read_idl(&cli.idl)?;
     let (samples, live) = if let Some(path) = &cli.samples {
         let samples = Samples::from_json(&read(path)?)?;
@@ -220,8 +250,12 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
     if let Some(min) = cli.min_coverage {
         report.require_coverage(min);
     }
-    let code = u8::from(report.fails_at(cli.fail_on.into()));
-    print(&report, cli.json, code).map_err(Error::Write)?;
+    if let (Some(list), Some(path)) = (&allow, &cli.allow) {
+        apply_allow(&mut report, list, path);
+    }
+    let fail_on = cli.fail_on.into();
+    let code = u8::from(report.fails_at(fail_on));
+    print(&report, cli, fail_on, code).map_err(Error::Write)?;
     Ok(code)
 }
 
@@ -344,6 +378,26 @@ fn read(path: &Path) -> Result<String, Error> {
     })
 }
 
+fn read_allow(path: &Path) -> Result<AllowList<Check>, Error> {
+    AllowList::parse(&read(path)?).map_err(|source| Error::Allow {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Mark the allowed findings, and warn on stderr about each entry that matches none.
+fn apply_allow(report: &mut Report, list: &AllowList<Check>, path: &Path) {
+    report.allow(list);
+    for entry in report.unused_allows.iter().flatten() {
+        let _ = writeln!(
+            io::stderr(),
+            "warning: allow file {}: line {}: no finding matches `{entry}`",
+            path.display(),
+            entry.line
+        );
+    }
+}
+
 fn read_idl(path: &Path) -> Result<Idl, Error> {
     Idl::from_json(&read(path)?).map_err(|source| Error::Idl {
         path: path.to_path_buf(),
@@ -351,15 +405,22 @@ fn read_idl(path: &Path) -> Result<Idl, Error> {
     })
 }
 
-fn print(report: &Report, json: bool, exit_code: u8) -> io::Result<()> {
+fn print(report: &Report, cli: &Cli, fail_on: Severity, exit_code: u8) -> io::Result<()> {
     let stdout = io::stdout();
     let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = stdout.lock();
-    if json {
+    if cli.json {
         let text = report
             .to_json_with_exit_code(exit_code)
             .map_err(io::Error::other)?;
         writeln!(out, "{text}")
+    } else if cli.markdown {
+        let samples = cli
+            .samples
+            .as_deref()
+            .map_or_else(|| "live samples".to_string(), |p| p.display().to_string());
+        let inputs = format!("{} with {samples}", cli.idl.display());
+        report.write_markdown(&mut out, &inputs, fail_on, exit_code)
     } else {
         report.write_human(&mut out, color)
     }

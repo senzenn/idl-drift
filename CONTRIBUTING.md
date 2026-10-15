@@ -35,7 +35,9 @@ cargo run -p idl-verify -- --idl IDL --samples SAMPLES
 | `integration/scenarios/` | End-to-end diff scenarios. Each has a `NOTES.md`. |
 | `integration/run-all.sh` | Runs each scenario, manual pair and fixture through both CLIs, and checks the exit codes. |
 | `tools/reference/` | Reference decoder (`@coral-xyz/anchor`) for `idl-verify --reference`. |
-| `examples/github-actions/` | CI workflows for users. See [docs/ci.md](docs/ci.md). |
+| `action.yml`, `scripts/action.sh` | The GitHub Action. See [docs/ci.md](docs/ci.md). |
+| `examples/github-actions/` | CI workflows for users that run the action. |
+| `.github/workflows/release.yml`, `scripts/package-release.sh` | Build and publish the release binaries on a `v*` tag. |
 
 [docs/architecture.md](docs/architecture.md) describes the parts of each crate.
 
