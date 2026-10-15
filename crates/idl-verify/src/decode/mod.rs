@@ -452,16 +452,21 @@ impl<'a> Decoder<'a> {
                 let at = r.pos;
                 let len = resolve_len(len, scope).map_err(|k| DecodeError::new(at, k))?;
                 // The length comes from the IDL; check it against the data before allocating.
+                // A short array is short data, as for a scalar: TooLong is for read lengths.
                 let remaining = r.remaining();
-                let fits = match self.min_size(item, 0) {
+                let min = self.min_size(item, 0);
+                let fits = match min {
                     0 => len <= remaining,
                     min => len <= remaining / min,
                 };
                 if !fits {
-                    return Err(DecodeError::new(
-                        at,
-                        DecodeErrorKind::TooLong { len, remaining },
-                    ));
+                    let kind = match len.checked_mul(min) {
+                        Some(needed) if min > 0 => {
+                            DecodeErrorKind::UnexpectedEnd { needed, remaining }
+                        }
+                        _ => DecodeErrorKind::TooLong { len, remaining },
+                    };
+                    return Err(DecodeError::new(at, kind));
                 }
                 self.list(r, item, Some(len), scope, depth)?
             }

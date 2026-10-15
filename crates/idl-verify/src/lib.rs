@@ -35,6 +35,6 @@ pub use idl_drift::layout;
 pub use decoder::run_decoder;
 pub use error::Error;
 pub use reference::Reference;
-pub use report::{Finding, Report, SamplingSummary, Severity};
+pub use report::{Finding, RentSource, Report, SamplingSummary, Severity, UpgradeImpact};
 pub use samples::{AccountSample, EventSample, EventSource, InstructionSample, KeyFlags, Samples};
-pub use verify::verify;
+pub use verify::{offline_rent_minimum, verify, verify_upgrade, OFFLINE_LAMPORTS_PER_BYTE};

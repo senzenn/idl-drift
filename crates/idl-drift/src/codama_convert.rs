@@ -153,16 +153,18 @@ fn convert_ix_account(
     ix: &InstructionNode,
     pdas: &[PdaNode],
 ) -> AccountItem {
+    let address = match a.default_value.as_ref() {
+        Some(InstructionInputValueNode::PublicKeyValue(pk)) => Some(pk.public_key.clone()),
+        _ => None,
+    };
     AccountItem::Single(Account {
         name: a.name.to_string(),
         writable: a.is_writable,
         signer: matches!(a.is_signer, IsSigner::True | IsSigner::Either),
         may_sign: matches!(a.is_signer, IsSigner::Either),
         optional: a.is_optional.unwrap_or(false),
-        address: match a.default_value.as_ref() {
-            Some(InstructionInputValueNode::PublicKeyValue(pk)) => Some(pk.public_key.clone()),
-            _ => None,
-        },
+        address_is_default: address.is_some(),
+        address,
         pda: match a.default_value.as_ref() {
             Some(InstructionInputValueNode::PdaValue(v)) => convert_pda(v, ix, pdas),
             _ => None,

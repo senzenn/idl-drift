@@ -26,3 +26,15 @@ jobs:
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The `rust-version` in Cargo.toml. Change both together.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+      # `+1.91` overrides rust-toolchain.toml, which pins the version of the check job.
+      - run: cargo +1.91 check --workspace --all-targets --locked

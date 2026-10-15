@@ -17,12 +17,22 @@ pub struct DecodeError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodeErrorKind {
-    UnexpectedEnd { needed: usize, remaining: usize },
-    TooLong { len: usize, remaining: usize },
+    UnexpectedEnd {
+        needed: usize,
+        remaining: usize,
+    },
+    /// A length read from the data holds more items than the bytes left can hold.
+    TooLong {
+        len: usize,
+        remaining: usize,
+    },
     InvalidBool(u8),
     InvalidOptionTag(u128),
     InvalidCOptionTag(u32),
-    InvalidEnumTag { tag: u64, variants: usize },
+    InvalidEnumTag {
+        tag: u64,
+        variants: usize,
+    },
     InvalidUtf8,
     InvalidShortU16,
     UndefinedType(String),

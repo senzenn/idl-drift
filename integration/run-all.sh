@@ -94,6 +94,9 @@ for entry in \
   dir="fixtures/live/$program"
   expect "$program/$idl" "$want" "$VERIFY" --idl "$dir/$idl" --samples "$dir/samples.json"
 done
+# An IDL is its own upgrade: every account is ok. A samples file with no account exits 2.
+expect "voltr_vault --upgrade-impact" 0 "$VERIFY" --idl fixtures/live/voltr_vault/idl.json --samples fixtures/live/voltr_vault/samples.json --upgrade-impact
+expect "pump_fun --upgrade-impact (no accounts)" 2 "$VERIFY" --idl fixtures/live/pump_fun/idl.json --samples fixtures/live/pump_fun/samples.json --upgrade-impact
 
 echo
 echo "${PASS}/${TOTAL} behaved as expected"

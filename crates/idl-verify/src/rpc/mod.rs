@@ -295,6 +295,24 @@ pub fn accounts_from_rpc(
     Ok(out)
 }
 
+/// The rent-exempt minimum of an account with `data_len` bytes of data, from
+/// `getMinimumBalanceForRentExemption`.
+///
+/// # Errors
+///
+/// When the request fails, or its result is not a number of lamports.
+pub fn rent_exempt_minimum(
+    mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    data_len: usize,
+) -> Result<u64, Error> {
+    let result = rpc("getMinimumBalanceForRentExemption", json!([data_len]))?;
+    result.as_u64().ok_or_else(|| {
+        Error::RpcResponse(format!(
+            "getMinimumBalanceForRentExemption: expected lamports, got {result}"
+        ))
+    })
+}
+
 /// What a sample counts against: the first IDL entry its discriminator matches, else the
 /// first bytes of its data.
 fn kind(matched: Option<&[usize]>, data: &[u8]) -> (Option<usize>, String) {

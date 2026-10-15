@@ -293,3 +293,57 @@ fn fail_on_warning_exits_1_on_a_narrowed_field() {
     assert_eq!(run(&[]), (Some(0), 0.into(), counts.clone()));
     assert_eq!(run(&["--fail-on", "warning"]), (Some(1), 1.into(), counts));
 }
+
+#[test]
+fn upgrade_impact_adds_its_json_object() {
+    // The new voltr IDL adds a u64 at the end of the zero-copy `Vault`.
+    let mut idl: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(live("voltr_vault/idl.json")).unwrap())
+            .unwrap();
+    let vault = idl["types"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|t| t["name"] == "Vault")
+        .unwrap();
+    vault["type"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"name": "added", "type": "u64"}));
+    let dir = std::env::temp_dir().join("idl-verify-upgrade-impact");
+    std::fs::create_dir_all(&dir).unwrap();
+    let new = dir.join("idl.json");
+    std::fs::write(&new, idl.to_string()).unwrap();
+
+    let out = idl_verify(&[
+        "--idl",
+        new.to_str().unwrap(),
+        "--samples",
+        &live("voltr_vault/samples.json"),
+        "--upgrade-impact",
+        "--json",
+    ]);
+    // A realloc is a warning, so the default --fail-on error passes.
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let impact = &report["upgrade_impact"];
+    assert_eq!(impact["rent_source"], "formula");
+    let vault = impact["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "Vault")
+        .unwrap();
+    // 928 bytes grow to 936: 8 * 5080 lamports each.
+    assert_eq!(
+        vault["realloc"],
+        serde_json::json!({"count": 5, "bytes": {"min": 8, "max": 8},
+            "rent_each": {"min": 40640, "max": 40640}, "rent_total": 203_200})
+    );
+    assert_eq!(
+        impact["totals"],
+        serde_json::json!({"sampled": 16, "ok": 11, "shorter": 0, "realloc": 5,
+            "broken": 0, "rent_total": 203_200})
+    );
+    assert_eq!(report["instructions"], serde_json::json!([]));
+}

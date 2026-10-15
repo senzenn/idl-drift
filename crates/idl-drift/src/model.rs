@@ -113,6 +113,10 @@ pub struct Account {
     /// Fixed address (a program or sysvar). Not part of the positional diff.
     #[serde(default)]
     pub address: Option<String>,
+    /// Codama public-key default: `address` fills the slot when the caller gives no key, but
+    /// the program can accept another key.
+    #[serde(skip)]
+    pub address_is_default: bool,
     /// The seeds the address derives from. Not part of the positional diff.
     #[serde(default, deserialize_with = "deserialize_pda")]
     pub pda: Option<Pda>,
@@ -134,7 +138,8 @@ pub enum Seed {
     Const(Vec<u8>),
     /// The key of another account in the same instruction, by name.
     Account(String),
-    /// An instruction argument, by name.
+    /// An instruction argument, by name, or a field inside a struct argument by a dotted path
+    /// such as `params.id`.
     Arg(String),
     /// A seed the model cannot describe, such as a field of another account's data.
     Other,
@@ -161,10 +166,7 @@ fn deserialize_pda<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Pda>
 
 fn anchor_seed(seed: &serde_json::Value) -> Seed {
     let text = |key| seed.get(key).and_then(serde_json::Value::as_str);
-    // A dotted path reads a field of another account's data or of a struct argument.
-    let path = text("path")
-        .filter(|p| !p.contains('.'))
-        .map(str::to_string);
+    let path = text("path").map(str::to_string);
     match (text("kind"), path) {
         (Some("const"), _) => match seed.get("value") {
             Some(serde_json::Value::Array(items)) => items
@@ -178,7 +180,9 @@ fn anchor_seed(seed: &serde_json::Value) -> Seed {
             }
             _ => Seed::Other,
         },
-        (Some("account"), Some(path)) => Seed::Account(path),
+        // A dotted account path reads a field of that account's data, which the model cannot
+        // describe.
+        (Some("account"), Some(path)) if !path.contains('.') => Seed::Account(path),
         (Some("arg"), Some(path)) => Seed::Arg(path),
         _ => Seed::Other,
     }
@@ -660,6 +664,15 @@ impl Idl {
             let root: codama_nodes::RootNode = serde_json::from_value(value)?;
             Ok(crate::codama_convert::from_codama(root))
         } else {
+            // Anchor reads only spec 0.1.0. Another spec can rename fields, which serde then
+            // reads as empty, so a diff would not see them.
+            if let Some(spec) = value.pointer("/metadata/spec").and_then(|s| s.as_str()) {
+                if spec != "0.1.0" {
+                    return Err(serde::de::Error::custom(format!(
+                        "Anchor IDL spec {spec} is not supported; only spec 0.1.0 can be read"
+                    )));
+                }
+            }
             let legacy = normalize_legacy_anchor(&mut value);
             let mut idl: Self = serde_json::from_value(value)?;
             if legacy {
@@ -684,6 +697,9 @@ impl Idl {
         }
         for event in &mut idl.events {
             event.name = camel(&event.name);
+        }
+        for error in &mut idl.errors {
+            error.name = camel(&error.name);
         }
         for td in &mut idl.types {
             td.name = camel(&td.name);

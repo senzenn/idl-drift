@@ -80,20 +80,23 @@ impl Decoder<'_> {
             Type::Array(item, ArrayLen::Value(len)) => {
                 let (size, _) = self.types.size_align(item).map_err(layout_err)?;
                 let remaining = data.len().saturating_sub(at);
+                let total = size.checked_mul(*len);
                 let fits = match size {
                     0 => *len <= remaining,
-                    size => size
-                        .checked_mul(*len)
-                        .is_some_and(|total| total <= remaining),
+                    _ => total.is_some_and(|total| total <= remaining),
                 };
                 if !fits {
-                    return Err(DecodeError::new(
-                        at,
-                        DecodeErrorKind::TooLong {
+                    // As in Borsh: a short array is short data, not a length read from it.
+                    let kind = match total {
+                        Some(needed) if size > 0 => {
+                            DecodeErrorKind::UnexpectedEnd { needed, remaining }
+                        }
+                        _ => DecodeErrorKind::TooLong {
                             len: *len,
                             remaining,
                         },
-                    ));
+                    };
+                    return Err(DecodeError::new(at, kind));
                 }
                 let mut out = Vec::with_capacity(*len);
                 for i in 0..*len {

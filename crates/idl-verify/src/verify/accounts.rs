@@ -177,6 +177,11 @@ impl Verifier<'_> {
             })
             .collect();
         summary.bytes_used = bytes_used(&outcomes);
+        // The upgrade classes replace the checks below: old accounts do not have to fit a new IDL.
+        if self.upgrade.is_some() {
+            self.classify_for_upgrade(&nd.name, td, disc, &outcomes);
+            return summary;
+        }
 
         let hint = self.short_accounts_hint(&outcomes, expected);
         self.report_decode_failures(&subject, &outcomes, hint, |v, i| {
@@ -208,7 +213,7 @@ impl Verifier<'_> {
                     Check::Layout,
                     subject,
                     format!("cannot verify: the zero-copy layout is unknown ({e})"),
-                    Some("only zero-copy structs whose layout the IDL pins down can be checked: repr(C), no options, vecs or enums".into()),
+                    Some("only zero-copy structs whose layout the IDL pins down can be checked: repr(C), or repr(Rust, packed) with no bool, and no options, vecs or enums".into()),
                     None,
                 );
                 return None;

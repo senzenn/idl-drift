@@ -7,7 +7,8 @@ read the wrong bytes with no error.
 stable.
 
 - **`idl-drift`** compares two versions of an IDL. It puts each change in a tier, by its
-  effect on a parser that was generated from the old version.
+  effect on a parser that was generated from the old version. With `--onchain`, the old
+  version is the IDL that the program publishes on chain.
 - **`idl-verify`** checks one IDL against real account, instruction and event data from the
   program.
 

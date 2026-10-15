@@ -1,10 +1,13 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use idl_drift::inspect::{shared_types, SharedType};
 use idl_drift::model::Idl;
+use idl_drift::onchain::{self, OnchainIdl, Source};
 use idl_drift::{coverage, diff, layouts, Change, CoverageReport, Report, Severity, TypeLayout};
 use owo_colors::OwoColorize;
 use serde::Serialize;
@@ -16,8 +19,8 @@ use serde::Serialize;
   0  diff: no change at or above --fail-on; inspect: every field resolved
   1  diff: at least one change at or above --fail-on; inspect: unmapped fields,
      or a padded zero-copy type that Borsh also reads
-  2  idl-drift could not run: a file could not be read or parsed, or an option
-     is wrong")]
+  2  idl-drift could not run: a file could not be read or parsed, an option is
+     wrong, or the on-chain IDL could not be fetched or read")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -27,10 +30,27 @@ struct Cli {
 enum Cmd {
     /// Diff two IDLs and classify every change.
     Diff {
-        /// Baseline (old) IDL: Anchor or Codama JSON.
+        /// Baseline (old) IDL: Anchor or Codama JSON. With --onchain, a program id.
         old: PathBuf,
         /// Current (new) IDL: Anchor or Codama JSON.
         new: PathBuf,
+        /// Read OLD as a program id, and use the IDL that the program publishes on chain as
+        /// the baseline: `diff --onchain <PROGRAM> <NEW>`.
+        #[arg(long)]
+        onchain: bool,
+        /// JSON-RPC URL for --onchain. Prefer the env var: `ps` and shell history show a URL
+        /// given on the command line.
+        #[arg(
+            long,
+            value_name = "URL",
+            env = "IDL_DRIFT_RPC_URL",
+            hide_env_values = true
+        )]
+        rpc: Option<String>,
+        /// With --onchain, read the IDL from this account. Needed when the program has both,
+        /// because the two can differ.
+        #[arg(long, value_enum, requires = "onchain")]
+        source: Option<SourceArg>,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -58,6 +78,24 @@ enum Tier {
     Cosmetic,
 }
 
+/// `onchain::Source` as a CLI value.
+#[derive(Clone, Copy, ValueEnum)]
+enum SourceArg {
+    /// The canonical `idl` account of the Program Metadata program.
+    Metadata,
+    /// The legacy Anchor IDL account.
+    Anchor,
+}
+
+impl From<SourceArg> for Source {
+    fn from(source: SourceArg) -> Self {
+        match source {
+            SourceArg::Metadata => Self::Metadata,
+            SourceArg::Anchor => Self::Anchor,
+        }
+    }
+}
+
 impl From<Tier> for Severity {
     fn from(tier: Tier) -> Self {
         match tier {
@@ -70,8 +108,11 @@ impl From<Tier> for Severity {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
+    let parsed = Cli::command()
+        .try_get_matches()
+        .and_then(|m| Ok((Cli::from_arg_matches(&m)?, m)));
+    let (cli, matches) = match parsed {
+        Ok(parsed) => parsed,
         Err(e) => {
             // Help and version are not errors; a usage error exits 2, so JSON must say so.
             if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
@@ -87,9 +128,37 @@ fn main() -> ExitCode {
         Cmd::Diff {
             old,
             new,
+            onchain,
+            rpc,
+            source,
             json,
             fail_on,
-        } => run_diff(&old, &new, json, fail_on.into()),
+        } => {
+            // A shell can keep the env var set for file diffs, so only the flag needs --onchain.
+            let rpc_flag = matches
+                .subcommand_matches("diff")
+                .and_then(|m| m.value_source("rpc"))
+                == Some(ValueSource::CommandLine);
+            if onchain {
+                // A path that is not UTF-8 is also not a base58 address, so fetch rejects it.
+                let program = old.to_string_lossy();
+                run_onchain(
+                    &program,
+                    rpc.as_deref(),
+                    source.map(Into::into),
+                    &new,
+                    json,
+                    fail_on.into(),
+                )
+            } else if rpc_flag {
+                Err(Failure::Usage(
+                    "--rpc is the URL that --onchain reads from; add --onchain or drop --rpc"
+                        .into(),
+                ))
+            } else {
+                run_diff(&old, &new, json, fail_on.into())
+            }
+        }
         Cmd::Inspect { idl, layout } => run_inspect(&idl, layout),
     };
     match result {
@@ -109,13 +178,18 @@ fn main() -> ExitCode {
 enum Failure {
     /// A file could not be read or parsed.
     Input(String),
+    /// An option is wrong.
+    Usage(String),
+    /// The on-chain IDL could not be fetched or read.
+    Onchain(onchain::Error),
     Write(io::Error),
 }
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Input(message) => f.write_str(message),
+            Self::Input(message) | Self::Usage(message) => f.write_str(message),
+            Self::Onchain(e) => write!(f, "{e}"),
             Self::Write(e) => write!(f, "write report: {e}"),
         }
     }
@@ -147,11 +221,97 @@ fn load(path: &Path) -> Result<Idl, Failure> {
 
 fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8, Failure> {
     let report = diff(&load(old)?, &load(new)?);
+    print_report(&report, None, json, fail_on)
+}
+
+fn run_onchain(
+    program: &str,
+    rpc: Option<&str>,
+    source: Option<Source>,
+    new: &Path,
+    json: bool,
+    fail_on: Severity,
+) -> Result<u8, Failure> {
+    let new = load(new)?;
+    let url = rpc.unwrap_or_default().trim();
+    if url.is_empty() {
+        return Err(Failure::Usage(
+            "--onchain needs an RPC URL; set IDL_DRIFT_RPC_URL or --rpc".into(),
+        ));
+    }
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let call = |method: &str, params: serde_json::Value| rpc_call(&agent, url, method, &params);
+    let old = onchain::fetch(call, program, source).map_err(Failure::Onchain)?;
+    let report = diff(&old.idl, &new);
+    print_report(&report, Some(&old), json, fail_on)
+}
+
+/// The largest JSON-RPC answer to read: two accounts of the 10 MiB maximum, in base64.
+const MAX_RESPONSE_BYTES: u64 = 32 << 20;
+
+/// One JSON-RPC request, retried with backoff on rate limits and server errors. Errors
+/// never include `url`, which can hold an API key.
+fn rpc_call(
+    agent: &ureq::Agent,
+    url: &str,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, onchain::Error> {
+    let fail = |detail: String| onchain::Error::Rpc(format!("{method}: {detail}"));
+    // Other ureq errors can repeat the URL.
+    let transport = |e: ureq::Error| match e {
+        ureq::Error::Io(_)
+        | ureq::Error::Timeout(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::BodyExceedsLimit(_)
+        | ureq::Error::Json(_) => fail(e.to_string()),
+        _ => fail("the request failed; check that the RPC URL is a valid http(s) URL".into()),
+    };
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    for attempt in 0..5 {
+        let mut response = agent.post(url).send_json(&body).map_err(transport)?;
+        let status = response.status().as_u16();
+        if status == 429 || status >= 500 {
+            std::thread::sleep(Duration::from_millis(500 << attempt));
+            continue;
+        }
+        if status != 200 {
+            return Err(fail(format!("HTTP {status}")));
+        }
+        let mut reply: serde_json::Value = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_json()
+            .map_err(transport)?;
+        // `Value` prints strings JSON-escaped, so control characters stay inert.
+        if let Some(error) = reply.get("error") {
+            return Err(fail(error.to_string()));
+        }
+        return Ok(reply["result"].take());
+    }
+    Err(fail(
+        "still rate limited or failing after 5 attempts".into(),
+    ))
+}
+
+fn print_report(
+    report: &Report,
+    onchain: Option<&OnchainIdl>,
+    json: bool,
+    fail_on: Severity,
+) -> Result<u8, Failure> {
     let code = u8::from(report.fails_at(fail_on));
     written(if json {
-        print_json(&report, code)
+        print_json(report, onchain, code)
     } else {
-        print_human(&report, code)
+        print_human(report, onchain, code)
     })?;
     Ok(code)
 }
@@ -244,9 +404,12 @@ const TIERS: [(Severity, &str); 4] = [
     (Severity::Cosmetic, "COSMETIC"),
 ];
 
-fn print_human(report: &Report, exit_code: u8) -> io::Result<()> {
+fn print_human(report: &Report, onchain: Option<&OnchainIdl>, exit_code: u8) -> io::Result<()> {
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = io::stdout().lock();
+    if let Some(o) = onchain {
+        writeln!(out, "on-chain IDL: {} {}", o.source, o.account)?;
+    }
     for (severity, tag) in TIERS {
         for change in report.changes.iter().filter(|c| c.severity == severity) {
             writeln!(
@@ -279,6 +442,9 @@ fn paint(tag: &str, severity: Severity, color: bool) -> String {
 
 #[derive(Serialize)]
 struct JsonReport<'a> {
+    /// The account that the old IDL came from, with --onchain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onchain: Option<JsonOnchain<'a>>,
     /// Every change with its rule (`kind`) and `subject`, for allow-lists in CI.
     changes: &'a [Change],
     breaking: Vec<&'a str>,
@@ -290,6 +456,12 @@ struct JsonReport<'a> {
 }
 
 #[derive(Serialize)]
+struct JsonOnchain<'a> {
+    source: &'static str,
+    account: &'a str,
+}
+
+#[derive(Serialize)]
 struct JsonCounts {
     breaking: usize,
     dangerous: usize,
@@ -297,7 +469,7 @@ struct JsonCounts {
     cosmetic: usize,
 }
 
-fn print_json(report: &Report, exit_code: u8) -> io::Result<()> {
+fn print_json(report: &Report, onchain: Option<&OnchainIdl>, exit_code: u8) -> io::Result<()> {
     let messages = |severity| {
         report
             .changes
@@ -308,6 +480,10 @@ fn print_json(report: &Report, exit_code: u8) -> io::Result<()> {
     };
     let (breaking, dangerous, additive, cosmetic) = report.counts();
     let view = JsonReport {
+        onchain: onchain.map(|o| JsonOnchain {
+            source: o.source.key(),
+            account: &o.account,
+        }),
         changes: &report.changes,
         breaking: messages(Severity::Breaking),
         dangerous: messages(Severity::Dangerous),

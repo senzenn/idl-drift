@@ -41,6 +41,9 @@ pub enum Check {
     Reference,
     /// Too few of the IDL's items have a sample, with a required minimum set.
     Coverage,
+    /// With `--upgrade-impact`: an account breaks under the new IDL, needs a realloc, or
+    /// holds bytes after the data that the new IDL reads.
+    UpgradeImpact,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,13 +118,13 @@ pub struct EventSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Range {
-    pub min: usize,
-    pub max: usize,
+pub struct Range<T = usize> {
+    pub min: T,
+    pub max: T,
 }
 
-impl Range {
-    pub(crate) fn of(values: impl IntoIterator<Item = usize>) -> Option<Self> {
+impl<T: Copy + Ord> Range<T> {
+    pub(crate) fn of(values: impl IntoIterator<Item = T>) -> Option<Self> {
         values.into_iter().fold(None, |acc, v| {
             Some(match acc {
                 None => Self { min: v, max: v },
@@ -134,7 +137,7 @@ impl Range {
     }
 }
 
-impl std::fmt::Display for Range {
+impl<T: std::fmt::Display + PartialEq> std::fmt::Display for Range<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.min == self.max {
             write!(f, "{}", self.min)
@@ -144,7 +147,7 @@ impl std::fmt::Display for Range {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Coverage {
     pub sampled: usize,
     pub classified: usize,
@@ -179,6 +182,9 @@ pub struct Report {
     /// How a live run sampled; absent for a samples file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingSummary>,
+    /// Only with `--upgrade-impact`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_impact: Option<UpgradeImpact>,
     pub findings: Vec<Finding>,
 }
 
@@ -188,6 +194,90 @@ pub struct SamplingSummary {
     /// Successful transactions read.
     pub transactions: usize,
     pub stop_reason: String,
+}
+
+/// How a new IDL reads the sampled accounts. The counts are of the sample, not of every
+/// account of the program.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradeImpact {
+    pub rent_source: RentSource,
+    /// The rate of the offline estimate; `None` when the cluster gave the minimums.
+    pub lamports_per_byte: Option<u64>,
+    pub types: Vec<TypeImpact>,
+    /// Accounts whose discriminator matches no account type in the new IDL. They count as
+    /// broken in `totals`.
+    pub unknown: usize,
+    pub totals: ImpactTotals,
+}
+
+/// Where the rent-exempt minimums come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RentSource {
+    /// `getMinimumBalanceForRentExemption` on the sampled cluster.
+    Rpc,
+    /// `(128 + size) * lamports_per_byte`, with no request.
+    Formula,
+}
+
+/// The accounts of one type in each class.
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeImpact {
+    pub name: String,
+    pub sampled: usize,
+    /// Decodes, and the new IDL reads every byte.
+    pub ok: usize,
+    pub shorter: ShorterAccounts,
+    pub realloc: ReallocAccounts,
+    pub broken: BrokenAccounts,
+}
+
+/// Accounts that decode with bytes left over.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ShorterAccounts {
+    pub count: usize,
+    /// Bytes after the data that the new IDL reads; `None` when `count` is 0.
+    pub bytes: Option<Range>,
+}
+
+/// Accounts that decode only with zero bytes added at the end.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReallocAccounts {
+    pub count: usize,
+    /// The fewest bytes to add to each account; `None` when `count` is 0.
+    pub bytes: Option<Range>,
+    /// Lamports of rent to add to each account; `None` when `count` is 0.
+    pub rent_each: Option<Range<u64>>,
+    pub rent_total: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BrokenAccounts {
+    pub count: usize,
+    pub reasons: Vec<BrokenReason>,
+}
+
+/// Broken accounts that share a reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct BrokenReason {
+    /// Such as `` `amount` does not decode ``.
+    pub reason: String,
+    pub count: usize,
+    /// The full error or the two values, for `example`.
+    pub detail: String,
+    /// Address of one such account.
+    pub example: String,
+}
+
+/// The classes summed over all types, `unknown` included in `sampled` and `broken`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ImpactTotals {
+    pub sampled: usize,
+    pub ok: usize,
+    pub shorter: usize,
+    pub realloc: usize,
+    pub broken: usize,
+    pub rent_total: u64,
 }
 
 impl Report {
@@ -307,7 +397,16 @@ impl Report {
         let unsampled_types = self.account_coverage.not_sampled.len();
         let unsampled_ixs = self.instruction_coverage.not_sampled.len();
         let unsampled_events = self.event_coverage.not_sampled.len();
-        if unsampled_types + unsampled_ixs + unsampled_events > 0 {
+        if let Some(impact) = &self.upgrade_impact {
+            write_upgrade_impact(out, impact)?;
+            if unsampled_types > 0 {
+                writeln!(
+                    out,
+                    "\nnot sampled: {unsampled_types} of {} account types",
+                    unsampled_types + self.accounts.len()
+                )?;
+            }
+        } else if unsampled_types + unsampled_ixs + unsampled_events > 0 {
             write!(
                 out,
                 "\nnot sampled: {unsampled_types} of {} account types, {unsampled_ixs} of {} instructions",
@@ -380,6 +479,10 @@ impl Report {
                 })
                 .collect();
             write_table(out, ["type", "samples", "size", "used", "layout"], &rows)?;
+        }
+        // The sampled instructions and events are for the current program, not the new IDL.
+        if self.upgrade_impact.is_some() {
+            return Ok(());
         }
 
         let ic = &self.instruction_coverage;
@@ -465,6 +568,88 @@ impl Report {
     }
 }
 
+fn write_upgrade_impact(out: &mut impl Write, impact: &UpgradeImpact) -> io::Result<()> {
+    writeln!(
+        out,
+        "\nupgrade impact under the new IDL (sample counts, not all accounts of the program):"
+    )?;
+    let row = |name: &str, counts: [usize; 5], bytes: Option<String>, rent: Option<String>| {
+        let [sampled, ok, shorter, broken, realloc] = counts.map(|n| n.to_string());
+        let dash = |cell: Option<String>| cell.unwrap_or_else(|| "-".to_string());
+        let name = name.to_string();
+        [
+            name,
+            sampled,
+            ok,
+            shorter,
+            broken,
+            realloc,
+            dash(bytes),
+            dash(rent),
+        ]
+    };
+    let mut rows: Vec<[String; 8]> = impact
+        .types
+        .iter()
+        .map(|t| {
+            row(
+                &t.name,
+                [
+                    t.sampled,
+                    t.ok,
+                    t.shorter.count,
+                    t.broken.count,
+                    t.realloc.count,
+                ],
+                t.realloc.bytes.map(|r| r.to_string()),
+                t.realloc.rent_each.map(|r| r.to_string()),
+            )
+        })
+        .collect();
+    if impact.unknown > 0 {
+        let n = impact.unknown;
+        rows.push(row("(unknown type)", [n, 0, 0, n, 0], None, None));
+    }
+    let t = &impact.totals;
+    let counts = [t.sampled, t.ok, t.shorter, t.broken, t.realloc];
+    rows.push(row(
+        "total",
+        counts,
+        Some(String::new()),
+        Some(String::new()),
+    ));
+    write_table(
+        out,
+        [
+            "type",
+            "sampled",
+            "ok",
+            "shorter",
+            "broken",
+            "realloc",
+            "bytes",
+            "rent each",
+        ],
+        &rows,
+    )?;
+    if t.realloc == 0 {
+        return Ok(());
+    }
+    let accounts = plural(t.realloc, "account that needs", "accounts that need");
+    match impact.lamports_per_byte {
+        None => writeln!(
+            out,
+            "extra rent for the {} {accounts} a realloc: {} lamports, from getMinimumBalanceForRentExemption",
+            t.realloc, t.rent_total
+        ),
+        Some(rate) => writeln!(
+            out,
+            "extra rent for the {} {accounts} a realloc: {} lamports, estimated offline as (128 + size) * {rate} lamports\n  {rate} lamports per byte is the mainnet rate since the SIMD-0437 feature set_lamports_per_byte_to_5080. A later SIMD-0437 step can lower it. A live run (--rpc) gets the exact value from the cluster.",
+            t.realloc, t.rent_total
+        ),
+    }
+}
+
 fn paint(text: &str, color: bool, style: impl Fn(&str) -> String) -> String {
     if color {
         style(text)
@@ -513,6 +698,7 @@ fn write_table<const N: usize>(
                 let _ = write!(s, "  {cell:>w$}");
             }
         }
+        s.truncate(s.trim_end().len());
         s
     };
     writeln!(out, "{}", line(header))?;

@@ -42,6 +42,8 @@ pub enum Error {
     Decoder(String),
     #[error("nothing to check: {0}")]
     NothingSampled(String),
+    #[error("cannot compute the rent: {0}")]
+    Rent(String),
     #[error("{0}")]
     Usage(String),
 }

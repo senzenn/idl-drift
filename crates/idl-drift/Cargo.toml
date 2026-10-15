@@ -15,19 +15,31 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 [dependencies]
 base64.workspace = true
 bs58.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 # The crate and version that Shipstern's `include_shipstern_parser!` deserializes.
 codama-nodes = "=0.13.2"
+# The ed25519 curve check that program-derived addresses need, as Solana does it.
+curve25519-dalek = { version = "4", default-features = false }
+# Zlib and gzip for IDLs stored on chain.
+flate2 = "1"
 # Legacy Anchor IDLs omit discriminators; Anchor derives them as sha256("global:<snake_name>").
 heck = "0.5"
 owo-colors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+ureq = { version = "3.4", features = ["json"], optional = true }
+
+[features]
+default = ["rpc"]
+# The HTTP transport of `diff --onchain`. The library reads on-chain IDLs through an RPC
+# function that the caller gives, so it does not need this feature.
+rpc = ["dep:ureq"]
 
 [[bin]]
 name = "idl-drift"
 path = "src/main.rs"
+required-features = ["rpc"]
 
 [lib]
 name = "idl_drift"

@@ -5,6 +5,7 @@ mod compare;
 mod events;
 mod instructions;
 mod pda;
+mod upgrade;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -16,49 +17,23 @@ use crate::decode::{DecodeError, Decoder, Value};
 use crate::layout::TypeIndex;
 use crate::reference::Reference;
 use crate::report::{
-    Check, Finding, ProgramInfo, Range, ReferenceSummary, Report, Severity, SizeCount,
+    AccountSummary, Check, Coverage, EventSummary, Finding, InstructionSummary, ProgramInfo, Range,
+    ReferenceSummary, Report, Severity, SizeCount,
 };
 use crate::samples::Samples;
 use crate::text::{bytes, of_samples, plural};
 
+pub use upgrade::{offline_rent_minimum, verify_upgrade, OFFLINE_LAMPORTS_PER_BYTE};
+
 /// Check `samples` against `idl`, optionally comparing values with a reference decoder.
 #[must_use]
 pub fn verify(idl: &Idl, samples: &Samples, reference: Option<&Reference>) -> Report {
-    let mut v = Verifier {
-        idl,
-        samples,
-        reference,
-        classifier: Classifier::new(idl),
-        decoder: Decoder::new(TypeIndex::new(idl)),
-        findings: Vec::new(),
-        reference_summary: ReferenceSummary::default(),
-    };
+    let mut v = Verifier::new(idl, samples, reference);
     v.check_program_id();
-    let (account_coverage, accounts) = v.check_accounts();
-    let (instruction_coverage, instructions) = v.check_instructions();
-    let (event_coverage, events) = v.check_events();
-    let Verifier {
-        findings,
-        reference_summary,
-        ..
-    } = v;
-    Report {
-        program: ProgramInfo {
-            name: idl.metadata.name.clone(),
-            version: idl.metadata.version.clone(),
-            address: idl.address.clone(),
-        },
-        samples_program_id: samples.program_id.clone(),
-        account_coverage,
-        accounts,
-        instruction_coverage,
-        instructions,
-        event_coverage,
-        events,
-        reference: reference.map(|_| reference_summary),
-        sampling: None,
-        findings,
-    }
+    let accounts = v.check_accounts();
+    let instructions = v.check_instructions();
+    let events = v.check_events();
+    v.into_report(accounts, instructions, events)
 }
 
 /// The hint when an IDL has no instruction or event discriminators to match.
@@ -73,6 +48,8 @@ struct Verifier<'a> {
     decoder: Decoder<'a>,
     findings: Vec<Finding>,
     reference_summary: ReferenceSummary,
+    /// The class of each account sample, only with `--upgrade-impact`.
+    upgrade: Option<Vec<upgrade::TypeClasses>>,
 }
 
 /// Each sample's decode: the value and the bytes it used (discriminator included), or the error.
@@ -80,6 +57,48 @@ type Outcomes = Vec<(usize, Result<(Value, usize), DecodeError>)>;
 
 /// Sample indices grouped by a text key, such as the head of the error message they share.
 type Groups = BTreeMap<String, Vec<usize>>;
+
+impl<'a> Verifier<'a> {
+    fn new(idl: &'a Idl, samples: &'a Samples, reference: Option<&'a Reference>) -> Self {
+        Self {
+            idl,
+            samples,
+            reference,
+            classifier: Classifier::new(idl),
+            decoder: Decoder::new(TypeIndex::new(idl)),
+            findings: Vec::new(),
+            reference_summary: ReferenceSummary::default(),
+            upgrade: None,
+        }
+    }
+
+    fn into_report(
+        self,
+        (account_coverage, accounts): (Coverage, Vec<AccountSummary>),
+        (instruction_coverage, instructions): (Coverage, Vec<InstructionSummary>),
+        (event_coverage, events): (Coverage, Vec<EventSummary>),
+    ) -> Report {
+        let idl = self.idl;
+        Report {
+            program: ProgramInfo {
+                name: idl.metadata.name.clone(),
+                version: idl.metadata.version.clone(),
+                address: idl.address.clone(),
+            },
+            samples_program_id: self.samples.program_id.clone(),
+            account_coverage,
+            accounts,
+            instruction_coverage,
+            instructions,
+            event_coverage,
+            events,
+            reference: self.reference.map(|_| self.reference_summary),
+            sampling: None,
+            upgrade_impact: None,
+            findings: self.findings,
+        }
+    }
+}
 
 impl Verifier<'_> {
     fn push(

@@ -6,9 +6,10 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use idl_drift::model::Idl;
-use idl_verify::rpc::{sample, Limits};
+use idl_verify::rpc::{rent_exempt_minimum, sample, Limits};
 use idl_verify::{
-    run_decoder, verify, Error, Reference, Report, Samples, SamplingSummary, Severity,
+    run_decoder, verify, verify_upgrade, Error, Reference, Report, Samples, SamplingSummary,
+    Severity,
 };
 use serde_json::{json, Value};
 
@@ -65,6 +66,11 @@ struct Cli {
     /// samples with it too and compare values and discriminators.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["reference", "decoder"])]
     compare_idl: Option<PathBuf>,
+    /// Treat --idl as the IDL of a program upgrade: count the sampled accounts that decode,
+    /// need a realloc (with the extra rent), or break. Checks accounts only. Give the current
+    /// IDL with --compare-idl to also find fields that read another value.
+    #[arg(long, conflicts_with_all = ["reference", "decoder"])]
+    upgrade_impact: bool,
     /// Write what a live run sampled to this file, to rerun it offline with --samples.
     /// Live runs only: it cannot be combined with --samples.
     #[arg(long, value_name = "PATH", requires = "rpc")]
@@ -136,10 +142,19 @@ fn print_error_json(message: &str) {
 }
 
 /// Only accounts with no data give nothing to check, since no IDL can describe them.
-fn nothing_to_check(samples: &Samples) -> bool {
+/// `--upgrade-impact` checks accounts only.
+fn nothing_to_check(samples: &Samples, accounts_only: bool) -> bool {
     samples.accounts.iter().all(|a| a.data.is_empty())
-        && samples.instructions.is_empty()
-        && samples.events.is_empty()
+        && (accounts_only || (samples.instructions.is_empty() && samples.events.is_empty()))
+}
+
+/// The end of a "nothing to check" message: why accounts alone count.
+fn accounts_only_note(cli: &Cli) -> &'static str {
+    if cli.upgrade_impact {
+        "; --upgrade-impact checks accounts only"
+    } else {
+        ""
+    }
 }
 
 fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
@@ -159,64 +174,19 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
         )));
     }
     let idl = read_idl(&cli.idl)?;
-    let (samples, sampling) = if let Some(path) = &cli.samples {
+    let (samples, live) = if let Some(path) = &cli.samples {
         let samples = Samples::from_json(&read(path)?)?;
-        if nothing_to_check(&samples) {
+        if nothing_to_check(&samples, cli.upgrade_impact) {
             return Err(Error::NothingSampled(format!(
-                "{} holds no samples, or only accounts with no data",
-                path.display()
+                "{} holds no samples, or only accounts with no data{}",
+                path.display(),
+                accounts_only_note(cli)
             )));
         }
         (samples, None)
     } else {
-        let url = cli.rpc.as_deref().unwrap_or_default().trim();
-        if url.is_empty() {
-            return Err(Error::Usage(
-                "the RPC URL is empty; set --rpc or IDL_VERIFY_RPC_URL".into(),
-            ));
-        }
-        let agent = ureq::Agent::new_with_config(
-            ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(30)))
-                .http_status_as_error(false)
-                .build(),
-        );
-        let program = cli.program.as_deref().unwrap_or(&idl.address);
-        // A bad key gets an empty answer from the RPC, which would look like a quiet program.
-        if bs58::decode(program)
-            .into_vec()
-            .map_or(true, |k| k.len() != 32)
-        {
-            return Err(Error::Usage(format!(
-                "`{program}` is not a base58 program address; check --program or the IDL's address"
-            )));
-        }
-        let call = |method: &str, params: Value| rpc_call(&agent, url, method, &params);
-        let limits = Limits {
-            max_transactions: cli.max_tx,
-            stall: cli.stall,
-            ..Limits::default()
-        };
-        let sampled = sample(call, &idl, program, &limits)?;
-        let s = &sampled.samples;
-        // A run that saw nothing has checked nothing; passing it would hide a wrong address.
-        if nothing_to_check(s) {
-            return Err(Error::NothingSampled(format!(
-                "read {} successful transactions of {program} and found no instruction, account or event of it; check the program address",
-                sampled.transactions
-            )));
-        }
-        if let Some(path) = &cli.save_samples {
-            std::fs::write(path, s.to_json()).map_err(|source| Error::Save {
-                path: path.clone(),
-                source,
-            })?;
-        }
-        let summary = SamplingSummary {
-            transactions: sampled.transactions,
-            stop_reason: sampled.stop_reason.to_string(),
-        };
-        (sampled.samples, Some(summary))
+        let (samples, live) = sample_live(cli, &idl)?;
+        (samples, Some(live))
     };
     let reference = match (&cli.reference, &cli.decoder, &cli.compare_idl) {
         (_, _, Some(path)) => Some(Reference::from_idl(&read_idl(path)?, &idl, &samples)),
@@ -233,14 +203,99 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
         (None, None, None) => None,
     };
 
-    let mut report = verify(&idl, &samples, reference.as_ref());
-    report.sampling = sampling;
+    let mut report = match (cli.upgrade_impact, &live) {
+        (false, _) => verify(&idl, &samples, reference.as_ref()),
+        (true, Some(live)) => {
+            let mut rent = |len| {
+                rent_exempt_minimum(
+                    |method: &str, params| rpc_call(&live.agent, live.url, method, &params),
+                    len,
+                )
+            };
+            verify_upgrade(&idl, &samples, reference.as_ref(), Some(&mut rent))?
+        }
+        (true, None) => verify_upgrade(&idl, &samples, reference.as_ref(), None)?,
+    };
+    report.sampling = live.map(|l| l.summary);
     if let Some(min) = cli.min_coverage {
         report.require_coverage(min);
     }
     let code = u8::from(report.fails_at(cli.fail_on.into()));
     print(&report, cli.json, code).map_err(Error::Write)?;
     Ok(code)
+}
+
+/// A live run: what it read, and the connection, kept to ask the cluster for rent-exempt
+/// minimums.
+struct Live<'c> {
+    summary: SamplingSummary,
+    agent: ureq::Agent,
+    url: &'c str,
+}
+
+/// Sample the program over JSON-RPC, and save the samples when `--save-samples` asks.
+fn sample_live<'c>(cli: &'c Cli, idl: &Idl) -> Result<(Samples, Live<'c>), Error> {
+    let url = cli.rpc.as_deref().unwrap_or_default().trim();
+    if url.is_empty() {
+        return Err(Error::Usage(
+            "the RPC URL is empty; set --rpc or IDL_VERIFY_RPC_URL".into(),
+        ));
+    }
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let program = cli.program.as_deref().unwrap_or(&idl.address);
+    // A bad key gets an empty answer from the RPC, which would look like a quiet program.
+    if bs58::decode(program)
+        .into_vec()
+        .map_or(true, |k| k.len() != 32)
+    {
+        return Err(Error::Usage(format!(
+            "`{program}` is not a base58 program address; check --program or the IDL's address"
+        )));
+    }
+    let call = |method: &str, params: Value| rpc_call(&agent, url, method, &params);
+    let limits = Limits {
+        max_transactions: cli.max_tx,
+        stall: cli.stall,
+        ..Limits::default()
+    };
+    let sampled = sample(call, idl, program, &limits)?;
+    let s = &sampled.samples;
+    // A run that saw nothing has checked nothing; passing it would hide a wrong address.
+    if nothing_to_check(s, cli.upgrade_impact) {
+        let what = if cli.upgrade_impact {
+            "account of it with data"
+        } else {
+            "instruction, account or event of it"
+        };
+        return Err(Error::NothingSampled(format!(
+            "read {} successful transactions of {program} and found no {what}; check the program address{}",
+            sampled.transactions,
+            accounts_only_note(cli)
+        )));
+    }
+    if let Some(path) = &cli.save_samples {
+        std::fs::write(path, s.to_json()).map_err(|source| Error::Save {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    let summary = SamplingSummary {
+        transactions: sampled.transactions,
+        stop_reason: sampled.stop_reason.to_string(),
+    };
+    Ok((
+        sampled.samples,
+        Live {
+            summary,
+            agent,
+            url,
+        },
+    ))
 }
 
 /// One JSON-RPC request, retried with backoff on rate limits and server errors. Errors

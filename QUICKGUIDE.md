@@ -34,6 +34,10 @@ idl-verify --idl fixtures/live/voltr_vault/idl.js-codama.json --samples fixtures
 # 4. Check an IDL against live mainnet data, at the IDL's address. Keep the URL off the command line.
 export IDL_VERIFY_RPC_URL=<your mainnet RPC URL>
 idl-verify --idl path/to/idl.json --save-samples samples.json   # run again offline with --samples
+
+# 5. Compare the IDL that a program publishes on chain with your new IDL.
+export IDL_DRIFT_RPC_URL=<your mainnet RPC URL>
+idl-drift diff --onchain <PROGRAM_ID> path/to/new-idl.json
 ```
 
 The diff in step 2 prints:

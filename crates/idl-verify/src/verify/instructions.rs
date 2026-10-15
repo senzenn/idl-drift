@@ -258,6 +258,9 @@ impl Verifier<'_> {
         }
     }
 
+    /// An Anchor `address` is a constraint that the program checks. A Codama default only fills
+    /// the slot when the caller gives no key, so another key there is not an error. The default
+    /// key at another IDL position is a warning, because a free slot can also hold that key.
     fn report_fixed_addresses(
         &mut self,
         subject: &str,
@@ -271,27 +274,66 @@ impl Verifier<'_> {
             let Some(address) = &account.address else {
                 continue;
             };
-            let wrong: Vec<(usize, &str)> = idxs
+            // Another account with the same address can hold that key at its own position.
+            let shared = flat
                 .iter()
-                .filter_map(|&i| {
-                    let key = samples[i].accounts.get(place(places, i, pos)?)?;
-                    // Anchor passes the program id in place of an absent optional account.
-                    let absent = account.optional && *key == program_id;
-                    (key != address && !absent).then_some((i, key.as_str()))
-                })
-                .collect();
-            if let Some(&(first, key)) = wrong.first() {
-                let example = samples[first].signature.clone();
-                self.push(
-                    Severity::Error,
-                    Check::FixedAddress,
-                    subject,
+                .enumerate()
+                .any(|(p, a)| p != pos && a.address.as_ref() == Some(address));
+            let mut moved = Vec::new();
+            let mut wrong = Vec::new();
+            for &i in idxs {
+                let keys = &samples[i].accounts;
+                let Some(key) = place(places, i, pos).and_then(|at| keys.get(at)) else {
+                    continue;
+                };
+                // Anchor passes the program id in place of an absent optional account.
+                if key == address || (account.optional && *key == program_id) {
+                    continue;
+                }
+                // Keys after the IDL's accounts are remaining accounts, which can be any key.
+                match keys.iter().take(flat.len()).position(|k| k == address) {
+                    Some(at) if account.address_is_default && !shared => moved.push((i, at)),
+                    _ => wrong.push((i, key.as_str())),
+                }
+            }
+            let mut found = Vec::new();
+            if let Some(&(first, at)) = moved.first() {
+                found.push((
+                    Severity::Warning,
+                    first,
                     format!(
-                        "account #{pos} `{}` must be {address}, but another key is passed in {} (such as {key})",
+                        "account #{pos} `{}` defaults to {address}, but that key is passed at #{at} instead, in {}",
+                        account.name,
+                        of_samples(moved.len(), idxs.len())
+                    ),
+                    "the IDL's account order likely does not match the program, or an earlier account is missing",
+                ));
+            }
+            if let Some(&(first, key)) = wrong.first() {
+                let (severity, verb, hint) = if account.address_is_default {
+                    (Severity::Note, "defaults to", "a Codama default fills the account only when the caller gives no key, so the program can accept another key; a generated parser reads the key that is passed")
+                } else {
+                    (Severity::Error, "must be", "the IDL's account order does not match the program, or an earlier account is missing")
+                };
+                found.push((
+                    severity,
+                    first,
+                    format!(
+                        "account #{pos} `{}` {verb} {address}, but another key is passed in {} (such as {key})",
                         account.name,
                         of_samples(wrong.len(), idxs.len())
                     ),
-                    Some("the IDL's account order does not match the program, or an earlier account is missing".into()),
+                    hint,
+                ));
+            }
+            for (severity, first, message, hint) in found {
+                let example = samples[first].signature.clone();
+                self.push(
+                    severity,
+                    Check::FixedAddress,
+                    subject,
+                    message,
+                    Some(hint.into()),
                     Some(&example),
                 );
             }
@@ -635,36 +677,95 @@ mod tests {
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
     }
 
-    #[test]
-    fn left_out_optional_accounts_shift_later_accounts() {
-        const RENT: &str = "SysvarRent111111111111111111111111111111111";
-        let account = |name: &str, writable: bool, more: &str| {
-            format!(
-                r#"{{"kind":"instructionAccountNode","name":"{name}","isWritable":{writable},
-                "isSigner":false{more}}}"#
-            )
-        };
-        let optional = r#","isOptional":true"#;
-        let fixed =
-            format!(r#","defaultValue":{{"kind":"publicKeyValueNode","publicKey":"{RENT}"}}"#);
-        let accounts = [
-            account("a", false, ""),
-            account("o1", false, optional),
-            account("b", true, ""),
-            account("o2", false, optional),
-            account("c", false, &fixed),
-        ];
-        let idl = Idl::from_json(&format!(
+    /// A Codama instruction account; `more` adds fields such as `"isOptional":true`.
+    fn codama_account(name: &str, writable: bool, more: &str) -> String {
+        format!(
+            r#"{{"kind":"instructionAccountNode","name":"{name}","isWritable":{writable},
+            "isSigner":false{more}}}"#
+        )
+    }
+
+    fn default_key(key: &str) -> String {
+        format!(r#","defaultValue":{{"kind":"publicKeyValueNode","publicKey":"{key}"}}"#)
+    }
+
+    /// A Codama IDL of program `P` with one instruction `go`, discriminator `[1]`.
+    fn codama_go(strategy: &str, accounts: &[String]) -> Idl {
+        Idl::from_json(&format!(
             r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
             "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
             "errors":[],"definedTypes":[],"pdas":[],"instructions":[{{"kind":"instructionNode",
-            "name":"go","optionalAccountStrategy":"omitted","accounts":[{}],"arguments":[],
+            "name":"go","optionalAccountStrategy":"{strategy}","accounts":[{}],"arguments":[],
             "discriminators":[{{"kind":"constantDiscriminatorNode","offset":0,"constant":{{
             "kind":"constantValueNode","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
             "value":{{"kind":"numberValueNode","number":1}}}}}}]}}]}}}}"#,
             accounts.join(",")
         ))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn a_codama_default_key_is_not_a_constraint() {
+        // Token-2022 `instructionsSysvarOrContextState` defaults to this sysvar, but the
+        // program also takes a context-state account there.
+        const SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
+        let found = |idl: &Idl, keys: &[&str]| -> Vec<(Severity, Check)> {
+            verify(idl, &instructions(&[(&[1], keys)]), None)
+                .findings
+                .iter()
+                .map(|f| (f.severity, f.check))
+                .collect()
+        };
+        let codama = codama_go(
+            "programId",
+            &[
+                codama_account("a", false, ""),
+                codama_account("sysvar", false, &default_key(SYSVAR)),
+                codama_account("b", false, ""),
+            ],
+        );
+        assert_eq!(
+            found(&codama, &["A", "Context", "B"]),
+            [(Severity::Note, Check::FixedAddress)]
+        );
+        // The default key one position late means the accounts likely moved.
+        let report = verify(&codama, &instructions(&[(&[1], &["A", "B", SYSVAR])]), None);
+        assert_eq!(
+            (only(&report).severity, only(&report).message.as_str()),
+            (Severity::Warning, "account #1 `sysvar` defaults to Sysvar1nstructions1111111111111111111111111, but that key is passed at #2 instead, in 1 of 1 sample")
+        );
+        // A remaining account can be any key.
+        assert_eq!(
+            found(&codama, &["A", "Context", "B", SYSVAR]),
+            [
+                (Severity::Note, Check::AccountCount),
+                (Severity::Note, Check::FixedAddress)
+            ]
+        );
+        // An Anchor `address` is a constraint.
+        let anchor = go(&format!(
+            r#"[{{"name":"a"}},{{"name":"sysvar","address":"{SYSVAR}"}},{{"name":"b"}}]"#
+        ));
+        assert_eq!(
+            found(&anchor, &["A", "Context", "B"]),
+            [(Severity::Error, Check::FixedAddress)]
+        );
+    }
+
+    #[test]
+    fn left_out_optional_accounts_shift_later_accounts() {
+        const RENT: &str = "SysvarRent111111111111111111111111111111111";
+        let optional = r#","isOptional":true"#;
+        let idl = codama_go(
+            "omitted",
+            &[
+                codama_account("a", false, ""),
+                codama_account("o1", false, optional),
+                codama_account("b", true, ""),
+                codama_account("o2", false, optional),
+                codama_account("c", false, &default_key(RENT)),
+            ],
+        );
         // Either `o1` or `o2` is left out, so `b` can be at #1 or #2. `c` is at #3.
         let mut samples = instructions(&[
             (&[1], &["A", "B", "O2", RENT]),
@@ -689,7 +790,7 @@ mod tests {
             found,
             [
                 (Severity::Note, Check::AccountCount, "4 accounts passed where the IDL lists 5, in 3 of 3 samples; the instruction leaves out absent optional accounts: 1 of o1, o2"),
-                (Severity::Error, Check::FixedAddress, "account #4 `c` must be SysvarRent111111111111111111111111111111111, but another key is passed in 1 of 3 samples (such as X)"),
+                (Severity::Note, Check::FixedAddress, "account #4 `c` defaults to SysvarRent111111111111111111111111111111111, but another key is passed in 1 of 3 samples (such as X)"),
             ]
         );
     }

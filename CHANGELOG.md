@@ -26,6 +26,11 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   change.
 - `idl-drift inspect IDL` lists unresolved fields and padded zero-copy types that Borsh also
   reads. `--layout` prints each zero-copy type field by field.
+- `idl-drift diff --onchain PROGRAM NEW` uses the IDL that the program publishes on chain
+  (Program Metadata or Anchor IDL account) as the old IDL.
+- A removed or renumbered error, or an error code with a new name, is Dangerous.
+- `repr(Rust, packed)` zero-copy types (Anchor `zero_copy(unsafe)`) have a layout when no
+  field holds a bool. An Anchor IDL whose `metadata.spec` is not 0.1.0 stops with exit 2.
 
 #### idl-verify
 
@@ -33,12 +38,16 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   instruction and event data.
 - Live sampling with `--rpc` or `IDL_VERIFY_RPC_URL`, controlled by `--program`, `--max-tx`
   and `--stall`. `--save-samples` saves a live run to run again offline.
+- `--upgrade-impact` puts each sampled account in a class under a new IDL: ok, shorter,
+  needs a realloc (with the extra rent) or broken. The `upgrade_impact` check reports them.
 - Checks for discriminators, missing types, decode failures, unused bytes, zero-copy
   layouts, size distribution, account counts, fixed addresses, account flags, PDA seeds,
   event envelopes, program id and coverage, with hints for unused bytes. All-zero extra
   bytes on a fixed-size Borsh account are a warning, not an error.
 - Codama instructions with `optionalAccountStrategy: "omitted"` map the passed accounts to
   IDL positions, so a left-out optional account gives no false finding.
+- A Codama default public key is not a constraint. Another key there is a note. An Anchor
+  `address` stays an error. PDA seeds that read a field of a struct argument are checked.
 - Value comparison with `--reference` (`@coral-xyz/anchor`), `--decoder` (a decoder under
   test) or `--compare-idl` (a second IDL).
 - `--min-coverage`, `--fail-on warning` and `--json`.
@@ -48,4 +57,4 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
 - One exit code contract: 0 when clean, 1 on a finding at or above `--fail-on`, 2 when the
   tool cannot run. With `--json`, an exit 2 prints `{"error": "...", "exit_code": 2}`.
 - GitHub Actions examples: `idl-drift` on pull requests and a nightly `idl-verify` run.
-- The minimum supported Rust version is 1.91.
+- The minimum supported Rust version is 1.91, and CI checks it.

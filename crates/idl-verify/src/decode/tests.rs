@@ -151,9 +151,13 @@ fn huge_array_length_is_an_error_not_a_panic() {
     );
     for name in ["S", "Z"] {
         let err = decode(&idl, name, &[1, 2]).unwrap_err();
-        assert!(
-            matches!(err.kind, DecodeErrorKind::TooLong { .. }),
-            "{name}: {err}"
+        assert_eq!(
+            err.kind,
+            DecodeErrorKind::UnexpectedEnd {
+                needed: 4_000_000_000_000,
+                remaining: 2
+            },
+            "{name}"
         );
     }
 }

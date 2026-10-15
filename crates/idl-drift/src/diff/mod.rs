@@ -7,6 +7,7 @@
 
 mod accounts;
 mod collisions;
+mod errors;
 mod events;
 mod instructions;
 mod normalize;
@@ -49,6 +50,7 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
     // Account layouts live in `types`; here only the discriminators.
     accounts::diff_account_types(&old.accounts, &new.accounts, &mut r);
     events::diff_events(&old.events, &new.events, &mut r);
+    errors::diff_errors(&old.errors, &new.errors, &mut r);
     types::diff_types(old, new, &reached, &mut r);
     r
 }

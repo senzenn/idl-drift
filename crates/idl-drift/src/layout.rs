@@ -39,7 +39,8 @@ impl<'a> TypeIndex<'a> {
     /// # Errors
     ///
     /// When the layout is not pinned down by the IDL: enums, options, vecs, generics,
-    /// `repr(Rust)`, undefined types, overflowing sizes or recursive types.
+    /// `repr(Rust)` (except packed with no bool), undefined types, overflowing sizes or
+    /// recursive types.
     pub fn struct_layout(&self, td: &TypeDef) -> Result<StructLayout, LayoutError> {
         self.struct_layout_at(td, 0)
     }
@@ -206,8 +207,20 @@ impl<'a> TypeIndex<'a> {
         }
         let repr = layout_repr(td);
         match repr.kind {
-            ReprKind::Rust => {
+            ReprKind::Rust if !repr.packed => {
                 return Err(LayoutError::unknown("repr(Rust) may reorder fields"));
+            }
+            // rustc 1.85 to 1.97 move a `repr(Rust, packed)` field that has a niche. Enums and
+            // options have no layout here, so a bool is the only niche left.
+            ReprKind::Rust => {
+                for field in fields {
+                    if self.holds_bool(&field.ty, depth + 1)? {
+                        return Err(LayoutError::unknown(
+                            "repr(Rust, packed) may reorder a field that holds a bool",
+                        )
+                        .within(&field.name));
+                    }
+                }
             }
             ReprKind::Transparent if fields.len() != 1 => {
                 return Err(LayoutError::unknown(
@@ -262,6 +275,31 @@ impl<'a> TypeIndex<'a> {
         layout.size = size;
         layout.align = align;
         Ok(layout)
+    }
+
+    /// `true` when `ty` holds a bool at any depth. Types without a zero-copy layout give
+    /// `false`, so the layout error names them.
+    fn holds_bool(&self, ty: &Type, depth: usize) -> Result<bool, LayoutError> {
+        if depth > MAX_DEPTH {
+            return Err(LayoutError::TooDeep);
+        }
+        Ok(match ty {
+            Type::Bool => true,
+            Type::Array(item, _) => self.holds_bool(item, depth + 1)?,
+            Type::Defined { name, .. } => match &self.lookup(name)?.ty {
+                TypeDefTy::Struct { fields } => {
+                    for field in fields {
+                        if self.holds_bool(&field.ty, depth + 1)? {
+                            return Ok(true);
+                        }
+                    }
+                    false
+                }
+                TypeDefTy::Type { alias } => self.holds_bool(alias, depth + 1)?,
+                TypeDefTy::Enum { .. } => false,
+            },
+            _ => false,
+        })
     }
 
     fn size_align_at(&self, ty: &Type, depth: usize) -> Result<(usize, usize), LayoutError> {
@@ -671,6 +709,28 @@ mod tests {
     fn repr_rust_is_unknown() {
         let err = layout(&RECEIPT.replace(r#""kind":"c""#, r#""kind":"rust""#), "R").unwrap_err();
         assert_eq!(err.to_string(), "repr(Rust) may reorder fields");
+    }
+
+    #[test]
+    fn packed_repr_rust_keeps_order_without_a_niche() {
+        let packed = RECEIPT.replace(r#""kind":"c""#, r#""kind":"rust","packed":true"#);
+        let l = layout(&packed, "R").unwrap();
+        assert_eq!((l.size, l.align, l.padding_len()), (42, 1, 0));
+        assert_eq!(l.fields[2].offset, 33);
+        let flag = |ty: &str| {
+            let fields = packed.replace(r#""type":"u8"}]"#, &format!(r#""type":{ty}}}]"#));
+            let e = r#"{"name":"E","type":{"kind":"enum","variants":[{"name":"A"}]}}"#;
+            let types = format!("{},{e}]", fields.strip_suffix(']').unwrap());
+            layout(&types, "R").unwrap_err().to_string()
+        };
+        assert_eq!(
+            flag(r#""bool""#),
+            "`flag`: repr(Rust, packed) may reorder a field that holds a bool"
+        );
+        assert_eq!(
+            flag(r#"{"defined":{"name":"E"}}"#),
+            "`flag`: `E` is an enum, which has no defined zero-copy layout"
+        );
     }
 
     #[test]

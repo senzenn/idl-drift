@@ -76,6 +76,7 @@ In the tables:
 | `--reference <PATH>` | Compare values with the output of the reference decoder. See [reference decoder](#reference-decoder). |
 | `--decoder <CMD>` | Compare values with a decoder under test. See [decoder-protocol.md](decoder-protocol.md). |
 | `--compare-idl <PATH>` | Compare values with a second IDL of the same program. See [compare two IDLs](#compare-two-idls). |
+| `--upgrade-impact` | Read `--idl` as the IDL of a program upgrade, and put each sampled account in a class: ok, shorter, needs a realloc or broken. See [upgrade impact](#upgrade-impact). |
 | `--min-coverage <PERCENT>` | Fail when less than this percent of the IDL's account types, instructions or events have a sample. |
 | `--fail-on <SEVERITY>` | The lowest severity that sets exit code 1: `error` (default) or `warning`. |
 | `--json` | Print the report as JSON. See [JSON output](#json-output). |
@@ -86,7 +87,8 @@ Rules for the options:
   wins, and idl-verify does not sample the cluster. `--max-tx` or `--stall` with `--samples`
   is a usage error (exit 2). Their default values do not count.
 - `--save-samples` saves only live samples. With `--samples` it is a usage error (exit 2).
-- `--reference`, `--decoder` and `--compare-idl` cannot be combined.
+- `--reference`, `--decoder` and `--compare-idl` cannot be combined. `--upgrade-impact`
+  cannot be combined with `--reference` or `--decoder`.
 - Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
 
 ## Exit codes
@@ -108,15 +110,16 @@ explorer.
 | `decode` | error | The data does not fit the IDL: it is too short, or it has an invalid bool, option tag, enum tag or UTF-8 string. A vec, set or map of a type with no data (such as an empty struct) is also an error, because Borsh refuses it. The message names the field and offset. When each failing account is shorter than the layout, the hint says so: these accounts can be older than an upgrade. |
 | `bytes_used` | error, warning or note | The IDL reads fewer bytes than the data holds. See [unused bytes](#unused-bytes). For instructions, any byte after the arguments is an error: instruction data has no spare room, so the IDL is missing an argument or declares one too narrow. For events, bytes after the payload are an error when a byte is not zero, else a note. When each sample has the same trailing bytes, the hint names an N-byte missing field, and an `Option` shape when it fits. |
 | `envelope` | error | A self-CPI event sample does not start with the expected envelope: the IDL's envelope, else Anchor's event tag. |
-| `layout` | error or warning | Error: a `bytemuck` (Pod) type whose calculated layout has padding. Pod forbids padding, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not fix (an option, vec, enum, generic or `repr(Rust)` inside it). idl-verify reports it as not verifiable, and does not guess. |
+| `layout` | error or warning | Error: a `bytemuck` (Pod) type whose calculated layout has padding. Pod forbids padding, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not fix (an option, vec, enum or generic inside it, `repr(Rust)` without `packed`, or `repr(Rust, packed)` with a bool inside it). idl-verify reports it as not verifiable, and does not guess. |
 | `size_distribution` | note | A fixed-size account type has more than one size, such as accounts created before an upgrade. |
 | `coverage` | error | Only with `--min-coverage`: less than the given percent of the IDL's account types, instructions or events have a sample. One finding for each kind that is short. |
 | `account_count` | error, warning or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Note: only optional accounts are missing at the tail, or a Codama instruction with `optionalAccountStrategy: "omitted"` leaves out absent optional accounts. Note: samples pass more accounts than the IDL lists (remaining accounts). |
-| `fixed_address` | error | An account that the IDL fixes to an address (a program or sysvar) holds another key. The IDL's account order does not match the program. An absent optional account passed as the program id is accepted. |
+| `fixed_address` | error, warning or note | An account that the IDL gives an address (a program or sysvar) holds another key. Error: an Anchor `address` holds another key, so the IDL's account order does not match the program. A Codama `publicKeyValueNode` default fills the account only when the caller gives no key, so the program can accept another key. Note: another key is at the position of a Codama default. Warning: the default key is at another position, so the accounts likely moved. An absent optional account passed as the program id is accepted. |
 | `account_flags` | error | An account that the IDL marks `writable` gets a key that the transaction makes read-only, or an account that the IDL marks `signer` gets a key that does not sign the transaction. The IDL's account order probably does not match the program, or an earlier account is missing. Only samples with flags are checked (see [the samples file](#the-samples-file)). A key with more privileges than the IDL asks for is accepted, because the transaction flags cover each instruction in it. The signer check uses only top-level instructions, because a CPI can sign for a PDA. A Codama `isSigner: "either"` account and an absent optional account are accepted. |
-| `pda` | error or note | An account that the IDL derives from seeds (Anchor `pda`, Codama `pdaValueNode` default) gets a key that its seeds do not give. Error: the derived address is passed at another position in the same instruction, so the IDL's account order does not match the program, or an earlier account is missing. Note: the derived address is not in the instruction, so the seeds may read data that the IDL does not show. A sample is skipped when a seed cannot be resolved: a path into account data (`pool.mint`), an argument field inside a struct, or an absent optional account. When the IDL names a program for the seeds, the sampled program id is also tried, because the IDL can come from another deployment. |
+| `pda` | error or note | An account that the IDL derives from seeds (Anchor `pda`, Codama `pdaValueNode` default) gets a key that its seeds do not give. Error: the derived address is passed at another position in the same instruction, so the IDL's account order does not match the program, or an earlier account is missing. Note: the derived address is not in the instruction, so the seeds may read data that the IDL does not show. A sample is skipped when a seed cannot be resolved: a path into account data (`pool.mint`) or an absent optional account. A seed path into a struct argument (`params.id`) reads the decoded argument. When the IDL names a program for the seeds, the sampled program id is also tried, because the IDL can come from another deployment. |
 | `program_id` | warning | The samples' `programId` is not the IDL's `address`. |
 | `reference` | error, warning or note | Error: decoded values do not agree with the other decoder. The other side failed: an error for the decoder under test or the old IDL, a warning for the reference decoder. Note: a type was skipped, or the decoder under test skipped a sample kind that it does not decode. See [compare with another decoder](#compare-with-another-decoder). |
+| `upgrade_impact` | error, warning or note | Only with `--upgrade-impact`. Error: an account breaks under the new IDL. Warning: an account needs a realloc before the new program can read it. Note: an account holds bytes after the data that the new IDL reads. See [upgrade impact](#upgrade-impact). |
 
 ### Unused bytes
 
@@ -147,9 +150,14 @@ with SBF alignment rules:
 - `packed: true` aligns each field to 1. `align: N` increases the struct's alignment.
 - A struct nested in a zero-copy type keeps its own `repr` and padding.
 - A zero-copy type with no `repr` in the IDL is read as `repr(C)`. This is the default of
-  Anchor's `#[zero_copy]`. The default of `#[zero_copy(unsafe)]` is `repr(Rust, packed)`,
-  and Anchor writes it into the IDL. `repr(Rust)` does not fix the field order, so a type
-  with it gets a `layout` warning: idl-verify reports it as not verifiable.
+  Anchor's `#[zero_copy]`.
+- `repr(Rust, packed)` is the default of `#[zero_copy(unsafe)]`, and Anchor writes it into
+  the IDL. Its fields are read in IDL order with no padding. Rust does not promise this
+  order, but rustc 1.85 to 1.97 keep it when no field holds a bool. They move a field that
+  holds a bool, so such a type gets a `layout` warning: idl-verify reports it as not
+  verifiable.
+- `repr(Rust)` without `packed` does not fix the field order. A type with it gets the same
+  `layout` warning.
 
 `idl-drift inspect --layout` prints these layouts. See
 [idl-drift.md](idl-drift.md#--layout).
@@ -188,7 +196,8 @@ ignores other keys, such as a `type` label: it classifies samples by discriminat
 ## Live sampling
 
 `--rpc <URL>` (or `IDL_VERIFY_RPC_URL`) samples the program over JSON-RPC. The RPC must
-serve `getSignaturesForAddress`, `getTransaction` and `getMultipleAccounts`.
+serve `getSignaturesForAddress`, `getTransaction` and `getMultipleAccounts`, and with
+`--upgrade-impact` also `getMinimumBalanceForRentExemption`.
 
 - **Signatures.** From `getSignaturesForAddress`, 1000 at a time, back through history.
   idl-verify skips failed transactions, because they can hold data that the program
@@ -280,6 +289,88 @@ Equal values do not prove equal layouts. voltr's Codama IDL drops 7 bytes of pad
 fails on the `bytes_used` error of the new IDL. Run idl-verify on the old IDL alone to see
 its unused bytes.
 
+## Upgrade impact
+
+Before you deploy a program upgrade, `--upgrade-impact` shows how the new IDL reads the
+program's accounts. Give the new IDL with `--idl`. idl-verify decodes each sampled
+account with it and puts the account in one class:
+
+| Class | Rule |
+|---|---|
+| ok | The account decodes, and the new IDL reads each byte. |
+| shorter | The account decodes, and bytes are left over. The new type can be smaller, or the account has spare room. The account is not broken. |
+| realloc | A read goes past the end of the data, and the account decodes when zero bytes are added at the end. A field or a fixed array of the new layout can start or end past the data. The realloc size is the smallest number of zero bytes that makes it decode. For a fixed-size or zero-copy type, this is the new size minus the account size. For a variable-size type, it is the bytes that the new trailing fields need. |
+| broken | The discriminator matches no account type of the new IDL. Or the data does not decode, and zero bytes do not fix it, such as an invalid enum tag or bool. Or a length prefix that the new IDL reads from the existing bytes points past the data: a live account holds complete data, so the new IDL reads those bytes another way. (The prefix of a new trailing field comes from the zero bytes, so it is 0.) Or, with `--compare-idl`, a field that both IDLs name decodes to another value. |
+
+Give the current IDL with `--compare-idl`. idl-verify then decodes each account with both
+IDLs and compares the fields that both IDLs name, with the same comparison as
+[compare two IDLs](#compare-two-idls). A field that only one IDL has is not a difference.
+Lists compare on the items that both IDLs read, so a reserved array that gives bytes to a
+new field is not a difference when the values stay the same. Without `--compare-idl`, a
+field that changes its type, or that moves, can show as ok, shorter or realloc.
+
+The extra rent of an account that needs a realloc is the rent-exempt minimum of the new
+size minus the minimum of the current size. A live run gets the minimums from the cluster
+with `getMinimumBalanceForRentExemption`, one request for each size. With `--samples`,
+idl-verify sends no request. It uses `(128 + size) * 5080` lamports, as Agave's
+`Rent::minimum_balance` does with a rate of 5080 lamports per byte. 5080 is the mainnet
+rate since the SIMD-0437 feature `set_lamports_per_byte_to_5080` activated at slot
+446256000. A later SIMD-0437 step can lower it. A live run gets the exact current value
+from the cluster. The output names the source of the rent.
+
+A broken account is an `upgrade_impact` error, an account that needs a realloc is a
+warning, and a shorter account is a note. So with the default `--fail-on error`, a run where
+accounts only need a realloc exits 0. `--fail-on warning` fails it.
+
+The new voltr IDL below adds a `u64` at the end of the zero-copy `Vault`, narrows
+`StrategyInitReceipt.position_value` from `u64` to `u32`, and makes
+`AdaptorAddReceipt._reserved` 8 bytes shorter:
+
+```bash
+idl-verify --idl voltr_new.json --upgrade-impact \
+           --samples fixtures/live/voltr_vault/samples.json \
+           --compare-idl fixtures/live/voltr_vault/idl.json
+```
+
+```text
+upgrade impact under the new IDL (sample counts, not all accounts of the program):
+  type                 sampled  ok  shorter  broken  realloc  bytes  rent each
+  AdaptorAddReceipt          5   0        5       0        0      -  -
+  Protocol                   1   1        0       0        0      -  -
+  StrategyInitReceipt        5   2        0       3        0      -  -
+  Vault                      5   0        0       0        5      8  40640
+  total                     16   3        5       3        5
+extra rent for the 5 accounts that need a realloc: 203200 lamports, estimated offline as (128 + size) * 5080 lamports
+  5080 lamports per byte is the mainnet rate since the SIMD-0437 feature set_lamports_per_byte_to_5080. A later SIMD-0437 step can lower it. A live run (--rpc) gets the exact value from the cluster.
+
+error: account StrategyInitReceipt: breaks under the new IDL in 3 of 5 samples: `position_value` reads 3670056934 under the new IDL and 415986917350 under the old IDL
+warning: account Vault: needs a realloc of 8 bytes under the new IDL in 5 of 5 samples
+note: account AdaptorAddReceipt: 8 bytes after the data that the new IDL reads, in 5 of 5 samples
+```
+
+The `u32` keeps its offset in the `repr(C)` layout, so without `--compare-idl` all 5
+`StrategyInitReceipt` accounts are ok. The 2 ok accounts hold a value that fits in 32 bits.
+
+The run checks accounts only. The instructions and events in the samples are for the
+current program, so idl-verify does not check them against the new IDL, and the report's
+`instructions` and `events` are empty. A run with no account data exits 2. The classes
+replace the `decode`, `bytes_used`, `size_distribution` and `reference` checks on the
+accounts. The `discriminator`, `missing_type` and `layout` checks still run. When the new
+IDL has another address, such as a new deployment, give the sampled program with
+`--program`. The `program_id` warning then says that the two addresses differ.
+
+Limits:
+
+- **The counts are of the sample.** Live sampling takes the accounts that recent
+  transactions pass, at most 5 of each account type. idl-verify does not count all the
+  accounts of a type, because many RPCs refuse `getProgramAccounts` for a large program.
+- **New bytes are zero.** idl-verify decodes a realloc with zero bytes at the end. If the
+  new program writes other values when it reallocates, the classes do not show it.
+- **An IDL with no account discriminators** matches accounts by size. An account of the old
+  size then matches no type, and is broken.
+- **A type that idl-verify cannot decode has no row.** It gets its usual `missing_type` or
+  `layout` finding.
+
 ## Events
 
 A `log` event is `[discriminator][payload]`. A `cpi` event first loses its envelope: the
@@ -315,6 +406,7 @@ error: event TradeEvent: 24 bytes after the payload in 10 of 10 samples
 | `events` | One entry for each event: `name`, `samples`, `sources` (`log`, `cpi`), `sizes`, `bytes_used`. Sizes include the discriminator and do not include a self-CPI envelope. |
 | `reference` | Only after a comparison: `accounts_compared`, `accounts_matched`, `instructions_compared`, `instructions_matched`, `events_compared`, `events_matched`, `skipped`. |
 | `sampling` | Only after a live run: `transactions` (successful transactions read) and `stop_reason`. |
+| `upgrade_impact` | Only with `--upgrade-impact`. `rent_source` (`rpc` or `formula`), `lamports_per_byte` (the offline rate, or `null` for `rpc`), `types`, `unknown` (accounts whose discriminator matches no account type, counted as broken) and `totals`. Each entry of `types` has `name`, `sampled`, `ok`, `shorter` (`count`, `bytes`), `realloc` (`count`, `bytes`, `rent_each`, `rent_total`) and `broken` (`count`, and `reasons`, each with `reason`, `count`, `detail` and `example`). `bytes` and `rent_each` are `min` and `max`, or `null` when `count` is 0. `totals` has `sampled`, `ok`, `shorter`, `realloc`, `broken` and `rent_total`. The counts are of the sample. Rent is in lamports. In this mode, `instructions` and `events` are empty. |
 | `findings` | Each finding: `severity`, `check`, `subject`, `message`, and when present `hint` and `example`. |
 | `counts` | `errors`, `warnings`, `notes`. |
 | `exit_code` | The same value as the process exit code. |
@@ -365,11 +457,9 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
   passes fewer accounts than the IDL lists leaves out absent optional accounts. idl-verify
   maps the keys to IDL positions only where the position is certain, and skips the other
   accounts in `fixed_address`, `account_flags` and `pda`.
-- **A default public key is read as a fixed address.** An account whose IDL default is a
-  public key, but which the program also accepts with another key, gives a false
-  `fixed_address` error for that other key. An example is Token-2022's
-  `instructionsSysvarOrContextState`, which takes a context-state account in place of the
-  Instructions sysvar.
+- **A Codama IDL cannot fix an address.** Codama has only a default key, so a Codama IDL
+  converted from Anchor loses each `address` constraint. Another key at that position is a
+  note, not an error. Verify the Anchor IDL to get the error.
 - **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
   `name` key of each node to `identifier`. idl-verify stops with "Codama spec 2.0.0 is not
   supported; only spec 1.x can be read" (exit 2).

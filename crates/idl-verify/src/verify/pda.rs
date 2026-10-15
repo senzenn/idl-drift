@@ -180,12 +180,17 @@ impl SampleSeeds<'_> {
                 }
                 Some(key.to_vec())
             }
-            Seed::Arg(name) => {
-                let Some(Value::Struct(fields)) = self.args else {
-                    return None;
-                };
-                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-                arg_bytes(&fields.get(by_name(&names, name)?)?.1)
+            Seed::Arg(path) => {
+                // Each part of `params.id` names a field of a struct, as in Anchor's client.
+                let mut value = self.args?;
+                for name in path.split('.') {
+                    let Value::Struct(fields) = value else {
+                        return None;
+                    };
+                    let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                    value = &fields.get(by_name(&names, name)?)?.1;
+                }
+                arg_bytes(value)
             }
             Seed::Other => None,
         }
@@ -361,6 +366,33 @@ mod tests {
         let report = verify(&idl, &sample(&[1, 7, 0, 0, 0, 0, 0, 0, 0], &order), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
         let report = verify(&idl, &sample(&[1, 8, 0, 0, 0, 0, 0, 0, 0], &order), None);
+        assert_eq!(
+            findings(&report),
+            [(Severity::Note, "account #0 `order`: the key passed there does not derive from its seeds in the IDL, in 1 of 1 sample (such as DYFXbWma5QHoWZbUWoQ5qszknvT3g45Qapxkhakfaa1F)")]
+        );
+    }
+
+    #[test]
+    fn a_seed_can_read_a_field_inside_a_struct_argument() {
+        let idl = Idl::from_json(&format!(
+            r#"{{"address":"{VOLTR}","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},
+            "instructions":[{{"name":"go","discriminator":[1],"accounts":[
+                {{"name":"order","pda":{{"seeds":[{{"kind":"const","value":[111,114,100,101,114]}},
+                {{"kind":"arg","path":"params.inner.id"}}]}}}},
+                {{"name":"other","pda":{{"seeds":[{{"kind":"arg","path":"params.flag.unwrap_or(0)"}}]}}}}],
+            "args":[{{"name":"params","type":{{"defined":{{"name":"Params"}}}}}}]}}],
+            "types":[
+                {{"name":"Params","type":{{"kind":"struct","fields":[{{"name":"flag","type":"u8"}},
+                {{"name":"inner","type":{{"defined":{{"name":"Inner"}}}}}}]}}}},
+                {{"name":"Inner","type":{{"kind":"struct","fields":[{{"name":"id","type":"u64"}}]}}}}]}}"#
+        ))
+        .unwrap();
+        // `order` is the PDA of `["order", 7u64.to_le_bytes()]`; `other` has a seed that
+        // cannot be resolved, so the check skips it.
+        let keys = ["DYFXbWma5QHoWZbUWoQ5qszknvT3g45Qapxkhakfaa1F", KEYS[0]];
+        let report = verify(&idl, &sample(&[1, 9, 7, 0, 0, 0, 0, 0, 0, 0], &keys), None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        let report = verify(&idl, &sample(&[1, 9, 8, 0, 0, 0, 0, 0, 0, 0], &keys), None);
         assert_eq!(
             findings(&report),
             [(Severity::Note, "account #0 `order`: the key passed there does not derive from its seeds in the IDL, in 1 of 1 sample (such as DYFXbWma5QHoWZbUWoQ5qszknvT3g45Qapxkhakfaa1F)")]

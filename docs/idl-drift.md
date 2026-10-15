@@ -7,6 +7,7 @@ by its effect on a parser that was generated from the old IDL.
 
 ```text
 idl-drift diff [--json] [--fail-on <TIER>] <OLD> <NEW>
+idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json] [--fail-on <TIER>] <PROGRAM> <NEW>
 idl-drift inspect [--layout] <IDL>
 ```
 
@@ -14,15 +15,46 @@ idl-drift inspect [--layout] <IDL>
 |---|---|---|
 | `--json` | `diff` | Print the report as JSON. See [JSON output](#json-output). |
 | `--fail-on <TIER>` | `diff` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
+| `--onchain` | `diff` | Read the first argument as a program id, and use the IDL that the program publishes on chain as the old IDL. See [On-chain IDL](#on-chain-idl). |
+| `--rpc <URL>` | `diff` | The JSON-RPC URL for `--onchain`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
+| `--source <SOURCE>` | `diff` | With `--onchain`, the account to read: `metadata` (the Program Metadata program) or `anchor` (the Anchor IDL account). |
 | `--layout` | `inspect` | Also print each zero-copy type field by field, with its gaps and both sizes. |
 
 Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
+
+### On-chain IDL
+
+`idl-drift diff --onchain <PROGRAM> <NEW>` compares the IDL that the program publishes on
+chain with NEW. Use it before an upgrade, to see what changes for parsers that were built
+from the deployed IDL.
+
+```bash
+export IDL_DRIFT_RPC_URL=https://api.mainnet-beta.solana.com
+idl-drift diff --onchain 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P target/idl/pump.json
+```
+
+idl-drift reads two accounts:
+
+- The canonical `idl` account of the Program Metadata program, which only the program's
+  upgrade authority can write. The account must hold the IDL as UTF-8 JSON text, with no
+  compression, gzip or zlib.
+- The Anchor IDL account, which `anchor idl init` writes. The data is zlib.
+
+If the program has both accounts, idl-drift stops (exit 2) and asks for `--source`, because
+the two IDLs can differ. A legacy IDL with no address gets the program id as its address.
+
+The report starts with the account that the IDL came from, for example
+`on-chain IDL: Anchor IDL account <ACCOUNT>`. The JSON report adds
+`"onchain": {"source": "anchor", "account": "<ACCOUNT>"}`.
+
+A Program Metadata account that stores the IDL at a URL or in another account is not read.
 
 ## Input formats
 
 Each file can be one of these formats. The two files do not have to use the same format.
 
-- Anchor IDL, 0.30 spec (with `address`, `metadata` and discriminators).
+- Anchor IDL, 0.30 spec (with `address`, `metadata` and discriminators). `metadata.spec`
+  must be `0.1.0`, the only spec that Anchor reads. Another spec stops the run (exit 2).
 - Legacy Anchor IDL (before 0.30). These IDLs have no discriminators. idl-drift calculates
   them from the names, as Anchor does: the first 8 bytes of
   `sha256("global:<snake_case name>")`, `sha256("account:<Name>")` or `sha256("event:<Name>")`.
@@ -137,6 +169,8 @@ Two rules follow Shipstern's dispatch:
   dispatch order.
 - `serialization` or `repr` changed, no field moves, but the zero-copy size changes
   (trailing padding).
+- An error was removed or renumbered, or a new error name took an old code. An indexer
+  names the `Custom(code)` of a failed transaction from the IDL's errors.
 
 ### Additive
 
@@ -173,6 +207,7 @@ change in CI, match on `kind` and `subject`, not on the message text, which can 
 | | `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
 | | `field_renamed`, `variant_renamed`, `variant_appended` | Dangerous on a reachable type, else Cosmetic |
 | | `layout_changed` | Breaking, Dangerous or Cosmetic. See [Zero-copy types](#zero-copy-types). |
+| Errors | `error_removed`, `error_renumbered`, `error_code_reused` | Dangerous |
 
 The `subject` names the item. A positional item has `#<position>`, counted from 0:
 
@@ -313,8 +348,9 @@ the functions behind `inspect`.
 
 ## Limitations
 
-- **IDL against IDL only.** idl-drift cannot see a program that was upgraded on chain with
-  no IDL update. Use [idl-verify](idl-verify.md) to check an IDL against real data.
+- **IDL against IDL only.** idl-drift compares IDLs, also with `--onchain`. It cannot see a
+  program that was upgraded on chain with no IDL update. Use [idl-verify](idl-verify.md) to
+  check an IDL against real data.
 - **New types in `types` are not reported.** A type removed from `types` is reported only
   when a parser still reads it.
 - **Unresolved Codama nodes.** idl-drift cannot read inside some Codama nodes. A change

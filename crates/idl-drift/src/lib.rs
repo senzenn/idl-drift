@@ -18,6 +18,7 @@ pub mod diff;
 pub mod inspect;
 pub mod layout;
 pub mod model;
+pub mod onchain;
 mod reach;
 
 pub use diff::{diff, Change, ChangeKind, Report, Severity};

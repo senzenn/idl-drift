@@ -143,6 +143,17 @@ fn legacy_discriminators_match_the_real_ones() {
 }
 
 #[test]
+fn anchor_spec_other_than_0_1_0_fails_with_its_spec() {
+    let err =
+        Idl::from_json(r#"{"address":"A","metadata":{"name":"t","version":"1","spec":"0.2.0"}}"#)
+            .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Anchor IDL spec 0.2.0 is not supported; only spec 0.1.0 can be read"
+    );
+}
+
+#[test]
 fn legacy_idl_with_address_only_metadata_parses() {
     let idl = parse(
         r#"{"version":"0.1.0","name":"counter","metadata":{"address":"Count111"},

@@ -37,6 +37,7 @@ fn account(name: &str, optional: bool) -> AccountItem {
         may_sign: false,
         optional,
         address: None,
+        address_is_default: false,
         pda: None,
     })
 }
