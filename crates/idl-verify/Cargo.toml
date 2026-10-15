@@ -1,7 +1,7 @@
 [package]
 name = "idl-verify"
 description = "Check a Solana program IDL against real account and instruction data."
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,13 +11,13 @@ categories = ["command-line-utilities", "development-tools"]
 include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
-idl-drift = { path = "../..", version = "0.1.0" }
-base64 = "0.22"
-bs58 = "0.5"
-clap = { version = "4", features = ["derive", "env"] }
-owo-colors = "4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+idl-drift.workspace = true
+base64.workspace = true
+bs58.workspace = true
+clap = { workspace = true, features = ["env"] }
+owo-colors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror = "2"
 ureq = { version = "3.4", features = ["json"] }
 

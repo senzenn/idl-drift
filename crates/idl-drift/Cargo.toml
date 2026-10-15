@@ -1,0 +1,36 @@
+[package]
+name = "idl-drift"
+description = "Semantic drift detection for Solana program IDLs. Flags parser-breaking changes before they silently corrupt data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solana", "idl", "anchor", "codama", "borsh"]
+categories = ["command-line-utilities", "development-tools"]
+# The fixture IDLs belong to third parties, so the package ships only the code.
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[dependencies]
+base64.workspace = true
+bs58.workspace = true
+clap.workspace = true
+# The crate and version that Shipstern's `include_shipstern_parser!` deserializes.
+codama-nodes = "=0.13.2"
+# Legacy Anchor IDLs omit discriminators; Anchor derives them as sha256("global:<snake_name>").
+heck = "0.5"
+owo-colors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+
+[[bin]]
+name = "idl-drift"
+path = "src/main.rs"
+
+[lib]
+name = "idl_drift"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
   2  idl-verify could not run: a file could not be read or parsed, the RPC or the
      decoder failed, or nothing was sampled")]
 struct Cli {
-    /// Program IDL: Anchor (0.30+ spec) or Codama JSON.
+    /// Program IDL: Anchor (0.30 spec or legacy) or Codama JSON.
     #[arg(long, value_name = "PATH")]
     idl: PathBuf,
     /// Captured samples JSON: base64 account and instruction data.
@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "decoder")]
     reference: Option<PathBuf>,
     /// Decoder under test: a command that reads one JSON line per sample on stdin and
-    /// answers one per line (see README, "Decoder under test"). Split on whitespace.
+    /// answers one per line (see docs/decoder-protocol.md). Split on whitespace.
     #[arg(long, value_name = "CMD")]
     decoder: Option<String>,
     /// Another IDL of the same program, such as the one before a migration: decode the
@@ -145,11 +145,7 @@ fn run(cli: &Cli) -> Result<u8, Error> {
             "--save-samples saves only live samples, and --samples turns live sampling off; drop one of the two".into(),
         ));
     }
-    let idl_src = read(&cli.idl)?;
-    let idl = Idl::from_json(&idl_src).map_err(|source| Error::Idl {
-        path: cli.idl.clone(),
-        source,
-    })?;
+    let idl = read_idl(&cli.idl)?;
     let (samples, sampling) = if let Some(path) = &cli.samples {
         let samples = Samples::from_json(&read(path)?)?;
         if nothing_to_check(&samples) {
@@ -210,13 +206,7 @@ fn run(cli: &Cli) -> Result<u8, Error> {
         (sampled.samples, Some(summary))
     };
     let reference = match (&cli.reference, &cli.decoder, &cli.compare_idl) {
-        (_, _, Some(path)) => {
-            let old = Idl::from_json(&read(path)?).map_err(|source| Error::Idl {
-                path: path.clone(),
-                source,
-            })?;
-            Some(Reference::from_idl(&old, &idl, &samples))
-        }
+        (_, _, Some(path)) => Some(Reference::from_idl(&read_idl(path)?, &idl, &samples)),
         (Some(path), _, None) => Some(Reference::from_json(&read(path)?, &samples)?),
         (None, Some(command), None) => {
             let words: Vec<String> = command.split_whitespace().map(str::to_string).collect();
@@ -281,6 +271,13 @@ fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
 
 fn read(path: &Path) -> Result<String, Error> {
     std::fs::read_to_string(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_idl(path: &Path) -> Result<Idl, Error> {
+    Idl::from_json(&read(path)?).map_err(|source| Error::Idl {
         path: path.to_path_buf(),
         source,
     })

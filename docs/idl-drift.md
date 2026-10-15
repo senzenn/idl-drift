@@ -1,0 +1,293 @@
+# idl-drift reference
+
+`idl-drift` compares two versions of a Solana program IDL. It puts each change in a tier,
+by its effect on a parser that was generated from the old IDL.
+
+## Commands
+
+```text
+idl-drift diff [--json] [--fail-on <TIER>] <OLD> <NEW>
+idl-drift inspect [--layout] <IDL>
+```
+
+| Option | Command | Meaning |
+|---|---|---|
+| `--json` | `diff` | Print the report as JSON. See [JSON output](#json-output). |
+| `--fail-on <TIER>` | `diff` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
+| `--layout` | `inspect` | Also print each zero-copy type field by field, with its gaps and both sizes. |
+
+Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
+
+## Input formats
+
+Each file can be one of these formats. The two files do not have to use the same format.
+
+- Anchor IDL, 0.30 spec (with `address`, `metadata` and discriminators).
+- Legacy Anchor IDL (before 0.30). These IDLs have no discriminators. idl-drift calculates
+  them from the names, as Anchor does: the first 8 bytes of
+  `sha256("global:<snake_case name>")`, `sha256("account:<Name>")` or `sha256("event:<Name>")`.
+- Codama `rootNode` JSON, the format that Shipstern's `include_shipstern_parser!` reads.
+
+idl-drift also accepts three Anchor shapes that are not in the spec structs: tuple struct
+fields written as bare types, the pre-0.30 `{"kind": "alias"}` type, and
+`"serialization": {"custom": ...}`. A custom serialization has an unknown layout.
+
+## How idl-drift compares two IDLs
+
+A generated parser reads bytes by position and routes them by discriminator. idl-drift
+compares the two IDLs the same way:
+
+- Instructions, account types, events and defined types match by name.
+- Inside them, items compare by position: instruction accounts (composite groups are
+  flattened), instruction arguments, struct fields and enum variants.
+- A layout change counts only on a **reachable** type: an account type, an event type, a
+  type that an instruction argument names, and each type that these reach through fields,
+  variant payloads and aliases. A layout change on any other type is Cosmetic.
+
+When the two files use different formats, idl-drift first does these steps:
+
+- It compares names in camelCase, as Codama writes them. So `deposit_vault` and
+  `depositVault` are the same instruction.
+- It compares an instruction argument that links a struct field by field, at each depth,
+  and an argument that links an alias as the alias target. Codama inlines a type that has
+  only one use, and Borsh writes a struct as its fields, so the bytes are the same.
+- It compares a tuple struct and a tuple alias as the same type.
+
+### Zero-copy types
+
+`serialization` and `repr` changes follow Shipstern's converter. Only accounts are cast from
+memory. Instruction arguments and events are always Borsh. idl-drift lays out each zero-copy
+account two times, with the old and with the new `serialization` and `repr`, and compares
+the field offsets. Thus changes that cancel out are Cosmetic, for example a converter that
+removes `packed` from an account and from each type in it.
+
+### Discriminator dispatch
+
+Two rules follow Shipstern's dispatch:
+
+- Instructions that share a discriminator are told apart by account count, most accounts
+  first.
+- A self-CPI event envelope that changes length moves the start of the payload. An example
+  is a port from Anchor's 8-byte event tag to the 1-byte tag that many Pinocchio programs use.
+
+## Tiers
+
+| Tier | Meaning | Default effect |
+|---|---|---|
+| **Breaking** | The old parser misreads bytes or cannot route them. | Exit code 1. |
+| **Dangerous** | Existing positions and tags stay the same, but the parser must grow, or generated names change. Review the change. | Exit code 0, or 1 with `--fail-on dangerous`. |
+| **Additive** | New surface. Old parsers are not affected. | Exit code 0. |
+| **Cosmetic** | No byte that a parser reads changes. | Exit code 0. |
+
+### Breaking
+
+- The program address changed. The parser drops each update from the new address.
+- An instruction was removed.
+- Two instructions have the same name, or names that differ only by ASCII case. Shipstern
+  generates one helper for both.
+- A new instruction uses the discriminator of an existing instruction. Old parsers route it
+  to the existing instruction.
+- An instruction, account or event discriminator changed. This includes a change in its
+  length (for example an Anchor to Quasar port), a Codama size discriminator, an event
+  discriminator offset, and a later constant in an event discriminator chain.
+- An instruction account moved, or an account was removed from the middle of the list.
+- An instruction argument was added, removed, retyped or moved.
+- Two instructions have the same discriminator and the same account count.
+- An account type or event type was removed.
+- An event envelope discriminator or the event payload offset changed.
+- The kind of a type changed, for example from struct to enum.
+- On a reachable type: a field was added, removed, retyped or moved; an enum variant was
+  inserted before the end, removed or moved; a variant tag value or payload changed; the
+  enum tag width changed; an alias target changed; or the type was removed while a parser
+  still reads it.
+- `serialization` or `repr` changed and a field of a zero-copy account moves, for example
+  when a converter removes `bytemuckunsafe` from a padded type. The same applies when the
+  layout of a zero-copy account cannot be calculated, for example when it holds an enum.
+
+### Dangerous
+
+- The program name changed. The generated module name changes.
+- An enum variant was added at the end.
+- An account was added at the end of an instruction's account list.
+- An optional account was removed from the end of the list.
+- The `writable`, `signer` or `optional` flag of an instruction account changed.
+- A field, argument, account or variant was renamed in place: the same type, the same
+  position, and neither name is used at another position on the other side. Otherwise
+  idl-drift reports a move.
+- A discriminator collision exists in both versions.
+- The set of account counts under a shared discriminator changed. This changes the
+  dispatch order.
+- `serialization` or `repr` changed, no field moves, but the zero-copy size changes
+  (trailing padding).
+
+### Additive
+
+- A new instruction, account type or event type.
+
+### Cosmetic
+
+- A field, variant, enum tag or alias change on a type that no parser reads.
+- A `serialization` or `repr` change that moves no zero-copy field. This includes a type
+  that is only read as Borsh, and a nested type's own `serialization`, which no zero-copy
+  read uses.
+
+## Rule names
+
+Each change has a `kind`: the rule that found it. Rule names are stable. To allow a known
+change in CI, match on `kind` and `subject`, not on the message text, which can change.
+
+| Area | `kind` | Tier |
+|---|---|---|
+| Program | `program_address_changed` | Breaking |
+| | `program_renamed` | Dangerous |
+| Instructions | `instruction_removed`, `instruction_duplicate`, `instruction_name_collision`, `discriminator_reused`, `discriminator_changed`, `discriminator_offset_changed`, `collision` | Breaking |
+| | `collision_preexisting`, `dispatch_order_changed` | Dangerous |
+| | `instruction_added` | Additive |
+| Instruction accounts | `account_moved`, `account_removed` | Breaking |
+| | `account_added`, `optional_account_removed`, `account_renamed`, `account_flags_changed` | Dangerous |
+| Instruction arguments | `arg_added`, `arg_removed`, `arg_changed`, `arg_moved` | Breaking |
+| | `arg_renamed` | Dangerous |
+| Account types | `account_type_removed`, `account_discriminator_changed`, `account_discriminator_offset_changed` | Breaking |
+| | `account_type_added` | Additive |
+| Events | `event_removed`, `event_discriminator_changed`, `event_envelope_changed`, `event_payload_offset_changed` | Breaking |
+| | `event_added` | Additive |
+| Defined types | `type_kind_changed`, `type_removed` | Breaking |
+| | `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
+| | `field_renamed`, `variant_renamed`, `variant_appended` | Dangerous on a reachable type, else Cosmetic |
+| | `layout_changed` | Breaking, Dangerous or Cosmetic. See [Zero-copy types](#zero-copy-types). |
+
+The `subject` names the item. A positional item has `#<position>`, counted from 0:
+
+| Subject | Meaning |
+|---|---|
+| `program` | The program address or name. |
+| `swap` | The instruction, type or event `swap`. |
+| `swap#2` | Account or argument 2 of instruction `swap`. |
+| `Pool#1` | Field or variant 1 of type `Pool`. |
+
+## Exit codes
+
+The exit codes are in the [quick guide](../QUICKGUIDE.md#exit-codes). A reader that closes
+the pipe early, such as `head`, does not change the exit code.
+
+## JSON output
+
+`idl-drift diff --json` prints one object with these keys:
+
+| Key | Content |
+|---|---|
+| `changes` | Each change, with `severity`, `kind`, `subject` and `message`. |
+| `breaking`, `dangerous`, `additive`, `cosmetic` | The messages of each tier. |
+| `counts` | The number of changes in each tier. |
+| `exit_code` | The same value as the process exit code. |
+
+One entry of `changes` for the `amm_old.json` and `amm_new.json` pair in
+`crates/idl-drift/tests/fixtures/`:
+
+```json
+{
+  "severity": "breaking",
+  "kind": "field_changed",
+  "subject": "Pool#1",
+  "message": "FIELD changed (Pool#1) via reachable type: feeBps: u16 -> u32 (Borsh layout)"
+}
+```
+
+When the run exits 2, stdout holds only `{"error": "<message>", "exit_code": 2}`. The
+message also goes to stderr.
+
+To allow a known change in CI, filter it out by `kind` and `subject`. This `jq` command
+counts the Breaking changes other than a known field change on `Pool#1`:
+
+```bash
+idl-drift diff old.json new.json --json \
+  | jq '[.changes[] | select(.severity == "breaking")
+         | select(.kind != "field_changed" or .subject != "Pool#1")] | length'
+```
+
+## inspect
+
+`inspect` lists the fields whose byte layout idl-drift cannot resolve. A change to such a
+field cannot be classified, and `idl-verify` cannot decode it. Run `inspect` on a new IDL
+before you trust a `diff` of it.
+
+idl-drift cannot resolve these Codama nodes: hidden prefixes and suffixes, offsets,
+sentinels, inline enums, a size prefix around a struct, a fixed-size wrapper around a type
+that is not bytes or a string, a fixed count on a map or set, and a zeroable option with a
+custom zero value. It can resolve inline structs, big-endian numbers, `shortU16`, any
+integer length prefix, remainder lengths, and tagged, zeroable and remainder options.
+
+A Codama IDL with a `hiddenPrefixTypeNode` on argument `n` of instruction `ping` gives:
+
+```text
+instructions: 1  accounts: 0  events: 1  types: 1
+unmapped (Generic) fields: 1
+UNMAPPED: ix:ping.n -> Generic("hiddenPrefixTypeNode")
+padded zero-copy types also read as Borsh: 0
+```
+
+### Padded zero-copy types that Borsh also reads
+
+`inspect` also lists, on a `SHARED:` line, each padded zero-copy type that Borsh also
+reads. A type inside a `bytemuckunsafe` account sits at `repr(C)` offsets, with implicit
+padding. When an instruction argument, an event or a Borsh account reaches the same type,
+Borsh reads it without the padding. One type definition cannot describe both reads.
+Shipstern's converter rejects this case as `PaddedBorshType`.
+
+### --layout
+
+`--layout` prints each `bytemuck` and `bytemuckunsafe` type field by field: the offset, size
+and alignment of each field under SBF `repr(C)` rules, each implicit gap, and the zero-copy
+size next to the Borsh size. The alignment rules are in
+[idl-verify.md](idl-verify.md#zero-copy-layout).
+
+```bash
+idl-drift inspect --layout fixtures/live/voltr_vault/idl.json
+```
+
+```text
+instructions: 28  accounts: 6  events: 26  types: 44
+unmapped (Generic) fields: 0
+padded zero-copy types also read as Borsh: 0
+zero-copy types: 13
+
+AdaptorAddReceipt (bytemuckunsafe repr(C)): repr(C) size 144, Borsh size 137, padding 7
+  offset  size  align  field
+       0    32      1  vault
+      32    32      1  adaptor_program
+      64     1      1  version
+      65     1      1  bump
+      66     7      1  _padding0
+      80     8      8  last_updated_epoch
+      88    56      1  _reserved
+  gap at 73: 7 bytes before `last_updated_epoch`
+...
+```
+
+An IDL whose converter removed `serialization` lists no zero-copy types. Check this first
+when a parser reads too few bytes.
+
+## Library
+
+The `idl_drift` crate exposes the same functions as the CLI. An example is in the
+[crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
+both tools use. `idl_drift::layout` calculates zero-copy layouts. `idl_drift::inspect` holds
+the functions behind `inspect`.
+
+## Limitations
+
+- **IDL against IDL only.** idl-drift cannot see a program that was upgraded on chain with
+  no IDL update. Use [idl-verify](idl-verify.md) to check an IDL against real data.
+- **New types in `types` are not reported.** A type removed from `types` is reported only
+  when a parser still reads it.
+- **Unresolved Codama nodes.** A change inside a node that idl-drift cannot resolve can pass
+  `diff` with no warning. Run `inspect` to see these fields.
+
+Known bugs, not fixed yet:
+
+- Two instructions that are identified only by size, with the same size, are not reported
+  as a collision.
+- A Codama inline struct argument, or a generic type, compared with the same type in
+  another form can give a false Breaking change.
+- Composite account groups with the same leaf name in two groups can give a false
+  `account_moved`.

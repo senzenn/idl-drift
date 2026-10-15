@@ -71,9 +71,9 @@ for name in 90_broken_json 91_missing_field; do
 done
 
 # A real upgrade: the legacy pump.fun IDL against the on-chain 0.30 one.
-expect "real pair pump_fun legacy -> 0.30" 1 "$DRIFT" diff shipstern-integration/idls/pump_fun.json fixtures/real/pump_fun_onchain.json
+expect "real pair pump_fun legacy -> 0.30" 1 "$DRIFT" diff fixtures/shipstern/pump_fun.json fixtures/real/pump_fun_onchain.json
 # The same program as legacy Anchor and as Codama: names and discriminators must line up.
-expect "cross-format limit_order_v1" 0 "$DRIFT" diff fixtures/real/limit_order_v1_onchain.json tests/idls/limit_order_v1.json
+expect "cross-format limit_order_v1" 0 "$DRIFT" diff fixtures/real/limit_order_v1_onchain.json fixtures/shipstern/limit_order_v1.json
 
 echo
 echo "== idl-drift inspect: fixtures/real =="

@@ -19,10 +19,10 @@ use base64::Engine;
 use idl_drift::model::Idl;
 use serde_json::{json, Value as Json};
 
+use crate::classify::{envelopes, event_body};
 use crate::error::Error;
 use crate::reference::{Outcome, Reference};
-use crate::samples::{EventSource, Samples};
-use crate::verify::{envelopes, event_body};
+use crate::samples::Samples;
 
 /// Longest wait for one reply; a parser decodes a sample in microseconds.
 const REPLY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -72,12 +72,8 @@ pub fn run_decoder(
         .chain(samples.events.iter().map(|e| {
             // A sample without the IDL's envelope is already an error; send it whole.
             let body = event_body(e, &envelopes).unwrap_or(&e.data);
-            let source = match e.source {
-                EventSource::Log => "log",
-                EventSource::Cpi => "cpi",
-            };
             json!({ "kind": "event", "program": program_id, "signature": e.signature,
-                    "source": source, "data": STANDARD.encode(body) })
+                    "source": e.source.as_str(), "data": STANDARD.encode(body) })
         }))
         .collect();
     // Write on another thread: a child that answers as it reads would otherwise fill its
@@ -162,19 +158,15 @@ fn parse_reply(line: &str) -> Result<Outcome, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::samples::{AccountSample, EventSample, InstructionSample};
-    use crate::verify::EVENT_IX_TAG;
+    use crate::classify::EVENT_IX_TAG;
+    use crate::samples::{AccountSample, EventSample, EventSource, InstructionSample};
 
     fn idl() -> Idl {
-        Idl::from_json(
-            r#"{"address":"P","metadata":{"name":"t","version":"0","spec":"0.1.0"},"instructions":[],"events":[{"name":"Ev","discriminator":[7]}]}"#,
-        )
-        .unwrap()
+        crate::testing::idl(r#""instructions":[],"events":[{"name":"Ev","discriminator":[7]}]"#)
     }
 
     fn samples() -> Samples {
         Samples {
-            program_id: None,
             accounts: vec![AccountSample {
                 address: "A".into(),
                 data: vec![1, 2],
@@ -185,13 +177,12 @@ mod tests {
                 accounts: vec!["K".into()],
                 flags: None,
             }],
-            events: Vec::new(),
+            ..Samples::default()
         }
     }
 
     #[test]
     fn replies_line_up_with_samples_and_errors_are_kept() {
-        // `sh` answers ok for the account and error for the instruction.
         // `sh` checks that the program id arrives, then answers ok and error.
         let script = r#"read a; case "$a" in *'"program":"P"'*) echo '{"status":"ok","value":{"x":1}}';; *) echo '{"status":"error","error":"no program"}';; esac; read b; echo '{"status":"error","error":"nope"}'"#;
         let command = ["sh".to_string(), "-c".to_string(), script.to_string()];

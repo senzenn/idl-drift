@@ -33,5 +33,5 @@ print(f"stamped address={pid}")
 PY
 
 echo "fetched -> ${OUT}"
-cargo run --quiet -- inspect "$OUT"
+cargo run --quiet -p idl-drift -- inspect "$OUT"
 echo "exit=$?"

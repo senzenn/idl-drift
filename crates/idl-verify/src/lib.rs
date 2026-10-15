@@ -17,14 +17,20 @@
 //! ```
 
 pub mod decode;
-mod decoder;
-mod error;
-pub use idl_drift::layout;
-mod reference;
 pub mod report;
 pub mod rpc;
+
+mod classify;
+mod decoder;
+mod error;
+mod reference;
 mod samples;
+#[cfg(test)]
+mod testing;
+mod text;
 mod verify;
+
+pub use idl_drift::layout;
 
 pub use decoder::run_decoder;
 pub use error::Error;

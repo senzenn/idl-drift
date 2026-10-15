@@ -67,6 +67,16 @@ pub enum EventSource {
     Cpi,
 }
 
+impl EventSource {
+    /// The name `samples.json` and the decoder protocol use.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Cpi => "cpi",
+        }
+    }
+}
+
 /// One event the program emitted, as raw bytes.
 #[derive(Debug, Clone)]
 pub struct EventSample {
@@ -183,9 +193,7 @@ impl Samples {
             events,
         })
     }
-}
 
-impl Samples {
     /// The samples as `samples.json` text, so a live run can be saved and rerun offline.
     #[must_use]
     pub fn to_json(&self) -> String {
@@ -213,11 +221,7 @@ impl Samples {
             .events
             .iter()
             .map(|e| {
-                let source = match e.source {
-                    EventSource::Log => "log",
-                    EventSource::Cpi => "cpi",
-                };
-                serde_json::json!({ "signature": e.signature, "source": source,
+                serde_json::json!({ "signature": e.signature, "source": e.source.as_str(),
                                     "data": STANDARD.encode(&e.data) })
             })
             .collect();

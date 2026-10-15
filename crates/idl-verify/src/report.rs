@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
+use crate::text::plural;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -342,7 +344,7 @@ impl Report {
         self.write_findings(out, color)?;
         let count = |severity, one, many| {
             let n = self.count(severity);
-            format!("{n} {}", if n == 1 { one } else { many })
+            format!("{n} {}", plural(n, one, many))
         };
         writeln!(
             out,
@@ -522,27 +524,22 @@ fn write_table<const N: usize>(
 mod tests {
     use super::*;
     use crate::samples::{InstructionSample, Samples};
-    use idl_drift::model::Idl;
+    use crate::testing::idl;
 
     #[test]
     fn low_coverage_is_an_error_only_below_the_minimum() {
         // Two instructions, one sampled: 50%. The IDL has no account types or events.
-        let idl = Idl::from_json(
-            r#"{"address":"P","metadata":{"name":"t","version":"0","spec":"0.1.0"},"instructions":[
+        let idl = idl(r#""instructions":[
                 {"name":"a","discriminator":[1],"accounts":[],"args":[]},
-                {"name":"b","discriminator":[2],"accounts":[],"args":[]}]}"#,
-        )
-        .unwrap();
+                {"name":"b","discriminator":[2],"accounts":[],"args":[]}]"#);
         let samples = Samples {
-            program_id: None,
-            accounts: Vec::new(),
             instructions: vec![InstructionSample {
                 signature: "S".into(),
                 data: vec![1],
                 accounts: Vec::new(),
                 flags: None,
             }],
-            events: Vec::new(),
+            ..Samples::default()
         };
         let report = crate::verify(&idl, &samples, None);
         assert_eq!(report.exit_code(), 0);

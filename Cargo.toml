@@ -1,54 +1,23 @@
 [workspace]
-members = [".", "crates/idl-verify"]
+members = ["crates/idl-drift", "crates/idl-verify"]
 resolver = "2"
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/senzenn/idl-drift"
+
+[workspace.dependencies]
+idl-drift = { path = "crates/idl-drift", version = "0.1.0" }
+base64 = "0.22"
+bs58 = "0.5"
+clap = { version = "4", features = ["derive"] }
+owo-colors = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
-
-[package]
-name = "idl-drift"
-description = "Semantic drift detection for Solana program IDLs. Flags parser-breaking changes before they silently corrupt data."
-version = "0.1.0"
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-keywords = ["solana", "idl", "anchor", "codama", "borsh"]
-categories = ["command-line-utilities", "development-tools"]
-# The fixture and test IDLs belong to third parties, so the package ships only the code.
-include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
-
-# Dependencies are limited to permissive licenses (MIT / Apache-2.0).
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-# Same crate and version Shipstern's `include_shipstern_parser!` deserializes.
-codama-nodes = "=0.13.2"
-# Discriminator byte decoding for Codama `bytesValueNode` encodings.
-# Without these, base58/base64 discs were stored as encoded-string bytes and
-# compared unequal to the same value written as base16 (false Breaking).
-bs58 = "0.5"
-base64 = "0.22"
-owo-colors = "4"
-# Legacy Anchor IDLs omit discriminators; Anchor derives them as
-# sha256("global:<snake_case name>") and friends.
-heck = "0.5"
-sha2 = "0.10"
-
-[[bin]]
-name = "idl-drift"
-path = "src/main.rs"
-
-[lib]
-name = "idl_drift"
-path = "src/lib.rs"
-
-[lints]
-workspace = true
