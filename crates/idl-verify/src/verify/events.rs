@@ -161,7 +161,7 @@ impl Verifier<'_> {
             );
             return summary;
         };
-        let disc = ev.discriminator.len();
+        let disc = ev.payload_start();
         let outcomes: Outcomes = idxs
             .iter()
             .map(|&i| {
@@ -422,6 +422,20 @@ mod tests {
             f.message,
             "4 bytes of zeros after the payload in 1 of 1 sample"
         );
+    }
+
+    #[test]
+    fn event_payload_starts_after_the_last_discriminator() {
+        // Shipstern's fixture: envelope `fe`@0, then `a1a2`@4 and `b7`@8, with a gap after `a1a2`.
+        let idl = Idl::from_json(include_str!(
+            "../../../../fixtures/shipstern/chained_cpi_event_envelope.json"
+        ))
+        .unwrap();
+        let body = [&[0xa1, 0xa2, 0xcc, 0xcc, 0xb7][..], &7u64.to_le_bytes()].concat();
+        let samples = events(&[cpi(&[0xfe, 0, 0, 0], &body)]);
+        let report = verify(&idl, &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.event_coverage.classified, 1);
     }
 
     #[test]

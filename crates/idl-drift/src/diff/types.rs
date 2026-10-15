@@ -3,7 +3,9 @@
 
 use std::collections::BTreeSet;
 
-use super::text::{field_change, field_str, payload_str, tystr};
+use super::text::{
+    field_change, field_str, has_unreadable, payload_str, type_change, unreadable_change,
+};
 use super::{zero_copy, ChangeKind, FieldEdit, Report, Severity};
 use crate::model::{EnumFields, EnumVariant, Field, Idl, Type, TypeDef, TypeDefTy};
 
@@ -44,18 +46,18 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
                 },
             ) => {
                 if otag != ntag {
-                    let show =
-                        |t: &Option<Type>| t.as_ref().map_or_else(|| "u8".to_string(), tystr);
+                    let u8_tag = Type::U8;
+                    let tags = type_change(
+                        otag.as_ref().unwrap_or(&u8_tag),
+                        ntag.as_ref().unwrap_or(&u8_tag),
+                        "every variant tag is read differently",
+                    );
                     if is_reached {
                         r.push(
                             Severity::Breaking,
                             ChangeKind::EnumTagChanged,
                             name.as_str(),
-                            format!(
-                                "enum tag width changed ({name}): {} -> {} (every variant tag is read differently)",
-                                show(otag),
-                                show(ntag)
-                            ),
+                            format!("enum tag width changed ({name}): {tags}"),
                         );
                     } else {
                         r.push(
@@ -76,9 +78,8 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
                         ChangeKind::AliasChanged,
                         name.as_str(),
                         format!(
-                            "type alias target changed ({name}): {} -> {} (Borsh layout)",
-                            tystr(oa),
-                            tystr(na)
+                            "type alias target changed ({name}): {}",
+                            type_change(oa, na, "Borsh layout")
                         ),
                     );
                 } else {
@@ -176,10 +177,9 @@ fn diff_variants(ty: &str, ov: &[EnumVariant], nv: &[EnumVariant], reached: bool
                 Severity::Breaking,
                 ChangeKind::VariantPayloadChanged,
                 format!(
-                    "enum variant payload changed ({ty}#{pos} {}): {} -> {} (Borsh layout)",
+                    "enum variant payload changed ({ty}#{pos} {}): {}",
                     o.name,
-                    payload_str(&o.fields),
-                    payload_str(&n.fields)
+                    payload_change(&o.fields, &n.fields)
                 ),
             ),
             // Either name at another index on the other side means the tag now selects a
@@ -236,6 +236,19 @@ fn diff_variants(ty: &str, ov: &[EnumVariant], nv: &[EnumVariant], reached: bool
                 format!("variant changed in UNREACHED enum ({ty}#{pos})"),
             );
         }
+    }
+}
+
+fn payload_change(old: &EnumFields, new: &EnumFields) -> String {
+    let (os, ns) = (payload_str(old), payload_str(new));
+    let unreadable = |f: &EnumFields| match f {
+        EnumFields::Tuple(items) => items.iter().any(has_unreadable),
+        EnumFields::Named(fields) => fields.iter().any(|f| has_unreadable(&f.ty)),
+    };
+    if os == ns && (unreadable(old) || unreadable(new)) {
+        unreadable_change(&os)
+    } else {
+        format!("{os} -> {ns} (Borsh layout)")
     }
 }
 

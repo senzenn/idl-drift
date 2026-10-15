@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use idl_drift::model::{Account, Instruction};
+use idl_drift::model::{Account, Instruction, OptionalAccounts};
 
 use super::{missing_field_hint, sample_count, Groups, Outcomes, Verifier, LEGACY_DISCRIMINATORS};
 use crate::classify::flatten;
@@ -57,11 +57,15 @@ impl Verifier<'_> {
 
     fn check_instruction(&mut self, ix: &Instruction, idxs: &[usize]) -> InstructionSummary {
         let subject = format!("instruction {}", ix.name);
-        let disc = ix
-            .discriminator_offset
-            .saturating_add(ix.discriminator.len());
+        let disc = ix.payload_start();
         let flat = flatten(&ix.accounts);
         let samples = &self.samples.instructions;
+        let omitted = ix.optional_accounts == OptionalAccounts::Omitted;
+        let places: Places = idxs
+            .iter()
+            .filter(|&&i| omitted && samples[i].accounts.len() < flat.len())
+            .map(|&i| (i, omitted_places(&flat, samples[i].accounts.len())))
+            .collect();
 
         let outcomes: Outcomes = idxs
             .iter()
@@ -80,9 +84,10 @@ impl Verifier<'_> {
             v.samples.instructions[i].signature.clone()
         });
         self.report_trailing_args(&subject, &outcomes);
-        self.report_account_counts(&subject, &flat, idxs);
-        self.report_fixed_addresses(&subject, &flat, idxs);
-        self.report_account_flags(&subject, &flat, idxs);
+        self.report_account_counts(&subject, &flat, idxs, omitted);
+        self.report_fixed_addresses(&subject, &flat, idxs, &places);
+        self.report_account_flags(&subject, &flat, idxs, &places);
+        self.report_pda_addresses(&subject, &flat, &outcomes, &places);
         self.compare_instructions(&subject, ix, &outcomes);
 
         let zero = Range { min: 0, max: 0 };
@@ -153,9 +158,20 @@ impl Verifier<'_> {
         self.reference_summary.instructions_matched += matched;
     }
 
-    fn report_account_counts(&mut self, subject: &str, flat: &[&Account], idxs: &[usize]) {
+    fn report_account_counts(
+        &mut self,
+        subject: &str,
+        flat: &[&Account],
+        idxs: &[usize],
+        omitted: bool,
+    ) {
         let samples = &self.samples.instructions;
         let total = idxs.len();
+        let optional: Vec<&str> = flat
+            .iter()
+            .filter(|a| a.optional)
+            .map(|a| a.name.as_str())
+            .collect();
         let mut short: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let mut extra = Vec::new();
         for &i in idxs {
@@ -167,6 +183,30 @@ impl Verifier<'_> {
             }
         }
         for (n, group) in short {
+            let example = samples[group[0]].signature.clone();
+            let left_out = flat.len() - n;
+            let tail_only = left_out == optional.len() && flat[n..].iter().all(|a| a.optional);
+            if omitted && left_out <= optional.len() && !tail_only {
+                let some = if left_out == optional.len() {
+                    String::new()
+                } else {
+                    format!("{left_out} of ")
+                };
+                self.push(
+                    Severity::Note,
+                    Check::AccountCount,
+                    subject,
+                    format!(
+                        "{n} accounts passed where the IDL lists {}, in {}; the instruction leaves out absent optional accounts: {some}{}",
+                        flat.len(),
+                        of_samples(group.len(), total),
+                        optional.join(", ")
+                    ),
+                    Some("each later account moves one position earlier, so a generated parser that reads accounts by position may read them wrong; the other account checks skip an account whose position is not certain".into()),
+                    Some(&example),
+                );
+                continue;
+            }
             let missing = &flat[n..];
             let required = missing.iter().any(|a| !a.optional);
             let names: Vec<String> = missing
@@ -188,7 +228,6 @@ impl Verifier<'_> {
                     "a parser that checks the IDL's account count rejects these instructions",
                 )
             };
-            let example = samples[group[0]].signature.clone();
             self.push(
                 severity,
                 Check::AccountCount,
@@ -219,7 +258,13 @@ impl Verifier<'_> {
         }
     }
 
-    fn report_fixed_addresses(&mut self, subject: &str, flat: &[&Account], idxs: &[usize]) {
+    fn report_fixed_addresses(
+        &mut self,
+        subject: &str,
+        flat: &[&Account],
+        idxs: &[usize],
+        places: &Places,
+    ) {
         let samples = &self.samples.instructions;
         let program_id = self.program_id().to_string();
         for (pos, account) in flat.iter().enumerate() {
@@ -229,7 +274,7 @@ impl Verifier<'_> {
             let wrong: Vec<(usize, &str)> = idxs
                 .iter()
                 .filter_map(|&i| {
-                    let key = samples[i].accounts.get(pos)?;
+                    let key = samples[i].accounts.get(place(places, i, pos)?)?;
                     // Anchor passes the program id in place of an absent optional account.
                     let absent = account.optional && *key == program_id;
                     (key != address && !absent).then_some((i, key.as_str()))
@@ -255,7 +300,13 @@ impl Verifier<'_> {
 
     /// A key's message flags are the union over all instructions, so only a missing privilege
     /// is evidence. A CPI can sign for a PDA, so only top-level samples count for `signer`.
-    fn report_account_flags(&mut self, subject: &str, flat: &[&Account], idxs: &[usize]) {
+    fn report_account_flags(
+        &mut self,
+        subject: &str,
+        flat: &[&Account],
+        idxs: &[usize],
+        places: &Places,
+    ) {
         let samples = &self.samples.instructions;
         let program_id = self.program_id().to_string();
         let flagged: Vec<(usize, &KeyFlags)> = idxs
@@ -268,18 +319,21 @@ impl Verifier<'_> {
             let mut read_only = Vec::new();
             let mut unsigned = Vec::new();
             for &(i, flags) in &flagged {
-                let Some(key) = samples[i].accounts.get(pos) else {
+                let Some(at) = place(places, i, pos) else {
+                    continue;
+                };
+                let Some(key) = samples[i].accounts.get(at) else {
                     continue;
                 };
                 // Anchor passes the program id in place of an absent optional account.
                 if account.optional && *key == program_id {
                     continue;
                 }
-                if account.writable && flags.writable.get(pos) == Some(&false) {
+                if account.writable && flags.writable.get(at) == Some(&false) {
                     read_only.push((i, key.as_str()));
                 }
                 let must_sign = account.signer && !account.may_sign && !flags.cpi;
-                if must_sign && flags.signer.get(pos) == Some(&false) {
+                if must_sign && flags.signer.get(at) == Some(&false) {
                     unsigned.push((i, key.as_str()));
                 }
             }
@@ -316,6 +370,42 @@ impl Verifier<'_> {
             );
         }
     }
+}
+
+/// Where each IDL account sits among a sample's keys, by sample index, for samples that leave
+/// out absent optional accounts. Other samples pass each account at its own position.
+pub(super) type Places = BTreeMap<usize, Vec<Option<usize>>>;
+
+/// The position in sample `i` of the IDL account at `pos`.
+fn place(places: &Places, i: usize, pos: usize) -> Option<usize> {
+    places
+        .get(&i)
+        .map_or(Some(pos), |at| at.get(pos).copied().flatten())
+}
+
+/// Where each IDL account sits among `passed` keys, fewer than the IDL lists, when absent
+/// optional accounts are left out. `None` for an account that is absent or not certain.
+fn omitted_places(flat: &[&Account], passed: usize) -> Vec<Option<usize>> {
+    let optional = flat.iter().filter(|a| a.optional).count();
+    let left_out = flat.len().saturating_sub(passed);
+    if left_out > optional {
+        // A required account is missing too, and it can be at any position.
+        return vec![None; flat.len()];
+    }
+    let mut before = 0;
+    flat.iter()
+        .enumerate()
+        .map(|(pos, account)| {
+            if account.optional {
+                before += 1;
+                return None;
+            }
+            // Left out before `pos`: at least those that cannot all be after it, at most the
+            // optional accounts before it. The position is certain only when the two agree.
+            let least = left_out.saturating_sub(optional - before);
+            (least == left_out.min(before)).then(|| pos - least)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -386,6 +476,35 @@ mod tests {
         let report = verify(&idl, &instructions(&[(&[1, 9], &["k1", "k2"])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
         assert_eq!(report.instructions[0].name, "two");
+    }
+
+    /// Token-2022's transfer-fee instructions: a `u8` tag, then a `u8` sub-tag.
+    fn token_2022() -> Idl {
+        Idl::from_json(include_str!(
+            "../../../../fixtures/codama/token_2022_transfer_fee.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_sample_matches_only_if_every_discriminator_matches() {
+        // initializeTransferFeeConfig is [26, 0] and also takes one account.
+        let samples = instructions(&[(&[26, 4], &["Mint"])]);
+        let report = verify(&token_2022(), &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.instructions[0].name, "harvestWithheldTokensToMint");
+    }
+
+    #[test]
+    fn args_start_after_every_discriminator() {
+        // transferCheckedWithFee: [26, 1], amount u64, decimals u8, fee u64.
+        let mut data = vec![26, 1];
+        data.extend(5u64.to_le_bytes());
+        data.push(6);
+        data.extend(7u64.to_le_bytes());
+        let samples = instructions(&[(&data, &["Src", "Mint", "Dst", "Auth"])]);
+        let report = verify(&token_2022(), &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
     }
 
     #[test]
@@ -514,5 +633,64 @@ mod tests {
         .unwrap();
         let report = verify(&go(SWAPPED), &samples, None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn left_out_optional_accounts_shift_later_accounts() {
+        const RENT: &str = "SysvarRent111111111111111111111111111111111";
+        let account = |name: &str, writable: bool, more: &str| {
+            format!(
+                r#"{{"kind":"instructionAccountNode","name":"{name}","isWritable":{writable},
+                "isSigner":false{more}}}"#
+            )
+        };
+        let optional = r#","isOptional":true"#;
+        let fixed =
+            format!(r#","defaultValue":{{"kind":"publicKeyValueNode","publicKey":"{RENT}"}}"#);
+        let accounts = [
+            account("a", false, ""),
+            account("o1", false, optional),
+            account("b", true, ""),
+            account("o2", false, optional),
+            account("c", false, &fixed),
+        ];
+        let idl = Idl::from_json(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
+            "errors":[],"definedTypes":[],"pdas":[],"instructions":[{{"kind":"instructionNode",
+            "name":"go","optionalAccountStrategy":"omitted","accounts":[{}],"arguments":[],
+            "discriminators":[{{"kind":"constantDiscriminatorNode","offset":0,"constant":{{
+            "kind":"constantValueNode","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+            "value":{{"kind":"numberValueNode","number":1}}}}}}]}}]}}}}"#,
+            accounts.join(",")
+        ))
+        .unwrap();
+        // Either `o1` or `o2` is left out, so `b` can be at #1 or #2. `c` is at #3.
+        let mut samples = instructions(&[
+            (&[1], &["A", "B", "O2", RENT]),
+            (&[1], &["A", "O1", "B", RENT]),
+            (&[1], &["A", "B", "O2", "X"]),
+        ]);
+        for sample in &mut samples.instructions {
+            let writable = sample.accounts.iter().map(|k| k == "B").collect();
+            sample.flags = Some(KeyFlags {
+                signer: vec![false; 4],
+                writable,
+                cpi: false,
+            });
+        }
+        let report = verify(&idl, &samples, None);
+        let found: Vec<(Severity, Check, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.severity, f.check, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (Severity::Note, Check::AccountCount, "4 accounts passed where the IDL lists 5, in 3 of 3 samples; the instruction leaves out absent optional accounts: 1 of o1, o2"),
+                (Severity::Error, Check::FixedAddress, "account #4 `c` must be SysvarRent111111111111111111111111111111111, but another key is passed in 1 of 3 samples (such as X)"),
+            ]
+        );
     }
 }

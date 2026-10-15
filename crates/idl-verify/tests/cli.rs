@@ -129,7 +129,7 @@ fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
     std::fs::write(&no_data, r#"{"accounts":[{"address":"A","data":""}]}"#).unwrap();
     let saved = dir.join("idl-verify-not-saved.json");
     let samples = live("voltr_vault/samples.json");
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 7] = [
         (&["--samples", empty.to_str().unwrap()], "holds no samples"),
         (
             &["--samples", no_data.to_str().unwrap()],
@@ -152,6 +152,28 @@ fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
             ],
             "--save-samples saves only live samples",
         ),
+        (
+            &[
+                "--samples",
+                &samples,
+                "--rpc",
+                "http://127.0.0.1:9/k",
+                "--max-tx",
+                "5",
+            ],
+            "--max-tx limits only live sampling",
+        ),
+        (
+            &[
+                "--samples",
+                &samples,
+                "--rpc",
+                "http://127.0.0.1:9/k",
+                "--stall",
+                "5",
+            ],
+            "--stall limits only live sampling",
+        ),
     ];
     let idl = live("voltr_vault/idl.json");
     for (args, message) in cases {
@@ -163,15 +185,41 @@ fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
         assert!(stderr.contains(message), "{args:?}: {stderr}");
     }
     assert!(!saved.exists());
+    // The default limits do not count as given, so --samples still runs.
+    let out = idl_verify(&[
+        "--idl",
+        &idl,
+        "--samples",
+        &samples,
+        "--rpc",
+        "http://127.0.0.1:9/k",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
 fn json_exit_2_prints_one_error_object() {
     let idl = live("voltr_vault/idl.json");
-    let cases: [&[&str]; 3] = [
+    let samples = live("voltr_vault/samples.json");
+    let cases: [&[&str]; 4] = [
         &["--idl", "does-not-exist.json", "--samples", &idl],
         &["--idl", &idl, "--samples", &idl],
         &["--idl", &idl, "--rpc", "http://127.0.0.1:9/k"],
+        &[
+            "--idl",
+            &idl,
+            "--samples",
+            &samples,
+            "--rpc",
+            "http://127.0.0.1:9/k",
+            "--stall",
+            "5",
+        ],
     ];
     for args in cases {
         let mut all = args.to_vec();

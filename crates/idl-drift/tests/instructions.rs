@@ -4,7 +4,9 @@
 mod common;
 
 use common::{empty_idl, idl_kinds, kinds, max_sev, messages, parse, AMM_OLD};
-use idl_drift::model::{Account, AccountItem, Idl, Instruction};
+use idl_drift::model::{
+    Account, AccountItem, Format, Idl, Instruction, NamedDisc, OptionalAccounts,
+};
 use idl_drift::{diff, ChangeKind, Severity};
 
 fn bare_idl(instructions: Vec<Instruction>) -> Idl {
@@ -19,9 +21,11 @@ fn ix(name: &str, disc: Vec<u8>, accounts: Vec<AccountItem>) -> Instruction {
         name: name.into(),
         discriminator: disc,
         discriminator_offset: 0,
+        extra_discriminators: vec![],
         size_discriminator: None,
         accounts,
         args: vec![],
+        optional_accounts: OptionalAccounts::ProgramId,
     }
 }
 
@@ -33,6 +37,7 @@ fn account(name: &str, optional: bool) -> AccountItem {
         may_sign: false,
         optional,
         address: None,
+        pda: None,
     })
 }
 
@@ -234,5 +239,113 @@ fn program_address_and_module_name_changes_are_reported() {
     assert_eq!(
         kinds(&idl("A", "limit_order_2"), &idl("A", "limitOrder2")),
         []
+    );
+}
+
+#[test]
+fn same_size_discriminator_is_a_collision() {
+    // Shipstern groups size-only instructions by size, then tells them apart by account count.
+    let sized = |name: &str| Instruction {
+        size_discriminator: Some(4),
+        ..ix(name, vec![], vec![acct("a")])
+    };
+    let old = bare_idl(vec![sized("only")]);
+    let new = bare_idl(vec![sized("only"), sized("other")]);
+    assert_eq!(
+        idl_kinds(&old, &new),
+        [
+            (Severity::Breaking, ChangeKind::DiscriminatorReused),
+            (Severity::Breaking, ChangeKind::Collision)
+        ]
+    );
+    assert_eq!(
+        idl_kinds(&new, &new),
+        [(Severity::Dangerous, ChangeKind::CollisionPreexisting)]
+    );
+}
+
+#[test]
+fn account_types_with_one_size_discriminator_collide() {
+    // Shipstern's account parser takes the first type whose size matches.
+    let sized = |name: &str| NamedDisc {
+        name: name.into(),
+        discriminator: vec![],
+        discriminator_offset: 0,
+        extra_discriminators: vec![],
+        size: Some(100),
+        size_discriminator: Some(100),
+        payload_offset: None,
+    };
+    let old = Idl {
+        accounts: vec![sized("Pool")],
+        ..empty_idl()
+    };
+    let new = Idl {
+        accounts: vec![sized("Pool"), sized("Vault")],
+        ..empty_idl()
+    };
+    assert_eq!(
+        messages(&old, &new),
+        [
+            "unresolvable collision on account size discriminator 100 bytes: [Pool, Vault] all decode as Pool",
+            "new account type: Vault"
+        ]
+    );
+    assert_eq!(
+        idl_kinds(&new, &new),
+        [(Severity::Dangerous, ChangeKind::CollisionPreexisting)]
+    );
+}
+
+#[test]
+fn group_members_compare_by_the_names_shipstern_generates() {
+    let group = |name: &str, accounts| AccountItem::Composite {
+        name: name.into(),
+        accounts,
+    };
+    let anchor = |accounts| bare_idl(vec![ix("grouped", vec![1], accounts)]);
+    // `owner` repeats, so Shipstern's Anchor conversion prefixes each member with its group.
+    let old = anchor(vec![
+        acct("owner"),
+        group("source", vec![acct("owner"), acct("token")]),
+        group("destination", vec![acct("owner"), acct("token")]),
+    ]);
+    let codama = Idl {
+        format: Format::Codama,
+        ..bare_idl(vec![ix(
+            "grouped",
+            vec![1],
+            [
+                "owner",
+                "sourceOwner",
+                "sourceToken",
+                "destinationOwner",
+                "destinationToken",
+            ]
+            .map(acct)
+            .to_vec(),
+        )])
+    };
+    assert_eq!(idl_kinds(&old, &codama), []);
+
+    let swapped = anchor(vec![
+        acct("owner"),
+        group("destination", vec![acct("owner"), acct("token")]),
+        group("source", vec![acct("owner"), acct("token")]),
+    ]);
+    assert_eq!(
+        idl_kinds(&old, &swapped),
+        [(Severity::Breaking, ChangeKind::AccountMoved); 4]
+    );
+    // A new repeated name adds the prefix, but `token` still shifts to another position.
+    // Between two Anchor IDLs the prefix keeps the IDL's own names.
+    let before = anchor(vec![acct("owner"), group("source", vec![acct("token")])]);
+    let after = anchor(vec![
+        acct("owner"),
+        group("source", vec![acct("owner"), acct("token")]),
+    ]);
+    assert_eq!(
+        diff(&before, &after).changes[0].message,
+        "account changed at fixed position (grouped#1): token -> source.owner"
     );
 }

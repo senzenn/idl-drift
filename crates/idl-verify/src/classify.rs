@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-use idl_drift::model::{Account, AccountItem, Event, Idl, Instruction, Type};
+use idl_drift::model::{
+    Account, AccountItem, Discriminator, Event, Idl, Instruction, NamedDisc, Type,
+};
 
 use crate::layout::{Reading, TypeIndex};
 use crate::samples::{EventSample, EventSource, InstructionSample};
@@ -14,44 +16,85 @@ pub(crate) const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x
 /// A discriminator: where it starts in the data, and its bytes.
 pub(crate) type Disc<'a> = (usize, &'a [u8]);
 
-/// `(discriminator, index)` pairs, longest discriminator first, empty ones dropped.
-pub(crate) type DiscTable<'a> = Vec<(Disc<'a>, usize)>;
+/// Every discriminator of one entry, the first one first. Codama requires all to match.
+pub(crate) type Discs<'a> = Vec<Disc<'a>>;
 
-fn disc_table<'a>(discs: impl Iterator<Item = Disc<'a>>) -> DiscTable<'a> {
-    let mut table: DiscTable<'a> = discs
+/// `(discriminators, index)` pairs, most discriminator bytes first. An entry whose first
+/// discriminator is empty is dropped.
+pub(crate) type DiscTable<'a> = Vec<(Discs<'a>, usize)>;
+
+/// An IDL entry that a sample is matched to by its discriminators.
+pub(crate) trait Discriminated {
+    fn discs(&self) -> Discs<'_>;
+}
+
+fn discs<'a>(offset: usize, first: &'a [u8], extra: &'a [(usize, Discriminator)]) -> Discs<'a> {
+    std::iter::once((offset, first))
+        .chain(extra.iter().map(|(at, d)| (*at, d.as_slice())))
+        .collect()
+}
+
+impl Discriminated for NamedDisc {
+    fn discs(&self) -> Discs<'_> {
+        discs(
+            self.discriminator_offset,
+            &self.discriminator,
+            &self.extra_discriminators,
+        )
+    }
+}
+
+impl Discriminated for Instruction {
+    fn discs(&self) -> Discs<'_> {
+        discs(
+            self.discriminator_offset,
+            &self.discriminator,
+            &self.extra_discriminators,
+        )
+    }
+}
+
+/// Event discriminator offsets count from the start of the event bytes, after any envelope
+/// is removed.
+impl Discriminated for Event {
+    fn discs(&self) -> Discs<'_> {
+        discs(
+            self.discriminator_offset,
+            &self.discriminator,
+            &self.extra_discriminators,
+        )
+    }
+}
+
+fn disc_table<'a>(entries: impl Iterator<Item = Discs<'a>>) -> DiscTable<'a> {
+    let mut table: DiscTable<'a> = entries
         .enumerate()
-        .filter(|(_, (_, d))| !d.is_empty())
+        .filter(|(_, d)| d.first().is_some_and(|(_, first)| !first.is_empty()))
         .map(|(i, d)| (d, i))
         .collect();
-    table.sort_by_key(|((_, d), i)| (std::cmp::Reverse(d.len()), *i));
+    table.sort_by_key(|(d, i)| {
+        let len: usize = d.iter().map(|(_, bytes)| bytes.len()).sum();
+        (std::cmp::Reverse(len), *i)
+    });
     table
 }
 
 pub(crate) fn account_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(
-        idl.accounts
-            .iter()
-            .map(|a| (a.discriminator_offset, a.discriminator.as_slice())),
-    )
+    disc_table(idl.accounts.iter().map(Discriminated::discs))
 }
 
 pub(crate) fn instruction_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(
-        idl.instructions
-            .iter()
-            .map(|ix| (ix.discriminator_offset, ix.discriminator.as_slice())),
-    )
+    disc_table(idl.instructions.iter().map(Discriminated::discs))
 }
 
-/// Event discriminators start the event bytes, after any envelope is removed.
 pub(crate) fn event_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(idl.events.iter().map(|e| (0, e.discriminator.as_slice())))
+    disc_table(idl.events.iter().map(Discriminated::discs))
 }
 
-/// Every entry whose discriminator is the longest one found in `data` at its offset.
-pub(crate) fn longest_match(table: &[(Disc<'_>, usize)], data: &[u8]) -> Option<Vec<usize>> {
+/// Every entry whose discriminators all match `data` and hold the most bytes.
+pub(crate) fn longest_match(table: &[(Discs<'_>, usize)], data: &[u8]) -> Option<Vec<usize>> {
     let at = |(offset, disc): &Disc<'_>| data.get(*offset..).is_some_and(|d| d.starts_with(disc));
-    let (found, _) = table.iter().find(|(d, _)| at(d))?;
+    let (found, _) = table.iter().find(|(d, _)| d.iter().all(at))?;
     Some(
         table
             .iter()

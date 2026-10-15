@@ -4,8 +4,9 @@
 
 You need:
 
-- Rust. CI uses Rust 1.97.0 with `clippy` and `rustfmt`. A newer stable toolchain usually
-  works, but its new lints can fail `clippy`.
+- Rust 1.91 or newer to build. This is the `rust-version` in `Cargo.toml`.
+- Rust 1.97.0 with `clippy` and `rustfmt` to run the checks, as CI does.
+  `rust-toolchain.toml` pins this version, so rustup uses it in the repository.
 - Node.js and npm, only to run the reference decoder in `tools/reference`. No test needs it.
 
 ```bash
@@ -85,9 +86,11 @@ Use [Conventional Commits](https://www.conventionalcommits.org/):
 `<type>(<scope>): <description>`. Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`. Common scopes are `diff`,
 `inspect`, `layout`, `codama` and `verify`.
 
-A pull request does one thing. Its description says what was wrong, why, and how the change
-was tested. Add a line to the unreleased section of [CHANGELOG.md](CHANGELOG.md) for each
-change that users can see.
+A pull request does one thing. Fill in the three headings of the pull request template:
+Problem, Summary of Changes and Testing. Add a line to the `[Unreleased]` section of
+[CHANGELOG.md](CHANGELOG.md) for each change that users can see.
+
+Do not report a security problem in a public issue. See [SECURITY.md](SECURITY.md).
 
 ## Add a diff rule
 

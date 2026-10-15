@@ -1,8 +1,9 @@
 [package]
 name = "idl-drift"
-description = "Semantic drift detection for Solana program IDLs. Flags parser-breaking changes before they silently corrupt data."
+description = "Compare two versions of a Solana program IDL and sort each change by its effect on a generated parser."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"

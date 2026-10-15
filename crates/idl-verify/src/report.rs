@@ -34,6 +34,8 @@ pub enum Check {
     FixedAddress,
     /// An account the IDL marks writable or signer gets a key without that privilege.
     AccountFlags,
+    /// An account that the IDL derives from seeds gets a key that the seeds do not give.
+    Pda,
     /// A self-CPI event sample without the envelope the IDL (or Anchor) puts before events.
     Envelope,
     Reference,

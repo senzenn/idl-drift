@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use super::text::{disc_changed, size_text};
+use super::text::{disc_changed, extra_discs_text, size_text};
 use super::{ChangeKind, Report, Severity};
 use crate::model::NamedDisc;
 
@@ -36,6 +36,16 @@ pub(super) fn diff_account_types(old: &[NamedDisc], new: &[NamedDisc], r: &mut R
                 format!(
                     "account discriminator offset changed ({name}): {} -> {}",
                     oa.discriminator_offset, na.discriminator_offset
+                ),
+            ),
+            Some(oa) if oa.extra_discriminators != na.extra_discriminators => r.push(
+                Severity::Breaking,
+                ChangeKind::AccountDiscriminatorChanged,
+                *name,
+                format!(
+                    "account later discriminators changed ({name}): {} -> {}",
+                    extra_discs_text(&oa.extra_discriminators),
+                    extra_discs_text(&na.extra_discriminators)
                 ),
             ),
             Some(oa) if oa.size_discriminator != na.size_discriminator => r.push(

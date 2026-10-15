@@ -39,7 +39,9 @@ compares the two IDLs the same way:
 
 - Instructions, account types, events and defined types match by name.
 - Inside them, items compare by position: instruction accounts (composite groups are
-  flattened), instruction arguments, struct fields and enum variants.
+  flattened), instruction arguments, struct fields and enum variants. When an account name
+  repeats, group members get their group path as a prefix: `source.owner` between two IDLs
+  of one format, `sourceOwner` (as Codama writes it) across formats.
 - A layout change counts only on a **reachable** type: an account type, an event type, a
   type that an instruction argument names, and each type that these reach through fields,
   variant payloads and aliases. A layout change on any other type is Cosmetic.
@@ -48,9 +50,12 @@ When the two files use different formats, idl-drift first does these steps:
 
 - It compares names in camelCase, as Codama writes them. So `deposit_vault` and
   `depositVault` are the same instruction.
-- It compares an instruction argument that links a struct field by field, at each depth,
-  and an argument that links an alias as the alias target. Codama inlines a type that has
-  only one use, and Borsh writes a struct as its fields, so the bytes are the same.
+- It compares an instruction argument that holds a struct, linked or inline, field by
+  field at each depth, and an argument that links an alias as the alias target. Codama
+  inlines a type that has only one use, and Borsh writes a struct as its fields, so the
+  bytes are the same.
+- It writes each use of a generic struct or alias as its body with the arguments filled in,
+  as Codama converters do.
 - It compares a tuple struct and a tuple alias as the same type.
 
 ### Zero-copy types
@@ -62,6 +67,16 @@ the field offsets. Thus changes that cancel out are Cosmetic, for example a conv
 removes `packed` from an account and from each type in it.
 
 ### Discriminator dispatch
+
+A Codama IDL can list more than one discriminator, and the Codama spec says that all of
+them must match. idl-drift compares each one: a change to a later discriminator is
+`discriminator_changed` (`account_discriminator_changed` for an account type), and Breaking.
+Shipstern dispatches on the first discriminator only, so the collision rules below use only
+the first one. An argument or field with `defaultValueStrategy: "omitted"` stays in the
+layout, because its bytes stay in the data. Only an omitted field that the discriminator
+bytes at the start hold is left out.
+
+Codama's `optionalAccountStrategy` is read but not compared, because Shipstern ignores it.
 
 Two rules follow Shipstern's dispatch:
 
@@ -85,14 +100,17 @@ Two rules follow Shipstern's dispatch:
 - An instruction was removed.
 - Two instructions have the same name, or names that differ only by ASCII case. Shipstern
   generates one helper for both.
-- A new instruction uses the discriminator of an existing instruction. Old parsers route it
-  to the existing instruction.
+- A new instruction uses the discriminator or the size discriminator of an existing
+  instruction. Old parsers route it to the existing instruction.
 - An instruction, account or event discriminator changed. This includes a change in its
   length (for example an Anchor to Quasar port), a Codama size discriminator, an event
   discriminator offset, and a later constant in an event discriminator chain.
 - An instruction account moved, or an account was removed from the middle of the list.
 - An instruction argument was added, removed, retyped or moved.
-- Two instructions have the same discriminator and the same account count.
+- Two instructions have the same discriminator, or the same Codama size discriminator, and
+  the same account count.
+- Two account types have the same size discriminator. The parser decodes all of them as the
+  first one.
 - An account type or event type was removed.
 - An event envelope discriminator or the event payload offset changed.
 - The kind of a type changed, for example from struct to enum.
@@ -163,6 +181,7 @@ The `subject` names the item. A positional item has `#<position>`, counted from 
 | `program` | The program address or name. |
 | `swap` | The instruction, type or event `swap`. |
 | `swap#2` | Account or argument 2 of instruction `swap`. |
+| `size:4` | A collision on a Codama size discriminator of 4 bytes. |
 | `Pool#1` | Field or variant 1 of type `Pool`. |
 
 ## Exit codes
@@ -211,11 +230,29 @@ idl-drift diff old.json new.json --json \
 field cannot be classified, and `idl-verify` cannot decode it. Run `inspect` on a new IDL
 before you trust a `diff` of it.
 
-idl-drift cannot resolve these Codama nodes: hidden prefixes and suffixes, offsets,
-sentinels, inline enums, a size prefix around a struct, a fixed-size wrapper around a type
-that is not bytes or a string, a fixed count on a map or set, and a zeroable option with a
-custom zero value. It can resolve inline structs, big-endian numbers, `shortU16`, any
-integer length prefix, remainder lengths, and tagged, zeroable and remainder options.
+idl-drift cannot resolve these Codama nodes, and `inspect` lists them:
+
+- hidden prefixes and suffixes, offsets and sentinels;
+- inline enums;
+- a size prefix around a type that is not a string or bytes;
+- a fixed-size wrapper around a type that is not a string or bytes;
+- a fixed count on a map or set;
+- a length, count or option prefix that is a float or a wrapped number, and an enum size
+  that is a wrapped number;
+- a zeroable option with a custom zero value.
+
+idl-drift reads these Codama nodes in a simpler form. `inspect` does not list them, and
+`diff` does not report a change to the parts that idl-drift ignores:
+
+- A `booleanTypeNode` is read as 1 byte, whatever its `size`.
+- A wrapper inside an `amountTypeNode`, `dateTimeTypeNode` or `solAmountTypeNode` is
+  dropped. Only the number inside it is read.
+- A size-prefixed or remainder string with `base16`, `base58` or `base64` encoding is read as
+  UTF-8 text. Its length is correct, but idl-verify reports a `decode` error when the bytes
+  are not valid UTF-8.
+
+idl-drift can resolve inline structs, big-endian numbers, `shortU16`, any integer length
+prefix, remainder lengths, and tagged, zeroable and remainder options.
 
 A Codama IDL with a `hiddenPrefixTypeNode` on argument `n` of instruction `ping` gives:
 
@@ -280,14 +317,15 @@ the functions behind `inspect`.
   no IDL update. Use [idl-verify](idl-verify.md) to check an IDL against real data.
 - **New types in `types` are not reported.** A type removed from `types` is reported only
   when a parser still reads it.
-- **Unresolved Codama nodes.** A change inside a node that idl-drift cannot resolve can pass
-  `diff` with no warning. Run `inspect` to see these fields.
-
-Known bugs, not fixed yet:
-
-- Two instructions that are identified only by size, with the same size, are not reported
-  as a collision.
-- A Codama inline struct argument, or a generic type, compared with the same type in
-  another form can give a false Breaking change.
-- Composite account groups with the same leaf name in two groups can give a false
-  `account_moved`.
+- **Unresolved Codama nodes.** idl-drift cannot read inside some Codama nodes. A change
+  inside one is Breaking on a reachable type, with a message that idl-drift cannot read the
+  encoding. A change only to its docs is not reported. Run `inspect` to see these fields.
+  idl-drift reads some other nodes in a simpler form, and does not report them. Both lists
+  are in [inspect](#inspect).
+- **Collisions use the first discriminator only.** Instructions that share the first
+  discriminator are reported as a collision, as in Shipstern, also when a later
+  discriminator tells them apart. In the Token-2022 IDL these collisions are real for a
+  Shipstern parser.
+- **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
+  `name` key of each node to `identifier`. idl-drift stops with "Codama spec 2.0.0 is not
+  supported; only spec 1.x can be read" (exit 2).

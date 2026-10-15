@@ -304,6 +304,15 @@ impl Verifier<'_> {
                 .then(|| self.decoder.types().struct_layout(td).ok())
                 .flatten()
                 .filter(|l| l.padding_len() > 0 && disc.checked_add(l.size) == Some(size));
+            // Anchor's `space` often reserves more than a Borsh type needs. A zero-copy
+            // layout sets the size, so its unused bytes stay an error.
+            let zeros = zero_copy.is_none()
+                && idxs.iter().all(|&i| {
+                    accounts[i]
+                        .data
+                        .get(used..)
+                        .is_some_and(|rest| rest.iter().all(|b| *b == 0))
+                });
             let (severity, message, hint) = if let Some(layout) = padded {
                 let shifted = layout
                     .padding
@@ -326,6 +335,12 @@ impl Verifier<'_> {
                     Severity::Warning,
                     format!("{} after the data in {count}", bytes(unused)),
                     "the account size is the data size rounded up to 8 bytes, which suggests spare allocation; confirm against the program source".to_string(),
+                )
+            } else if zeros {
+                (
+                    Severity::Warning,
+                    format!("{unused} of {size} bytes unused in {count}, all zero"),
+                    "zero bytes after the data suggest spare allocation (Anchor's `space` can be larger than the type); a missing field that is zero in every sample looks the same, so confirm against the program source".to_string(),
                 )
             } else {
                 let mut hint = missing_field.clone().unwrap_or_else(|| "the IDL may be missing fields or padding, or the program allocates more space than the type needs".to_string());
@@ -555,6 +570,22 @@ mod tests {
             f.hint.as_deref(),
             Some("the same 8 bytes follow in every sample: the IDL is likely missing an 8-byte field at the end")
         );
+    }
+
+    #[test]
+    fn zero_tail_is_a_warning_on_a_borsh_type_and_an_error_on_a_zero_copy_type() {
+        // perpetuals custody: 1117 bytes used of 2000, and every unused byte is zero.
+        let body: &[u8] = &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let report = verify(&account_idl(U32_TYPE), &accounts(&[body]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Warning, Check::BytesUsed));
+        assert_eq!(f.message, "8 of 14 bytes unused in 1 of 1 sample, all zero");
+        assert_eq!(report.exit_code(), 0);
+
+        let zero_copy = r#"{"name":"A","serialization":"bytemuck","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
+        let report = verify(&account_idl(zero_copy), &accounts(&[body]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
     }
 
     #[test]

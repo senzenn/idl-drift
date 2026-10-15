@@ -104,7 +104,7 @@ fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
     if let Type::Generic(kind) = ty {
         out.push(UnmappedField {
             path: path.to_string(),
-            kind: kind.clone(),
+            kind: Type::generic_kind(kind).to_string(),
         });
     }
     for child in ty.children() {

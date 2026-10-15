@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use idl_drift::model::Idl;
 use idl_verify::rpc::{sample, Limits};
 use idl_verify::{
@@ -11,7 +12,7 @@ use idl_verify::{
 };
 use serde_json::{json, Value};
 
-/// Check a Solana program IDL against real account and instruction data.
+/// Check a Solana program IDL against real account, instruction and event data.
 ///
 /// Each sample is classified by discriminator and decoded from the IDL alone. Findings
 /// cover unknown discriminators, data that fails to decode, bytes the IDL leaves unused
@@ -22,8 +23,8 @@ use serde_json::{json, Value};
 #[command(after_help = "Exit codes:
   0  no finding at or above --fail-on (notes may be present)
   1  at least one finding at or above --fail-on (default: error)
-  2  idl-verify could not run: a file could not be read or parsed, the RPC or the
-     decoder failed, or nothing was sampled")]
+  2  idl-verify could not run: a file could not be read or parsed, an option is
+     wrong, the RPC or the decoder failed, or nothing was sampled")]
 struct Cli {
     /// Program IDL: Anchor (0.30 spec or legacy) or Codama JSON.
     #[arg(long, value_name = "PATH")]
@@ -97,8 +98,11 @@ impl From<Tier> for Severity {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
+    let parsed = Cli::command()
+        .try_get_matches()
+        .and_then(|m| Ok((Cli::from_arg_matches(&m)?, m)));
+    let (cli, matches) = match parsed {
+        Ok(parsed) => parsed,
         Err(e) => {
             // Help and version are not errors; a usage error exits 2, so JSON must say so.
             if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
@@ -109,7 +113,7 @@ fn main() -> ExitCode {
             e.exit()
         }
     };
-    match run(&cli) {
+    match run(&cli, &matches) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let _ = writeln!(io::stderr(), "error: {e}");
@@ -138,12 +142,21 @@ fn nothing_to_check(samples: &Samples) -> bool {
         && samples.events.is_empty()
 }
 
-fn run(cli: &Cli) -> Result<u8, Error> {
+fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
     // `--samples` wins over `--rpc`, so a save request would write nothing.
     if cli.samples.is_some() && cli.save_samples.is_some() {
         return Err(Error::Usage(
             "--save-samples saves only live samples, and --samples turns live sampling off; drop one of the two".into(),
         ));
+    }
+    // The limits have defaults, so only a value given on the command line conflicts.
+    let limit = [("max_tx", "--max-tx"), ("stall", "--stall")]
+        .into_iter()
+        .find(|(id, _)| matches.value_source(id) == Some(ValueSource::CommandLine));
+    if let (Some(_), Some((_, flag))) = (&cli.samples, limit) {
+        return Err(Error::Usage(format!(
+            "{flag} limits only live sampling, and --samples turns live sampling off; drop one of the two"
+        )));
     }
     let idl = read_idl(&cli.idl)?;
     let (samples, sampling) = if let Some(path) = &cli.samples {

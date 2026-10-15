@@ -4,6 +4,7 @@ mod accounts;
 mod compare;
 mod events;
 mod instructions;
+mod pda;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

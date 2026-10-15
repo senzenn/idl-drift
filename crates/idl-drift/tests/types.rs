@@ -37,6 +37,7 @@ fn account_idl(name: &str, types: Vec<TypeDef>) -> Idl {
             name: name.into(),
             discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
             discriminator_offset: 0,
+            extra_discriminators: vec![],
             size: None,
             size_discriminator: None,
             payload_offset: None,

@@ -1,4 +1,4 @@
-//! `idl-verify` checks a Solana program IDL against real account and instruction data.
+//! `idl-verify` checks a Solana program IDL against real account, instruction and event data.
 //!
 //! [`idl_drift`] compares two IDL versions. This crate catches an IDL that is wrong today:
 //! it classifies each sample by discriminator, decodes it from the IDL alone, and reports

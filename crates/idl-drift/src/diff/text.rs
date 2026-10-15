@@ -2,7 +2,9 @@
 
 use std::fmt::Write;
 
-use crate::model::{ArrayLen, Count, EnumFields, Field, GenericArg, OptionTag, Type};
+use crate::model::{
+    ArrayLen, Count, Discriminator, EnumFields, Field, GenericArg, OptionTag, Type,
+};
 
 /// `<what> changed (<name>)`. When the length changed too, the message gives both lengths,
 /// because a new length means a new discriminator scheme, as `hint` says.
@@ -26,6 +28,18 @@ pub(super) fn disc_hex(disc: &[u8]) -> String {
     out
 }
 
+/// Later discriminators as `<hex>@<offset>`, or `none`.
+pub(super) fn extra_discs_text(extra: &[(usize, Discriminator)]) -> String {
+    if extra.is_empty() {
+        return "none".into();
+    }
+    let parts: Vec<String> = extra
+        .iter()
+        .map(|(at, disc)| format!("{}@{at}", disc_hex(disc)))
+        .collect();
+    parts.join(", ")
+}
+
 pub(super) fn size_text(size: Option<usize>) -> String {
     size.map_or_else(|| "none".into(), |n| format!("{n} bytes"))
 }
@@ -37,13 +51,41 @@ pub(super) fn field_str(f: &Field) -> String {
 /// Name both sides, so a rename doesn't read as `u64 -> u64`.
 pub(super) fn field_change(old: &Field, new: &Field) -> String {
     let (ot, nt) = (tystr(&old.ty), tystr(&new.ty));
-    if old.name == new.name {
-        format!("{}: {ot} -> {nt} (Borsh layout)", old.name)
-    } else if old.ty == new.ty {
+    if old.ty == new.ty {
         format!("{} renamed to {} ({ot})", old.name, new.name)
+    } else if ot == nt && (has_unreadable(&old.ty) || has_unreadable(&new.ty)) {
+        let name = if old.name == new.name {
+            old.name.clone()
+        } else {
+            format!("{} -> {}", old.name, new.name)
+        };
+        format!("{name}: {}", unreadable_change(&ot))
+    } else if old.name == new.name {
+        format!("{}: {ot} -> {nt} (Borsh layout)", old.name)
     } else {
         format!("{}: {ot} -> {}: {nt} (Borsh layout)", old.name, new.name)
     }
+}
+
+/// `<old> -> <new> (<effect>)` for two types that differ.
+pub(super) fn type_change(old: &Type, new: &Type, effect: &str) -> String {
+    let (ot, nt) = (tystr(old), tystr(new));
+    if ot == nt && (has_unreadable(old) || has_unreadable(new)) {
+        unreadable_change(&ot)
+    } else {
+        format!("{ot} -> {nt} ({effect})")
+    }
+}
+
+/// Two types print the same when only the content of a node that idl-drift cannot read changed.
+pub(super) fn unreadable_change(shown: &str) -> String {
+    format!("{shown} changed inside a Codama encoding that idl-drift cannot read, so check the new bytes by hand")
+}
+
+/// The converter writes a Codama node that idl-drift cannot read as `<kind>#<hash>`.
+pub(super) fn has_unreadable(t: &Type) -> bool {
+    matches!(t, Type::Generic(name) if name.contains('#'))
+        || t.children().into_iter().any(has_unreadable)
 }
 
 pub(super) fn payload_str(fields: &EnumFields) -> String {
@@ -100,7 +142,7 @@ pub(super) fn tystr(t: &Type) -> String {
                 .collect();
             format!("{name}<{}>", args.join(", "))
         }
-        Type::Generic(name) => name.clone(),
+        Type::Generic(name) => Type::generic_kind(name).to_string(),
         Type::Struct(fields) => {
             let fields: Vec<String> = fields.iter().map(field_str).collect();
             format!("{{ {} }}", fields.join(", "))

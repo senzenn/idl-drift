@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{fixture, max_sev, parse};
+use common::{fixture, fixture_text, max_sev, parse};
 use idl_drift::codama_convert::decode_encoded_bytes;
 use idl_drift::model::{ArrayLen, Idl, Type, TypeDefTy};
 use idl_drift::{coverage, diff, ChangeKind, Severity};
@@ -35,6 +35,20 @@ fn codama_0_13_idl_loads() {
         .expect("adaptorAddReceipt account");
     assert_eq!(receipt.discriminator, [105, 99, 219, 155, 77, 241, 7, 119]);
     assert!(coverage(&idl).fully_mapped());
+}
+
+#[test]
+fn codama_spec_2_fails_with_its_version() {
+    // Spec 2 renames `name` to `identifier`, so serde alone reports a missing `name`.
+    let err = Idl::from_json(
+        r#"{"kind":"rootNode","standard":"codama","version":"2.0.0","program":{
+        "kind":"programNode","identifier":"t","publicKey":"P","version":"0"}}"#,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Codama spec 2.0.0 is not supported; only spec 1.x can be read"
+    );
 }
 
 #[test]
@@ -253,6 +267,42 @@ fn change_inside_a_codama_only_encoding_is_breaking() {
 }
 
 #[test]
+fn change_inside_a_codama_node_idl_drift_cannot_read_is_breaking() {
+    let hidden = |ty: &str, docs: &str| {
+        codama_arg(
+            &format!(
+                r#"{{"kind":"hiddenPrefixTypeNode","prefix":[{{"kind":"constantValueNode",
+                "type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},"value":{{"kind":"numberValueNode","number":1}}}}],
+                "type":{{"kind":"structTypeNode","fields":[{{"kind":"structFieldTypeNode","name":"a","docs":["{docs}"],
+                  "type":{{"kind":"numberTypeNode","format":"{ty}","endian":"le"}}}}]}}}}"#
+            ),
+            "",
+        )
+    };
+    let base = hidden("u8", "old");
+    assert_eq!(max_sev(&base, &base), None);
+    // A CI gate trusts the fingerprint, so it is a full SHA-256, not a short fast hash.
+    let arg = &parse(&base).instructions[0].args[0].ty;
+    let Type::Generic(name) = arg else {
+        panic!("expected an unresolved node, got {arg:?}");
+    };
+    let digest = name.split_once('#').map_or("", |(_, d)| d);
+    assert!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{name}"
+    );
+    // Docs are not bytes.
+    assert_eq!(max_sev(&base, &hidden("u8", "new")), None);
+    let changes = diff(&parse(&base), &parse(&hidden("u64", "old"))).changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].severity, Severity::Breaking);
+    assert_eq!(
+        changes[0].message,
+        "arg changed (set#0): x: hiddenPrefixTypeNode changed inside a Codama encoding that idl-drift cannot read, so check the new bytes by hand"
+    );
+}
+
+#[test]
 fn size_discriminators_and_event_chains_are_compared() {
     let root = |ix_size: u64, account_size: u64, event_chain: &str| {
         parse(&format!(
@@ -360,4 +410,42 @@ fn limit_order_idls_have_no_unexpected_generics() {
         .find(|a| a.name == "swapData")
         .expect("swapData arg");
     assert_eq!(swap.ty, Type::Bytes);
+}
+
+#[test]
+fn token_2022_sub_discriminator_change_is_breaking() {
+    // The second omitted arg tells the transfer-fee instructions apart, and Codama checks it.
+    let text = fixture_text("codama/token_2022_transfer_fee.json");
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let ix = json["program"]["instructions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|ix| ix["name"] == "transferCheckedWithFee")
+        .unwrap();
+    assert_eq!(ix["arguments"][1]["name"], "transferFeeDiscriminator");
+    ix["arguments"][1]["defaultValue"]["number"] = 9.into();
+    let report = diff(&parse(&text), &parse(&json.to_string()));
+    let breaking: Vec<(ChangeKind, &str)> = report
+        .changes
+        .iter()
+        .filter(|c| c.severity == Severity::Breaking)
+        .map(|c| (c.kind, c.subject.as_str()))
+        .collect();
+    assert_eq!(
+        breaking,
+        [(ChangeKind::DiscriminatorChanged, "transferCheckedWithFee")]
+    );
+}
+
+#[test]
+fn omitted_field_outside_the_discriminators_stays_in_the_layout() {
+    // Program Metadata accounts start with an omitted enum byte that no discriminator holds.
+    let idl = fixture("codama/pmp_accounts.json");
+    let metadata = idl.types.iter().find(|t| t.name == "metadata").unwrap();
+    let TypeDefTy::Struct { fields } = &metadata.ty else {
+        panic!("{:?}", metadata.ty);
+    };
+    let names: Vec<&str> = fields.iter().take(2).map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["discriminator", "program"]);
 }

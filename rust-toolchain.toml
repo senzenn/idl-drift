@@ -1,0 +1,5 @@
+# The version that CI uses. The minimum supported version is `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

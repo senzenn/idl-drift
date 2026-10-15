@@ -1,7 +1,7 @@
 # Roadmap
 
-This page lists planned work. The order is not a commitment. The limitations and known bugs
-of each tool are in its reference page: [idl-drift](docs/idl-drift.md#limitations) and
+This page lists planned work. The order is not a commitment. The limitations of each tool
+are in its reference page: [idl-drift](docs/idl-drift.md#limitations) and
 [idl-verify](docs/idl-verify.md#limitations).
 
 ## Planned

@@ -11,7 +11,7 @@ flowchart LR
 
 ## Install
 
-You need a stable Rust toolchain. The clone gives you the fixture files that the commands below use.
+You need Rust 1.91 or newer. The clone gives you the fixture files that the commands below use.
 
 ```bash
 cargo install --locked --git https://github.com/senzenn/idl-drift idl-drift

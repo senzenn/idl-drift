@@ -6,6 +6,7 @@ Codama `rootNode` IDLs copied from the Shipstern repository,
 
 | File | Program name | Program |
 |---|---|---|
+| `chained_cpi_event_envelope.json` | test IDL | no live program; an event envelope chain with three constants |
 | `dca.json` | `dca` | `DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M` |
 | `dynamic_bonding_curve.json` | `dynamicBondingCurve` | `dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN` |
 | `glow.json` | `margin` | `GLoWMgcn3VbyFKiC2FGMgfKxYSyTJS7uKFwKY2CSkq9X` |

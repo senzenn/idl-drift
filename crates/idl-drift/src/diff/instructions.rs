@@ -1,11 +1,12 @@
 //! Instructions: which exist, and per instruction its discriminator, accounts and args.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use super::text::{disc_changed, disc_hex, field_change, field_str, size_text};
+use super::collisions::DispatchKey;
+use super::text::{disc_changed, extra_discs_text, field_change, field_str, size_text};
 use super::{ChangeKind, FieldEdit, Report, Severity};
-use crate::model::{AccountItem, Idl, Instruction};
+use crate::model::{camel, AccountItem, Idl, Instruction};
 
 /// Instructions are matched by name, so a duplicate name would hide drift on all but one.
 pub(super) fn report_duplicate_names(instructions: &[Instruction], r: &mut Report) {
@@ -26,42 +27,41 @@ pub(super) fn report_duplicate_names(instructions: &[Instruction], r: &mut Repor
 }
 
 pub(super) fn diff_instructions(old: &Idl, new: &Idl, r: &mut Report) {
+    // Names from two formats are camelCase here, so group members must match Codama's names.
+    let camel_paths = old.format != new.format;
     let old_ix: BTreeMap<_, _> = old.instructions.iter().map(|i| (&i.name, i)).collect();
     let new_ix: BTreeMap<_, _> = new.instructions.iter().map(|i| (&i.name, i)).collect();
 
     for (name, ni) in &new_ix {
         match old_ix.get(name) {
             None => {
-                // An old parser routes a reused discriminator to the instruction it knows.
+                // An old parser routes a reused discriminator or size to the instruction it knows.
+                let key = DispatchKey::of(ni);
                 let shared: Vec<&str> = old
                     .instructions
                     .iter()
-                    .filter(|oi| {
-                        !ni.discriminator.is_empty() && oi.discriminator == ni.discriminator
-                    })
+                    .filter(|oi| key.is_some() && DispatchKey::of(oi) == key)
                     .map(|oi| oi.name.as_str())
                     .collect();
-                if shared.is_empty() {
-                    r.push(
-                        Severity::Additive,
-                        ChangeKind::InstructionAdded,
-                        *name,
-                        format!("new instruction: {name}"),
-                    );
-                } else {
-                    r.push(
+                match key {
+                    Some(key) if !shared.is_empty() => r.push(
                         Severity::Breaking,
                         ChangeKind::DiscriminatorReused,
                         *name,
                         format!(
-                            "new instruction {name} reuses discriminator {} of [{}]: parsers built from the old IDL route it there and misread its args",
-                            disc_hex(&ni.discriminator),
+                            "new instruction {name} reuses {key} of [{}]: parsers built from the old IDL route it there and misread its args",
                             shared.join(", ")
                         ),
-                    );
+                    ),
+                    _ => r.push(
+                        Severity::Additive,
+                        ChangeKind::InstructionAdded,
+                        *name,
+                        format!("new instruction: {name}"),
+                    ),
                 }
             }
-            Some(oi) => diff_instruction(oi, ni, r),
+            Some(oi) => diff_instruction(oi, ni, camel_paths, r),
         }
     }
     for name in old_ix.keys() {
@@ -76,7 +76,7 @@ pub(super) fn diff_instructions(old: &Idl, new: &Idl, r: &mut Report) {
     }
 }
 
-fn diff_instruction(oi: &Instruction, ni: &Instruction, r: &mut Report) {
+fn diff_instruction(oi: &Instruction, ni: &Instruction, camel_paths: bool, r: &mut Report) {
     let ix = oi.name.as_str();
     if oi.discriminator != ni.discriminator {
         r.push(
@@ -103,6 +103,18 @@ fn diff_instruction(oi: &Instruction, ni: &Instruction, r: &mut Report) {
             ),
         );
     }
+    if oi.extra_discriminators != ni.extra_discriminators {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::DiscriminatorChanged,
+            ix,
+            format!(
+                "later discriminators changed ({ix}): {} -> {}",
+                extra_discs_text(&oi.extra_discriminators),
+                extra_discs_text(&ni.extra_discriminators)
+            ),
+        );
+    }
     if oi.size_discriminator != ni.size_discriminator {
         r.push(
             Severity::Breaking,
@@ -119,8 +131,8 @@ fn diff_instruction(oi: &Instruction, ni: &Instruction, r: &mut Report) {
     // Parsers read accounts by position, so compare the flattened lists index by index.
     diff_accounts(
         ix,
-        &flatten_accounts(&oi.accounts),
-        &flatten_accounts(&ni.accounts),
+        &flatten_accounts(&oi.accounts, camel_paths),
+        &flatten_accounts(&ni.accounts, camel_paths),
         r,
     );
 
@@ -169,10 +181,14 @@ fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
         let subject = format!("{ix}#{pos}");
         match (ofa.get(pos), nfa.get(pos)) {
             (Some(o), Some(n)) if o.name != n.name => {
-                // Either name at another position on the other side means the account
+                // Either account at another position on the other side means the account
                 // moved, so the parser reads the wrong one. Fresh names are only a rename.
-                let moved = ofa.iter().any(|a| a.name == n.name)
-                    || nfa.iter().any(|a| a.name == o.name);
+                let elsewhere = |list: &[Leaf], leaf: &Leaf| {
+                    list.iter()
+                        .enumerate()
+                        .any(|(i, a)| i != pos && a.same_account(leaf))
+                };
+                let moved = elsewhere(ofa, n) || elsewhere(nfa, o);
                 if moved {
                     r.push(
                         Severity::Breaking,
@@ -189,7 +205,7 @@ fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
                     );
                 }
             }
-            (Some(o), Some(n)) if o != n => r.push(
+            (Some(o), Some(n)) if o.flags() != n.flags() => r.push(
                 Severity::Dangerous,
                 ChangeKind::AccountFlagsChanged,
                 subject,
@@ -219,12 +235,25 @@ fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
 }
 
 /// One account in an instruction's flattened, positional account list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Leaf {
+    /// The name Shipstern generates for it.
     name: String,
+    /// Its group path, which stays the same when Shipstern adds or drops the group prefix.
+    path: String,
     writable: bool,
     signer: bool,
     optional: bool,
+}
+
+impl Leaf {
+    fn same_account(&self, other: &Self) -> bool {
+        self.name == other.name || self.path == other.path
+    }
+
+    fn flags(&self) -> (bool, bool, bool) {
+        (self.writable, self.signer, self.optional)
+    }
 }
 
 impl fmt::Display for Leaf {
@@ -245,23 +274,57 @@ impl fmt::Display for Leaf {
     }
 }
 
-fn flatten_accounts(items: &[AccountItem]) -> Vec<Leaf> {
+/// Shipstern's Anchor conversion adds the group path to each group member's name only when
+/// some account name repeats, as in Codama's `sourceOwner` for `owner` in group `source`.
+/// With `camel_paths` unset, the path keeps the IDL's own names: `source.owner`.
+fn flatten_accounts(items: &[AccountItem], camel_paths: bool) -> Vec<Leaf> {
     let mut out = Vec::new();
+    flatten_into(items, None, camel_paths, repeats_a_name(items), &mut out);
+    out
+}
+
+fn flatten_into(
+    items: &[AccountItem],
+    group: Option<&str>,
+    camel_paths: bool,
+    prefix: bool,
+    out: &mut Vec<Leaf>,
+) {
+    let path_of = |name: &str| match group {
+        None => name.to_owned(),
+        Some(g) if camel_paths => camel(&format!("{g}_{name}")),
+        Some(g) => format!("{g}.{name}"),
+    };
     for it in items {
         match it {
-            AccountItem::Single(a) => out.push(Leaf {
-                name: a.name.clone(),
-                writable: a.writable,
-                signer: a.signer,
-                optional: a.optional,
-            }),
-            AccountItem::Composite { accounts, .. } => out.extend(flatten_accounts(accounts)),
+            AccountItem::Single(a) => {
+                let path = path_of(&a.name);
+                out.push(Leaf {
+                    name: if prefix { path.clone() } else { a.name.clone() },
+                    path,
+                    writable: a.writable,
+                    signer: a.signer,
+                    optional: a.optional,
+                });
+            }
+            AccountItem::Composite { name, accounts } => {
+                flatten_into(accounts, Some(&path_of(name)), camel_paths, prefix, out);
+            }
         }
     }
-    out
+}
+
+fn repeats_a_name(items: &[AccountItem]) -> bool {
+    fn walk(items: &[AccountItem], seen: &mut BTreeSet<String>) -> bool {
+        items.iter().any(|it| match it {
+            AccountItem::Single(a) => !seen.insert(camel(&a.name)),
+            AccountItem::Composite { accounts, .. } => walk(accounts, seen),
+        })
+    }
+    walk(items, &mut BTreeSet::new())
 }
 
 /// The number of accounts a parser reads by position: composites count their members.
 pub(super) fn account_count(items: &[AccountItem]) -> usize {
-    flatten_accounts(items).len()
+    flatten_accounts(items, false).len()
 }

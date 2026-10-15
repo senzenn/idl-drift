@@ -83,8 +83,8 @@ In the tables:
 Rules for the options:
 
 - Give `--samples` or `--rpc` (or set `IDL_VERIFY_RPC_URL`). When both are set, `--samples`
-  wins, and idl-verify does not sample the cluster. `--max-tx` and `--stall` then have no
-  effect, and idl-verify gives no warning.
+  wins, and idl-verify does not sample the cluster. `--max-tx` or `--stall` with `--samples`
+  is a usage error (exit 2). Their default values do not count.
 - `--save-samples` saves only live samples. With `--samples` it is a usage error (exit 2).
 - `--reference`, `--decoder` and `--compare-idl` cannot be combined.
 - Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
@@ -111,9 +111,10 @@ explorer.
 | `layout` | error or warning | Error: a `bytemuck` (Pod) type whose calculated layout has padding. Pod forbids padding, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not fix (an option, vec, enum, generic or `repr(Rust)` inside it). idl-verify reports it as not verifiable, and does not guess. |
 | `size_distribution` | note | A fixed-size account type has more than one size, such as accounts created before an upgrade. |
 | `coverage` | error | Only with `--min-coverage`: less than the given percent of the IDL's account types, instructions or events have a sample. One finding for each kind that is short. |
-| `account_count` | error, warning or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Warning: only optional accounts are missing. Note: samples pass more accounts than the IDL lists (remaining accounts). |
+| `account_count` | error, warning or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Note: only optional accounts are missing at the tail, or a Codama instruction with `optionalAccountStrategy: "omitted"` leaves out absent optional accounts. Note: samples pass more accounts than the IDL lists (remaining accounts). |
 | `fixed_address` | error | An account that the IDL fixes to an address (a program or sysvar) holds another key. The IDL's account order does not match the program. An absent optional account passed as the program id is accepted. |
 | `account_flags` | error | An account that the IDL marks `writable` gets a key that the transaction makes read-only, or an account that the IDL marks `signer` gets a key that does not sign the transaction. The IDL's account order probably does not match the program, or an earlier account is missing. Only samples with flags are checked (see [the samples file](#the-samples-file)). A key with more privileges than the IDL asks for is accepted, because the transaction flags cover each instruction in it. The signer check uses only top-level instructions, because a CPI can sign for a PDA. A Codama `isSigner: "either"` account and an absent optional account are accepted. |
+| `pda` | error or note | An account that the IDL derives from seeds (Anchor `pda`, Codama `pdaValueNode` default) gets a key that its seeds do not give. Error: the derived address is passed at another position in the same instruction, so the IDL's account order does not match the program, or an earlier account is missing. Note: the derived address is not in the instruction, so the seeds may read data that the IDL does not show. A sample is skipped when a seed cannot be resolved: a path into account data (`pool.mint`), an argument field inside a struct, or an absent optional account. When the IDL names a program for the seeds, the sampled program id is also tried, because the IDL can come from another deployment. |
 | `program_id` | warning | The samples' `programId` is not the IDL's `address`. |
 | `reference` | error, warning or note | Error: decoded values do not agree with the other decoder. The other side failed: an error for the decoder under test or the old IDL, a warning for the reference decoder. Note: a type was skipped, or the decoder under test skipped a sample kind that it does not decode. See [compare with another decoder](#compare-with-another-decoder). |
 
@@ -126,8 +127,11 @@ When an account has more bytes than the IDL reads, idl-verify tries to explain t
   misread. Error, with the location of the padding.
 - **The size is the used size rounded up to 8.** This is a common pattern of spare
   allocation, but not proof. Warning: compare with the program source.
-- **Any other size on a fixed-size type.** The IDL can be missing a field. Error, also when
-  the extra bytes are zero: these are often spare allocation, but can be a missing field.
+- **Extra bytes that are all zero on a fixed-size Borsh type.** This is usually spare
+  allocation from Anchor's `space`, but a missing field that is zero in each sample looks
+  the same. Warning.
+- **Any other size on a fixed-size type, or any extra bytes on a zero-copy type.** The IDL
+  can be missing a field. Error.
 - **A variable-size type** (strings, vecs, options) usually has an allocation at its maximum
   size, so trailing zeros are a note. Trailing bytes that are not zero are a warning: the
   IDL can be missing trailing fields.
@@ -142,8 +146,10 @@ with SBF alignment rules:
 - A pubkey is `[u8; 32]` and aligns to 1.
 - `packed: true` aligns each field to 1. `align: N` increases the struct's alignment.
 - A struct nested in a zero-copy type keeps its own `repr` and padding.
-- A zero-copy type with no `repr` in the IDL is `repr(C)`, which Anchor's `zero_copy`
-  attribute applies.
+- A zero-copy type with no `repr` in the IDL is read as `repr(C)`. This is the default of
+  Anchor's `#[zero_copy]`. The default of `#[zero_copy(unsafe)]` is `repr(Rust, packed)`,
+  and Anchor writes it into the IDL. `repr(Rust)` does not fix the field order, so a type
+  with it gets a `layout` warning: idl-verify reports it as not verifiable.
 
 `idl-drift inspect --layout` prints these layouts. See
 [idl-drift.md](idl-drift.md#--layout).
@@ -278,10 +284,13 @@ its unused bytes.
 
 A `log` event is `[discriminator][payload]`. A `cpi` event first loses its envelope: the
 IDL's envelope, else Anchor's `EVENT_IX_TAG` (`e445a52e51cb9a1d`), because an Anchor IDL
-cannot describe one. A Codama IDL gives the envelope as Shipstern reads it: a discriminator
-chain of constants, where the constant at offset 0 is the tag and the next one starts the
-event. idl-verify classifies the rest by event discriminator and decodes it as the `types`
-entry with the event's name. Sizes and offsets count from the discriminator.
+cannot describe one. idl-verify classifies the rest by event discriminator and decodes it as
+the `types` entry with the event's name. Sizes and offsets count from the discriminator.
+
+Codama has no node for an envelope. idl-verify reads the envelope of a Codama IDL by a
+Shipstern convention, not by Codama behavior: in an event whose discriminators are all
+constants, the constant at offset 0 is the envelope tag, and the next one starts the event.
+Codama reads each of these constants as a discriminator of the event.
 
 `fixtures/live/pump_fun` shows a real case. pump.fun emits each event both as a log line and
 as a self-CPI. Its `TradeEvent` holds 24 bytes that its on-chain IDL does not describe, in
@@ -333,9 +342,37 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
   if the program added fields after the IDL was written. A parser that ignores trailing
   bytes, as Shipstern's account parser does, gives wrong values with no error. Use
   `--fail-on warning` in CI, or `--compare-idl <old IDL>` to see the changed values.
-- **Two swapped accounts with the same flags look correct.** `account_flags` sees a swap or a
-  missing account only when a key lands where the IDL asks for a privilege that the key
-  does not have. Two writable accounts, or two read-only accounts, can change places with
-  no finding. A check of PDA seeds is needed to find this.
+- **Some swapped accounts look correct.** `account_flags` and `pda` find a swap only when a
+  key lands where the IDL asks for a privilege that the key does not have, or where seeds
+  derive another key. Two accounts with the same flags and no usable seeds can change
+  places with no finding.
+- **A field dropped before zero reserved bytes is only a warning.** Many accounts end in
+  reserved bytes that are zero. If the IDL drops a field before them, the extra bytes are
+  zero, so idl-verify reports spare allocation. Use `--fail-on warning` in CI, or
+  `--reference` or `--decoder` to compare the values.
 - **The reference decoder reads the same IDL.** A reference mismatch means that one of the
   two decoders misreads the bytes. It cannot prove that the IDL is correct.
+- **Codama nodes that idl-drift cannot read.** idl-verify uses the IDL model of idl-drift.
+  A field that idl-drift cannot resolve cannot be decoded, and some nodes are read in a
+  simpler form. Both lists are in [idl-drift.md](idl-drift.md#inspect).
+- **idl-verify follows the Codama spec where Shipstern does not.** A sample matches only if
+  every discriminator matches, and the arguments start after all of them. Omitted arguments
+  and fields stay in the layout. Shipstern 0.12 dispatches on the first discriminator and
+  drops omitted arguments, so it reads Token-2022 extension arguments one byte early. A
+  sample that idl-verify accepts can still be misread by a Shipstern parser. Use
+  `--decoder` to compare with your parser.
+- **Omitted optional accounts.** With `optionalAccountStrategy: "omitted"`, a sample that
+  passes fewer accounts than the IDL lists leaves out absent optional accounts. idl-verify
+  maps the keys to IDL positions only where the position is certain, and skips the other
+  accounts in `fixed_address`, `account_flags` and `pda`.
+- **A default public key is read as a fixed address.** An account whose IDL default is a
+  public key, but which the program also accepts with another key, gives a false
+  `fixed_address` error for that other key. An example is Token-2022's
+  `instructionsSysvarOrContextState`, which takes a context-state account in place of the
+  Instructions sysvar.
+- **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
+  `name` key of each node to `identifier`. idl-verify stops with "Codama spec 2.0.0 is not
+  supported; only spec 1.x can be read" (exit 2).
+- **Bool decoding is Borsh-strict.** A bool byte other than 0 or 1 is a `decode` error, as
+  in Shipstern, which decodes with Borsh. The Codama spec says that any value other than 1
+  is false, so a Codama client can accept data that idl-verify rejects.

@@ -59,6 +59,10 @@ pub struct Instruction {
     /// Where the discriminator starts in the data (Codama only; Anchor's is at 0).
     #[serde(default)]
     pub discriminator_offset: usize,
+    /// Later Codama discriminators, by offset. Codama requires every one to match, but
+    /// Shipstern dispatches on `discriminator` alone.
+    #[serde(default)]
+    pub extra_discriminators: Vec<(usize, Discriminator)>,
     /// Codama `sizeDiscriminatorNode`: the parser selects the instruction by its data length.
     #[serde(default)]
     pub size_discriminator: Option<usize>,
@@ -66,6 +70,19 @@ pub struct Instruction {
     pub accounts: Vec<AccountItem>,
     #[serde(default)]
     pub args: Vec<Field>,
+    /// How a caller passes an absent optional account. Anchor IDLs do not say.
+    #[serde(skip)]
+    pub optional_accounts: OptionalAccounts,
+}
+
+/// Codama `optionalAccountStrategy`: what goes in the place of an absent optional account.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptionalAccounts {
+    /// The program id, so each later account keeps its position. Anchor always does this.
+    #[default]
+    ProgramId,
+    /// Nothing, so each later account moves one position earlier.
+    Omitted,
 }
 
 /// A single account, or a composite group (told apart by its `accounts` array).
@@ -96,6 +113,75 @@ pub struct Account {
     /// Fixed address (a program or sysvar). Not part of the positional diff.
     #[serde(default)]
     pub address: Option<String>,
+    /// The seeds the address derives from. Not part of the positional diff.
+    #[serde(default, deserialize_with = "deserialize_pda")]
+    pub pda: Option<Pda>,
+}
+
+/// How an account address derives from seeds: Anchor `pda`, or a Codama `pdaValueNode`
+/// default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pda {
+    pub seeds: Vec<Seed>,
+    /// The program that derives the address; `None` means the instruction's own program.
+    pub program: Option<Seed>,
+}
+
+/// One PDA seed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Seed {
+    /// Fixed bytes.
+    Const(Vec<u8>),
+    /// The key of another account in the same instruction, by name.
+    Account(String),
+    /// An instruction argument, by name.
+    Arg(String),
+    /// A seed the model cannot describe, such as a field of another account's data.
+    Other,
+}
+
+/// Read an Anchor `pda`. A seed of an unknown shape becomes [`Seed::Other`], so the field
+/// never stops an IDL from loading.
+fn deserialize_pda<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Pda>, D::Error> {
+    let Some(value) = Option::<serde_json::Value>::deserialize(d)? else {
+        return Ok(None);
+    };
+    let Some(seeds) = value.get("seeds").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    Ok(Some(Pda {
+        seeds: seeds.iter().map(anchor_seed).collect(),
+        // Legacy Anchor names the program `programId`.
+        program: value
+            .get("program")
+            .or_else(|| value.get("programId"))
+            .map(anchor_seed),
+    }))
+}
+
+fn anchor_seed(seed: &serde_json::Value) -> Seed {
+    let text = |key| seed.get(key).and_then(serde_json::Value::as_str);
+    // A dotted path reads a field of another account's data or of a struct argument.
+    let path = text("path")
+        .filter(|p| !p.contains('.'))
+        .map(str::to_string);
+    match (text("kind"), path) {
+        (Some("const"), _) => match seed.get("value") {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                .collect::<Option<Vec<u8>>>()
+                .map_or(Seed::Other, Seed::Const),
+            // Legacy Anchor writes a string seed as text.
+            Some(serde_json::Value::String(s)) if text("type") == Some("string") => {
+                Seed::Const(s.as_bytes().to_vec())
+            }
+            _ => Seed::Other,
+        },
+        (Some("account"), Some(path)) => Seed::Account(path),
+        (Some("arg"), Some(path)) => Seed::Arg(path),
+        _ => Seed::Other,
+    }
 }
 
 /// An account type. Native programs may give no discriminator and tell types apart by size.
@@ -107,6 +193,10 @@ pub struct NamedDisc {
     /// Where the discriminator starts in the data (Codama only; Anchor's is at 0).
     #[serde(default)]
     pub discriminator_offset: usize,
+    /// Later Codama discriminators, by offset. Codama requires every one to match, but
+    /// Shipstern's account parser checks only `discriminator`.
+    #[serde(default)]
+    pub extra_discriminators: Vec<(usize, Discriminator)>,
     /// Declared account size in bytes, discriminator included (Codama `size`).
     #[serde(default)]
     pub size: Option<usize>,
@@ -118,16 +208,51 @@ pub struct NamedDisc {
     pub payload_offset: Option<usize>,
 }
 
+impl Instruction {
+    /// Where the arguments start: after the discriminator bytes.
+    #[must_use]
+    pub fn payload_start(&self) -> usize {
+        discriminator_end(
+            self.discriminator_offset,
+            &self.discriminator,
+            &self.extra_discriminators,
+        )
+    }
+}
+
 impl NamedDisc {
-    /// Where the account body starts: after the discriminator, unless the IDL says the
+    /// Where the account body starts: after the discriminator bytes, unless the IDL says the
     /// discriminator byte is also the body's first field (SPL Governance).
     #[must_use]
     pub fn payload_start(&self) -> usize {
         self.payload_offset.unwrap_or_else(|| {
-            self.discriminator_offset
-                .saturating_add(self.discriminator.len())
+            discriminator_end(
+                self.discriminator_offset,
+                &self.discriminator,
+                &self.extra_discriminators,
+            )
         })
     }
+}
+
+/// The end of the discriminator bytes: the end of the first discriminator, moved on by each
+/// later one that starts where the bytes so far end. A gap stops the run, because a field can
+/// fill the gap.
+#[must_use]
+pub fn discriminator_end(offset: usize, first: &[u8], extra: &[(usize, Discriminator)]) -> usize {
+    let mut end = offset.saturating_add(first.len());
+    // Each step must move forward: an IDL offset near usize::MAX must not loop forever.
+    for _ in 0..extra.len() {
+        let next = extra
+            .iter()
+            .find(|(at, d)| *at == end && !d.is_empty())
+            .and_then(|(at, d)| at.checked_add(d.len()));
+        match next {
+            Some(next) if next > end => end = next,
+            _ => break,
+        }
+    }
+    end
 }
 
 /// A program event. The envelope is the self-CPI wrap around the payload: Anchor's 8-byte
@@ -154,6 +279,20 @@ pub struct Event {
 }
 
 impl Event {
+    /// Where the payload starts in the event bytes, after the envelope is removed: after the
+    /// last discriminator, as Shipstern reads a chain.
+    #[must_use]
+    pub fn payload_start(&self) -> usize {
+        self.extra_discriminators
+            .iter()
+            .map(|(at, disc)| at.saturating_add(disc.len()))
+            .fold(
+                self.discriminator_offset
+                    .saturating_add(self.discriminator.len()),
+                usize::max,
+            )
+    }
+
     /// The explicit payload offset, else the envelope length when there is an envelope.
     #[must_use]
     pub fn effective_payload_offset(&self) -> Option<usize> {
@@ -424,6 +563,13 @@ pub enum OptionTag {
 }
 
 impl Type {
+    /// The name in a `Generic` without the `#<hash>` that the Codama reader adds to a node it
+    /// cannot read. The hash only tells two contents of the node apart.
+    #[must_use]
+    pub fn generic_kind(name: &str) -> &str {
+        name.split_once('#').map_or(name, |(kind, _)| kind)
+    }
+
     /// The types this one holds, so a walk over a type tree needs no list of variants.
     /// Length and tag prefixes are numbers, not data, so they are not included.
     #[must_use]
@@ -498,6 +644,18 @@ impl Idl {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let mut value: serde_json::Value = serde_json::from_str(s)?;
         if value.get("kind").and_then(|k| k.as_str()) == Some("rootNode") {
+            // Spec 2 renames fields, so a parse error would name a field and not the cause.
+            if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
+                let major = version
+                    .split('.')
+                    .next()
+                    .and_then(|m| m.parse::<u64>().ok());
+                if major.is_some_and(|m| m >= 2) {
+                    return Err(serde::de::Error::custom(format!(
+                        "Codama spec {version} is not supported; only spec 1.x can be read"
+                    )));
+                }
+            }
             crate::codama_convert::fix_string_error_codes(&mut value);
             let root: codama_nodes::RootNode = serde_json::from_value(value)?;
             Ok(crate::codama_convert::from_codama(root))
@@ -853,5 +1011,23 @@ fn rewrite_legacy_keys(value: &mut serde_json::Value) {
             *s = "pubkey".into();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod discriminator_end_tests {
+    use super::discriminator_end;
+
+    #[test]
+    fn a_chain_ends_and_an_offset_at_the_top_stops() {
+        assert_eq!(
+            discriminator_end(0, &[1], &[(1, vec![2]), (2, vec![3, 4])]),
+            4
+        );
+        // A gap stops the run: a field can sit in it.
+        assert_eq!(discriminator_end(0, &[1], &[(2, vec![2])]), 1);
+        // A hostile IDL: the end saturates at usize::MAX and a discriminator sits there.
+        let top = usize::MAX;
+        assert_eq!(discriminator_end(top - 1, &[1], &[(top, vec![2])]), top);
     }
 }

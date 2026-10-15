@@ -550,7 +550,8 @@ impl fmt::Display for LayoutError {
 impl std::error::Error for LayoutError {}
 
 /// The `repr` that sets a struct's zero-copy layout. A type with no `repr` is laid out as
-/// `repr(C)`.
+/// `repr(C)`, the default of Anchor's `zero_copy`. The default of `zero_copy(unsafe)` is
+/// `repr(Rust, packed)`, but Anchor writes that `repr` into the IDL.
 pub(crate) fn layout_repr(td: &TypeDef) -> Repr {
     td.repr.unwrap_or(Repr {
         kind: ReprKind::C,

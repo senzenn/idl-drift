@@ -11,7 +11,7 @@ use idl_drift::model::Idl;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 
-use crate::classify::{Classifier, Disc};
+use crate::classify::{Classifier, Discriminated, Discs};
 use crate::decode::Decoder;
 use crate::error::Error;
 use crate::layout::TypeIndex;
@@ -140,10 +140,9 @@ impl Reference {
                     );
                 };
                 let nd = &old.accounts[t];
-                let disc = (nd.discriminator_offset, nd.discriminator.as_slice());
+                let disc = nd.discs();
                 if let Some(o) = ours.account(&sample.data) {
-                    let n = &new.accounts[o];
-                    let new_disc = (n.discriminator_offset, n.discriminator.as_slice());
+                    let new_disc = new.accounts[o].discs();
                     if new_disc != disc {
                         return Outcome::Failed(other_disc("account", &nd.name, disc, new_disc));
                     }
@@ -169,10 +168,9 @@ impl Reference {
                     );
                 };
                 let ix = &old.instructions[t];
-                let disc = (ix.discriminator_offset, ix.discriminator.as_slice());
+                let disc = ix.discs();
                 if let Some(o) = ours.instruction(sample) {
-                    let n = &new.instructions[o];
-                    let new_disc = (n.discriminator_offset, n.discriminator.as_slice());
+                    let new_disc = new.instructions[o].discs();
                     if new_disc != disc {
                         return Outcome::Failed(other_disc(
                             "instruction",
@@ -182,7 +180,7 @@ impl Reference {
                         ));
                     }
                 }
-                let start = disc.0.saturating_add(disc.1.len());
+                let start = ix.payload_start();
                 let body = sample.data.get(start..).unwrap_or_default();
                 match decoder.borsh_fields(&ix.args, body) {
                     Ok(d) => Outcome::Ok(json!({ "name": ix.name, "data": to_json(&d.value) })),
@@ -226,9 +224,9 @@ fn old_event(
         return Outcome::Failed("no event discriminator in the old IDL matches".into());
     };
     let ev = &old.events[t];
-    let disc = (0, ev.discriminator.as_slice());
+    let disc = ev.discs();
     if let Some(o) = ours.event_body(sample).and_then(|b| ours.event(b)) {
-        let new_disc = (0, new.events[o].discriminator.as_slice());
+        let new_disc = new.events[o].discs();
         if new_disc != disc {
             return Outcome::Failed(other_disc("event", &ev.name, disc, new_disc));
         }
@@ -236,7 +234,7 @@ fn old_event(
     let Some(td) = decoder.types().get(&ev.name) else {
         return Outcome::Failed(format!("the old IDL has no type `{}`", ev.name));
     };
-    let start = ev.discriminator.len();
+    let start = ev.payload_start();
     let payload = body.get(start..).unwrap_or_default();
     match decoder.type_def(td, payload) {
         Ok(d) => Outcome::Ok(json!({ "name": ev.name, "data": to_json(&d.value) })),
@@ -244,11 +242,21 @@ fn old_event(
     }
 }
 
-fn other_disc(kind: &str, name: &str, old: Disc<'_>, new: Disc<'_>) -> String {
-    let by = |(offset, disc): Disc<'_>| match (offset, disc.is_empty()) {
-        (_, true) => "by size".to_string(),
-        (0, false) => format!("by discriminator {}", prefix_hex(disc)),
-        (at, false) => format!("by discriminator {} at offset {at}", prefix_hex(disc)),
+fn other_disc(kind: &str, name: &str, old: Discs<'_>, new: Discs<'_>) -> String {
+    let by = |discs: Discs<'_>| {
+        let parts: Vec<String> = discs
+            .into_iter()
+            .filter(|(_, disc)| !disc.is_empty())
+            .map(|(offset, disc)| match offset {
+                0 => prefix_hex(disc),
+                at => format!("{} at offset {at}", prefix_hex(disc)),
+            })
+            .collect();
+        if parts.is_empty() {
+            "by size".to_string()
+        } else {
+            format!("by discriminator {}", parts.join(" and "))
+        }
     };
     format!(
         "the old IDL classifies it as {kind} `{name}` {}, the new IDL {}",

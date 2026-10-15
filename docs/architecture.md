@@ -27,8 +27,8 @@ flowchart LR
 
 | Crate | Part | What it does |
 |---|---|---|
-| `idl-drift` | IDL model | One flat model for each supported format. The Anchor reader calculates the discriminators of a legacy IDL from the names. The Codama reader uses the same `codama-nodes` version as Shipstern. A node that the model cannot express becomes a `Generic` type, which `inspect` reports. Optional fields have defaults, so an IDL that leaves out `writable: false` and one that writes it compare equal. |
-| `idl-drift` | Layout | Calculates the Borsh size of a type and the `repr(C)` layout of a zero-copy type, with SBF alignment rules. When the IDL does not fix a layout (an option, vec, enum or generic inside a zero-copy type), it returns an error, not a guess. Both tools use it. |
+| `idl-drift` | IDL model | One flat model for each supported format. The Anchor reader calculates the discriminators of a legacy IDL from the names. The Codama reader uses the same `codama-nodes` version as Shipstern. A node that the model cannot express becomes a `Generic` type, which `inspect` reports. Some other nodes are read in a simpler form (see [idl-drift.md](idl-drift.md#inspect)). Optional fields have defaults, so an IDL that leaves out `writable: false` and one that writes it compare equal. |
+| `idl-drift` | Layout | Calculates the Borsh size of a type and the `repr(C)` layout of a zero-copy type, with SBF alignment rules. When the IDL does not fix a layout (an option, vec, enum, generic or `repr(Rust)` inside a zero-copy type), it returns an error, not a guess. Both tools use it. |
 | `idl-drift` | Diff rules | Finds the reachable types, compares the two IDLs by name and by position, and gives each change a severity and a `kind`. When the formats differ, it first brings both IDLs to the same names and shapes. |
 | `idl-drift` | Inspect | Lists `Generic` fields, prints zero-copy layouts, and finds padded zero-copy types that Borsh also reads. |
 | `idl-verify` | Samples | Loads and saves the samples file. |

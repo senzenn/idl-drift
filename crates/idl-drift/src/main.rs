@@ -9,14 +9,15 @@ use idl_drift::{coverage, diff, layouts, Change, CoverageReport, Report, Severit
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
-/// Semantic drift detection for Solana program IDLs.
+/// Compare two versions of a Solana program IDL.
 #[derive(Parser)]
 #[command(name = "idl-drift", version, about)]
 #[command(after_help = "Exit codes:
   0  diff: no change at or above --fail-on; inspect: every field resolved
   1  diff: at least one change at or above --fail-on; inspect: unmapped fields,
      or a padded zero-copy type that Borsh also reads
-  2  a file could not be read or parsed")]
+  2  idl-drift could not run: a file could not be read or parsed, or an option
+     is wrong")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

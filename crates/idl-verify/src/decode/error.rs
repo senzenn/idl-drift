@@ -101,7 +101,8 @@ impl fmt::Display for DecodeErrorKind {
             Self::UndefinedType(name) => write!(f, "type `{name}` is not defined in the IDL"),
             Self::UnresolvedGeneric(name) => write!(
                 f,
-                "`{name}` is an unbound generic or an encoding idl-verify cannot decode"
+                "`{}` is an unbound generic or an encoding idl-verify cannot decode",
+                Type::generic_kind(name)
             ),
             Self::Unsupported(what) => f.write_str(what),
             Self::ZeroSizedItems(item) => write!(

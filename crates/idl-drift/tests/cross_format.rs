@@ -145,3 +145,124 @@ fn a_struct_arg_that_holds_itself_does_not_grow_without_bound() {
     new.format = Format::Codama;
     assert!(!diff(&old, &new).has_breaking());
 }
+
+/// A Codama instruction `go` with discriminator 1 and the given args.
+fn codama_go(args: &[String], defined_types: &str) -> String {
+    format!(
+        r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+        "program":{{"kind":"programNode","name":"p","publicKey":"P","version":"1","accounts":[],"pdas":[],"errors":[],"events":[],
+        "definedTypes":[{defined_types}],
+        "instructions":[{{"kind":"instructionNode","name":"go","accounts":[],
+          "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}],
+          "arguments":[{{"kind":"instructionArgumentNode","name":"discriminator","defaultValueStrategy":"omitted",
+            "type":{{"kind":"fixedSizeTypeNode","size":1,"type":{{"kind":"bytesTypeNode"}}}},
+            "defaultValue":{{"kind":"bytesValueNode","data":"01","encoding":"base16"}}}},{}]}}]}}}}"#,
+        args.join(",")
+    )
+}
+
+fn codama_field(kind: &str, name: &str, ty: &str) -> String {
+    format!(r#"{{"kind":"{kind}","name":"{name}","type":{ty}}}"#)
+}
+
+fn codama_struct(fields: &[(&str, &str)]) -> String {
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|(name, ty)| codama_field("structFieldTypeNode", name, ty))
+        .collect();
+    format!(
+        r#"{{"kind":"structTypeNode","fields":[{}]}}"#,
+        fields.join(",")
+    )
+}
+
+fn codama_num(format: &str) -> String {
+    format!(r#"{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}"#)
+}
+
+#[test]
+fn codama_inline_struct_arg_reads_like_a_linked_struct() {
+    // Anchor links `Params`, which links `Inner`; the Codama file writes `inner` inline.
+    let anchor = parse(
+        r#"{"address":"P","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+      "instructions":[{"name":"go","discriminator":[1],"accounts":[],"args":[
+        {"name":"params","type":{"defined":{"name":"Params"}}},{"name":"amt","type":"u64"}]}],
+      "types":[
+        {"name":"Params","type":{"kind":"struct","fields":[{"name":"a","type":"u64"},{"name":"inner","type":{"defined":{"name":"Inner"}}}]}},
+        {"name":"Inner","type":{"kind":"struct","fields":[{"name":"b","type":"u8"},{"name":"c","type":"u16"}]}}]}"#,
+    );
+    let codama = |c: &str| {
+        let arg = |name: &str, ty: &str| codama_field("instructionArgumentNode", name, ty);
+        let inner = codama_struct(&[("b", &codama_num("u8")), ("c", &codama_num(c))]);
+        parse(&codama_go(
+            &[
+                arg("a", &codama_num("u64")),
+                arg("inner", &inner),
+                arg("amt", &codama_num("u64")),
+            ],
+            "",
+        ))
+    };
+    let report = diff(&anchor, &codama("u16"));
+    assert!(report.changes.is_empty(), "{:#?}", report.changes);
+    assert_eq!(
+        messages(&anchor, &codama("u32")),
+        ["arg changed (go#2): c: u16 -> u32 (Borsh layout)"]
+    );
+}
+
+#[test]
+fn generic_type_matches_the_codama_body_written_at_each_use() {
+    // Codama has no generics, so its converters write the body of `Price<u128>` and
+    // `Signer<pubkey>` in place of each use.
+    let anchor = parse(
+        r#"{"address":"P","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+      "instructions":[{"name":"go","discriminator":[1],"accounts":[],"args":[
+        {"name":"prices","type":{"defined":{"name":"Prices","generics":[{"kind":"type","type":"u128"}]}}},
+        {"name":"cfg","type":{"defined":{"name":"Config"}}}]}],
+      "types":[
+        {"name":"Config","type":{"kind":"struct","fields":[
+          {"name":"signers","type":{"array":[{"defined":{"name":"Signer","generics":[{"kind":"type","type":"pubkey"}]}},2]}}]}},
+        {"name":"Signer","generics":[{"kind":"type","name":"T"}],"type":{"kind":"struct","fields":[
+          {"name":"key","type":{"generic":"T"}},{"name":"expires_at","type":"i64"}]}},
+        {"name":"Price","generics":[{"kind":"type","name":"T"}],"type":{"kind":"struct","fields":[
+          {"name":"min","type":{"generic":"T"}},{"name":"max","type":{"generic":"T"}}]}},
+        {"name":"Prices","generics":[{"kind":"type","name":"T"}],"type":{"kind":"struct","fields":[
+          {"name":"index","type":{"defined":{"name":"Price","generics":[{"kind":"type","type":{"generic":"T"}}]}}},
+          {"name":"long","type":{"defined":{"name":"Price","generics":[{"kind":"type","type":{"generic":"T"}}]}}}]}}]}"#,
+    );
+    let codama = |expires_at: &str| {
+        let arg = |name: &str, ty: &str| codama_field("instructionArgumentNode", name, ty);
+        let price = codama_struct(&[("min", &codama_num("u128")), ("max", &codama_num("u128"))]);
+        let signer = codama_struct(&[
+            ("key", r#"{"kind":"publicKeyTypeNode"}"#),
+            ("expiresAt", &codama_num(expires_at)),
+        ]);
+        let signers = format!(
+            r#"{{"kind":"arrayTypeNode","item":{signer},"count":{{"kind":"fixedCountNode","value":2}}}}"#
+        );
+        let config = codama_field(
+            "definedTypeNode",
+            "config",
+            &codama_struct(&[("signers", &signers)]),
+        );
+        parse(&codama_go(
+            &[
+                arg("index", &price),
+                arg("long", &price),
+                arg("cfg", r#"{"kind":"definedTypeLinkNode","name":"config"}"#),
+            ],
+            &config,
+        ))
+    };
+    let report = diff(&anchor, &codama("i64"));
+    assert!(report.changes.is_empty(), "{:#?}", report.changes);
+    // `cfg` is inlined into the args, so no parser reads `config` itself.
+    assert_eq!(
+        messages(&anchor, &codama("i32")),
+        [
+            "arg changed (go#4): signers: [{ key: pubkey, expiresAt: i64 }; 2] -> [{ key: pubkey, expiresAt: i32 }; 2] (Borsh layout)",
+            "field changed in UNREACHED type (config#0): dead code",
+        ]
+    );
+}
