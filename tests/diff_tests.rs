@@ -378,6 +378,7 @@ fn acct(name: &str) -> AccountItem {
         name: name.into(),
         writable: false,
         signer: false,
+        may_sign: false,
         optional: false,
         address: None,
     })
@@ -388,6 +389,7 @@ fn opt_acct(name: &str) -> AccountItem {
         name: name.into(),
         writable: false,
         signer: false,
+        may_sign: false,
         optional: true,
         address: None,
     })
@@ -398,6 +400,7 @@ fn ix(name: &str, disc: Vec<u8>, accounts: Vec<AccountItem>) -> Instruction {
         name: name.into(),
         discriminator: disc,
         discriminator_offset: 0,
+        size_discriminator: None,
         accounts,
         args: vec![],
     }
@@ -579,6 +582,8 @@ fn event_named(name: &str) -> Event {
     Event {
         name: name.into(),
         discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        discriminator_offset: 0,
+        extra_discriminators: vec![],
         envelope_discriminator: vec![],
         envelope_payload_offset: None,
     }
@@ -689,6 +694,7 @@ fn idl_account(account: &str, types: Vec<TypeDef>) -> Idl {
             discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
             discriminator_offset: 0,
             size: None,
+            size_discriminator: None,
             payload_offset: None,
         }],
         events: vec![],
@@ -1678,4 +1684,376 @@ fn codama_event_envelope_comes_from_the_discriminator_chain() {
     let e = &single.events[0];
     assert_eq!(e.discriminator, [1, 2, 3, 4, 5, 6, 7, 8]);
     assert!(e.envelope_discriminator.is_empty());
+}
+
+#[test]
+fn program_address_and_module_name_changes_are_reported() {
+    let idl = |address: &str, name: &str| {
+        format!(
+            r#"{{"address":"{address}","metadata":{{"name":"{name}","version":"1","spec":"0.1.0"}},"instructions":[]}}"#
+        )
+    };
+    assert_eq!(
+        kinds(&idl("A", "lo"), &idl("B", "lo")),
+        [(Severity::Breaking, ChangeKind::ProgramAddressChanged)]
+    );
+    // A legacy IDL can have no address.
+    assert_eq!(kinds(&idl("", "lo"), &idl("B", "lo")), []);
+    assert_eq!(
+        kinds(&idl("A", "limit_order"), &idl("A", "limit_order_v2")),
+        [(Severity::Dangerous, ChangeKind::ProgramRenamed)]
+    );
+    // Shipstern camel-cases, then snake-cases the name: both give the module `limit_order2`.
+    assert_eq!(
+        kinds(&idl("A", "limit_order_2"), &idl("A", "limitOrder2")),
+        []
+    );
+}
+
+/// A Codama program whose one instruction takes an arg of type `arg`.
+fn codama_arg(arg: &str, defined_types: &str) -> String {
+    format!(
+        r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+  "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111","version":"0",
+    "accounts":[],"pdas":[],"errors":[],"definedTypes":[{defined_types}],
+    "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],
+      "arguments":[{{"kind":"instructionArgumentNode","name":"x","type":{arg}}}]}}]}}}}"#
+    )
+}
+
+#[test]
+fn change_inside_a_codama_only_encoding_is_breaking() {
+    let num = |format: &str, endian: &str| {
+        format!(r#"{{"kind":"numberTypeNode","format":"{format}","endian":"{endian}"}}"#)
+    };
+    let inline = |ty: &str| {
+        format!(
+            r#"{{"kind":"structTypeNode","fields":[{{"kind":"structFieldTypeNode","name":"a","type":{ty}}}]}}"#
+        )
+    };
+    let sized = |prefix: &str| {
+        format!(
+            r#"{{"kind":"sizePrefixTypeNode","type":{{"kind":"stringTypeNode","encoding":"utf8"}},"prefix":{prefix}}}"#
+        )
+    };
+    let option = |prefix: &str, fixed: bool| {
+        format!(
+            r#"{{"kind":"optionTypeNode","fixed":{fixed},"item":{{"kind":"publicKeyTypeNode"}},"prefix":{prefix}}}"#
+        )
+    };
+    let zeroable = r#"{"kind":"zeroableOptionTypeNode","item":{"kind":"publicKeyTypeNode"}}"#;
+    let (u8le, u16le, u32le, u64le) = (
+        num("u8", "le"),
+        num("u16", "le"),
+        num("u32", "le"),
+        num("u64", "le"),
+    );
+    // Each pair reads different bytes. Before, both sides were the same `Generic`.
+    let mut cases = vec![
+        ("inline struct field", inline(&u64le), inline(&u32le)),
+        ("size prefix width", sized(&u8le), sized(&u16le)),
+        ("byte order", u64le.clone(), num("u64", "be")),
+        ("fixed option", option(&u16le, false), option(&u16le, true)),
+        (
+            "zeroable option",
+            zeroable.to_string(),
+            option(&u8le, false),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, old, new)| (label, codama_arg(&old, ""), codama_arg(&new, "")))
+    .collect::<Vec<_>>();
+    // `inner` is linked only inside an inline struct, so its change must still count.
+    let link = inline(r#"{"kind":"definedTypeLinkNode","name":"inner"}"#);
+    let inner = |ty: &str| {
+        let ty = inline(ty);
+        format!(r#"{{"kind":"definedTypeNode","name":"inner","type":{ty}}}"#)
+    };
+    cases.push((
+        "type behind an inline struct",
+        codama_arg(&link, &inner(&u64le)),
+        codama_arg(&link, &inner(&u32le)),
+    ));
+    for (label, old, new) in &cases {
+        assert_eq!(max_sev(old, new), Some(Severity::Breaking), "{label}");
+        assert_eq!(max_sev(new, new), None, "{label}: self-diff");
+    }
+}
+
+#[test]
+fn size_discriminators_and_event_chains_are_compared() {
+    let root = |ix_size: u64, account_size: u64, event_chain: &str| {
+        parse(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],"program":{{
+            "kind":"programNode","name":"p","publicKey":"P","version":"1","pdas":[],"errors":[],"definedTypes":[],
+            "instructions":[{{"kind":"instructionNode","name":"sized","accounts":[],"arguments":[],
+              "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{ix_size}}}]}}],
+            "accounts":[{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[]}},
+              "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{account_size}}}]}}],
+            "events":[{{"kind":"eventNode","name":"trade","data":{{"kind":"structTypeNode","fields":[]}},
+              "discriminators":[{event_chain}]}}]}}}}"#
+        ))
+    };
+    let constant = |hex: &str, offset: u8| {
+        format!(
+            r#"{{"kind":"constantDiscriminatorNode","offset":{offset},"constant":{{"kind":"constantValueNode",
+            "type":{{"kind":"bytesTypeNode"}},"value":{{"kind":"bytesValueNode","data":"{hex}","encoding":"base16"}}}}}}"#
+        )
+    };
+    let chain = |last: &str| {
+        format!(
+            "{},{},{}",
+            constant("fe", 0),
+            constant("a1a2", 4),
+            constant(last, 8)
+        )
+    };
+    let base = root(4, 100, &chain("b7"));
+    assert!(diff(&base, &base).changes.is_empty());
+    let kinds_of = |new: &Idl| -> Vec<ChangeKind> {
+        diff(&base, new).changes.iter().map(|c| c.kind).collect()
+    };
+    assert_eq!(
+        kinds_of(&root(8, 100, &chain("b7"))),
+        [ChangeKind::DiscriminatorChanged]
+    );
+    assert_eq!(
+        kinds_of(&root(4, 120, &chain("b7"))),
+        [ChangeKind::AccountDiscriminatorChanged]
+    );
+    // The third constant of the chain: Shipstern checks it too.
+    assert_eq!(
+        kinds_of(&root(4, 100, &chain("b0"))),
+        [ChangeKind::EventDiscriminatorChanged]
+    );
+    // A lone event discriminator that moves from offset 0 to 8.
+    let lone = |offset: u8| root(4, 100, &constant("e1e2", offset));
+    let moved: Vec<ChangeKind> = diff(&lone(0), &lone(8))
+        .changes
+        .iter()
+        .map(|c| c.kind)
+        .collect();
+    assert_eq!(moved, [ChangeKind::EventDiscriminatorChanged]);
+}
+
+#[test]
+fn anchor_and_its_codama_conversion_read_the_same_args() {
+    // `Params` has one use, so Codama flattens it; `Inner` has two, so Codama keeps the link.
+    let anchor = r#"{"address":"P","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+      "instructions":[
+        {"name":"go","discriminator":[1],"accounts":[],"args":[{"name":"params","type":{"defined":{"name":"Params"}}}]},
+        {"name":"stop","discriminator":[2],"accounts":[],"args":[
+          {"name":"inner","type":{"defined":{"name":"Inner"}}},{"name":"flag","type":{"defined":{"name":"OptionBool"}}}]}],
+      "types":[
+        {"name":"Params","type":{"kind":"struct","fields":[{"name":"a","type":"u8"},{"name":"inner","type":{"defined":{"name":"Inner"}}}]}},
+        {"name":"Inner","type":{"kind":"struct","fields":[{"name":"x","type":"u64"}]}},
+        {"name":"OptionBool","type":{"kind":"struct","fields":["bool"]}}]}"#;
+    let codama = |option_bool: &str| {
+        let arg = |name: &str, ty: &str| {
+            format!(r#"{{"kind":"instructionArgumentNode","name":"{name}","type":{ty}}}"#)
+        };
+        let link = |name: &str| format!(r#"{{"kind":"definedTypeLinkNode","name":"{name}"}}"#);
+        let disc = |b: u8| {
+            format!(
+                r#"{{"kind":"instructionArgumentNode","name":"discriminator","defaultValueStrategy":"omitted","type":{{"kind":"fixedSizeTypeNode","size":1,"type":{{"kind":"bytesTypeNode"}}}},"defaultValue":{{"kind":"bytesValueNode","data":"0{b}","encoding":"base16"}}}}"#
+            )
+        };
+        let ix = |name: &str, b: u8, args: &[String]| {
+            format!(
+                r#"{{"kind":"instructionNode","name":"{name}","accounts":[],"arguments":[{},{}],"discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}]}}"#,
+                disc(b),
+                args.join(",")
+            )
+        };
+        let defined = |name: &str, ty: &str| {
+            format!(r#"{{"kind":"definedTypeNode","name":"{name}","type":{ty}}}"#)
+        };
+        format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{"kind":"programNode","name":"p","publicKey":"P","version":"1","accounts":[],"pdas":[],"errors":[],"events":[],
+            "instructions":[{},{}],"definedTypes":[{},{}]}},"additionalPrograms":[]}}"#,
+            ix(
+                "go",
+                1,
+                &[
+                    arg(
+                        "a",
+                        r#"{"kind":"numberTypeNode","format":"u8","endian":"le"}"#
+                    ),
+                    arg("inner", &link("inner"))
+                ]
+            ),
+            ix(
+                "stop",
+                2,
+                &[
+                    arg("inner", &link("inner")),
+                    arg("flag", &link("optionBool"))
+                ]
+            ),
+            defined(
+                "inner",
+                r#"{"kind":"structTypeNode","fields":[{"kind":"structFieldTypeNode","name":"x","type":{"kind":"numberTypeNode","format":"u64","endian":"le"}}]}"#
+            ),
+            defined("optionBool", option_bool),
+        )
+    };
+    let tuple = r#"{"kind":"tupleTypeNode","items":[{"kind":"booleanTypeNode","size":{"kind":"numberTypeNode","format":"u8","endian":"le"}}]}"#;
+    let report = diff(&parse(anchor), &parse(&codama(tuple)));
+    assert!(!report.has_breaking(), "{:?}", report.changes);
+    // A Codama file whose `optionBool` lost its field reads 0 bytes where the program writes 1.
+    let empty = r#"{"kind":"structTypeNode","fields":[]}"#;
+    assert!(diff(&parse(anchor), &parse(&codama(empty))).has_breaking());
+}
+
+#[test]
+fn a_struct_arg_that_holds_itself_does_not_grow_without_bound() {
+    // 64 fields of its own type: 16 rounds of inlining would make 64^16 args.
+    let fields: Vec<String> = (0..64)
+        .map(|i| format!(r#"{{"name":"f{i}","type":{{"defined":{{"name":"Wide"}}}}}}"#))
+        .collect();
+    let old = parse(&format!(
+        r#"{{"address":"P","metadata":{{"name":"p","version":"1","spec":"0.1.0"}},
+        "instructions":[{{"name":"go","discriminator":[1],"accounts":[],"args":[{{"name":"w","type":{{"defined":{{"name":"Wide"}}}}}}]}}],
+        "types":[{{"name":"Wide","type":{{"kind":"struct","fields":[{}]}}}}]}}"#,
+        fields.join(",")
+    ));
+    let mut new = old.clone();
+    new.format = Format::Codama;
+    assert!(!diff(&old, &new).has_breaking());
+}
+
+// Both types drop `bytemuckunsafe repr(C, packed)`. Each change alone moves `inner.y`;
+// together, Borsh reads every byte where the packed account had it.
+const PACKED_OUTER: &str = r#"{"address":"P","metadata":{"name":"p","version":"0.1.0","spec":"0.1.0"},
+  "accounts":[{"name":"Outer","discriminator":[1,1,1,1,1,1,1,1]}],
+  "types":[
+    {"name":"Outer","serialization":"bytemuckunsafe","repr":{"kind":"c","packed":true},"type":{"kind":"struct","fields":[
+      {"name":"a","type":"u8"},{"name":"inner","type":{"defined":{"name":"Inner"}}}]}},
+    {"name":"Inner","serialization":"bytemuckunsafe","repr":{"kind":"c","packed":true},"type":{"kind":"struct","fields":[
+      {"name":"x","type":"u8"},{"name":"y","type":"u64"}]}}]}"#;
+
+#[test]
+fn nested_packed_types_that_all_drop_their_layout_keep_the_bytes() {
+    let borsh = PACKED_OUTER.replace(
+        r#""serialization":"bytemuckunsafe","repr":{"kind":"c","packed":true},"#,
+        "",
+    );
+    let report = diff(&parse(PACKED_OUTER), &parse(&borsh));
+    assert_eq!(report.counts(), (0, 0, 0, 2), "{:?}", report.changes);
+}
+
+#[test]
+fn zero_copy_type_read_only_as_an_arg_is_borsh() {
+    // Instruction args are always Borsh, so the zero-copy padding before `amount` is never read.
+    let old = r#"{"address":"P","metadata":{"name":"p","version":"0.1.0","spec":"0.1.0"},
+      "instructions":[{"name":"f","discriminator":[1],"accounts":[],"args":[{"name":"r","type":{"defined":{"name":"Receipt"}}}]}],
+      "types":[{"name":"Receipt","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+        {"name":"flag","type":"u8"},{"name":"amount","type":"u64"}]}}]}"#;
+    let new = old.replace(r#""serialization":"bytemuck","repr":{"kind":"c"},"#, "");
+    let report = diff(&parse(old), &parse(&new));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["serialization and repr changed (Receipt): bytemuck repr(C) -> borsh none: only read as Borsh, which ignores both"]
+    );
+}
+
+#[test]
+fn repr_change_with_an_uncomputable_layout_is_breaking() {
+    // The IDL gives no width for `Status`, so neither layout is known, but unpacking still
+    // moves `amount` if `Status` is one byte.
+    let old = r#"{"address":"P","metadata":{"name":"p","version":"0.1.0","spec":"0.1.0"},
+      "accounts":[{"name":"Pool","discriminator":[1,1,1,1,1,1,1,1]}],
+      "types":[{"name":"Pool","serialization":"bytemuck","repr":{"kind":"c","packed":true},"type":{"kind":"struct","fields":[
+          {"name":"status","type":{"defined":{"name":"Status"}}},{"name":"amount","type":"u64"}]}},
+        {"name":"Status","type":{"kind":"enum","variants":[{"name":"Open"},{"name":"Closed"}]}}]}"#;
+    let new = old.replace(r#","packed":true"#, "");
+    let report = diff(&parse(old), &parse(&new));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["repr changed (Pool): repr(C, packed) -> repr(C): the zero-copy layout of Pool can't be computed, so a field may move: `status`: `Status` is an enum, which has no defined zero-copy layout"]
+    );
+}
+
+#[test]
+fn nested_type_serialization_does_not_change_a_zero_copy_layout() {
+    // `Cfg` is read in place inside `Pool` with the same repr, whatever its own serialization.
+    // The enum keeps the layout of `Pool` unknown, so only the inputs of that layout count.
+    let old = r#"{"address":"P","metadata":{"name":"p","version":"0.1.0","spec":"0.1.0"},
+      "accounts":[{"name":"Pool","discriminator":[1,1,1,1,1,1,1,1]}],
+      "types":[{"name":"Pool","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+          {"name":"status","type":{"defined":{"name":"Status"}}},{"name":"cfg","type":{"defined":{"name":"Cfg"}}}]}},
+        {"name":"Cfg","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+          {"name":"flag","type":"u8"},{"name":"amount","type":"u64"}]}},
+        {"name":"Status","type":{"kind":"enum","variants":[{"name":"Open"},{"name":"Closed"}]}}]}"#;
+    let new = old.replace(
+        r#"{"name":"Cfg","serialization":"bytemuck","#,
+        r#"{"name":"Cfg","#,
+    );
+    let report = diff(&parse(old), &parse(&new));
+    let messages: Vec<&str> = report.changes.iter().map(|c| c.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["serialization changed (Cfg): bytemuck -> borsh: no zero-copy reading depends on this change, so the bytes are the same"]
+    );
+}
+
+#[test]
+fn fields_with_the_same_camel_case_name_pair_by_position() {
+    // `padding_0` and `_padding_0` are both `padding0` in camelCase, as in dynamic_bonding_curve.
+    let anchor = r#"{"address":"P","metadata":{"name":"p","version":"0.1.0","spec":"0.1.0"},
+      "accounts":[{"name":"Meta","discriminator":[1,2,3,4,5,6,7,8]}],
+      "types":[{"name":"Meta","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+        {"name":"padding_0","type":{"array":["u8",8]}},{"name":"x","type":"u64"},
+        {"name":"_padding_0","type":"u8"},{"name":"y","type":{"array":["u8",7]}}]}}]}"#;
+    let mut codama =
+        parse(&anchor.replace(r#""serialization":"bytemuck","repr":{"kind":"c"},"#, ""));
+    codama.format = Format::Codama;
+    let report = diff(&parse(anchor), &codama);
+    assert_eq!(report.counts(), (0, 0, 0, 1), "{:?}", report.changes);
+}
+
+fn drift() -> std::process::Command {
+    std::process::Command::new(env!("CARGO_BIN_EXE_idl-drift"))
+}
+
+#[test]
+fn json_flag_prints_one_error_object_on_exit_2() {
+    let out = drift()
+        .args([
+            "diff",
+            "no/such/old.json",
+            "tests/fixtures/amm_new.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["error", "exit_code"]);
+    assert_eq!(json["exit_code"], 2);
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("read no/such/old.json: "));
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("error: read no/such/old.json: "));
+}
+
+#[test]
+fn closed_stdout_keeps_the_exit_code() {
+    // A reader that has already closed the pipe, such as `head -0`.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let status = drift()
+        .args([
+            "diff",
+            "tests/fixtures/amm_old.json",
+            "tests/fixtures/amm_new.json",
+        ])
+        .stdout(writer)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
 }

@@ -59,6 +59,9 @@ pub struct Instruction {
     /// Where the discriminator starts in the data (Codama only; Anchor's is at 0).
     #[serde(default)]
     pub discriminator_offset: usize,
+    /// Codama `sizeDiscriminatorNode`: the parser selects the instruction by its data length.
+    #[serde(default)]
+    pub size_discriminator: Option<usize>,
     #[serde(default)]
     pub accounts: Vec<AccountItem>,
     #[serde(default)]
@@ -76,6 +79,8 @@ pub enum AccountItem {
     Single(Account),
 }
 
+// The bools are the IDL's own account flags, one each.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Account {
     pub name: String,
@@ -83,6 +88,9 @@ pub struct Account {
     pub writable: bool,
     #[serde(default)]
     pub signer: bool,
+    /// Codama `isSigner: "either"`: `signer` is set, but the account need not sign.
+    #[serde(skip)]
+    pub may_sign: bool,
     #[serde(default)]
     pub optional: bool,
     /// Fixed address (a program or sysvar). Not part of the positional diff.
@@ -102,6 +110,9 @@ pub struct NamedDisc {
     /// Declared account size in bytes, discriminator included (Codama `size`).
     #[serde(default)]
     pub size: Option<usize>,
+    /// Codama `sizeDiscriminatorNode`: the parser selects the account by its data length.
+    #[serde(default)]
+    pub size_discriminator: Option<usize>,
     /// Explicit body start; `None` means right after the discriminator.
     #[serde(default)]
     pub payload_offset: Option<usize>,
@@ -127,6 +138,13 @@ pub struct Event {
     /// Content discriminator, such as Anchor's event sighash.
     #[serde(default)]
     pub discriminator: Discriminator,
+    /// Where the content discriminator starts, after any envelope (Codama only).
+    #[serde(default)]
+    pub discriminator_offset: usize,
+    /// More constants of a Codama chain, by offset after any envelope. Shipstern checks them
+    /// all and reads the payload after the last one.
+    #[serde(default)]
+    pub extra_discriminators: Vec<(usize, Discriminator)>,
     /// Shipstern's `cpi_event_discriminator`.
     #[serde(default)]
     pub envelope_discriminator: Discriminator,
@@ -361,6 +379,77 @@ pub enum Type {
         generics: Vec<GenericArg>,
     },
     Generic(String),
+    /// Codama inline struct: the fields in order, as Borsh writes a struct.
+    #[serde(skip)]
+    Struct(Vec<Field>),
+    /// Codama `shortU16`: 1 to 3 bytes, 7 bits in each.
+    #[serde(skip)]
+    ShortU16,
+    /// A Codama big-endian number. The inner type is the number.
+    #[serde(skip)]
+    BigEndian(Box<Type>),
+    /// A Codama `Bytes`, `String`, `Vec`, `Map` or `Set` whose length is not Borsh's `u32`.
+    #[serde(skip)]
+    Counted {
+        ty: Box<Type>,
+        count: Count,
+    },
+    /// A Codama option that is not Borsh's `Option` or Solana's `COption`.
+    #[serde(skip)]
+    CodamaOption {
+        item: Box<Type>,
+        tag: OptionTag,
+    },
+}
+
+/// Where a Codama collection gets its length.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Count {
+    /// A number of this type before the items. For `Bytes` and `String` it counts bytes.
+    Prefix(Box<Type>),
+    /// The items fill the rest of the data.
+    Remainder,
+}
+
+/// How a Codama option tells that the item is there.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OptionTag {
+    /// A number before the item: 0 for absent, 1 for present. With `fixed`, an absent
+    /// item still takes its bytes.
+    Prefix { ty: Box<Type>, fixed: bool },
+    /// No tag: an item of only zero bytes is absent.
+    Zeroable,
+    /// No tag: the item is absent when no bytes are left.
+    Remainder,
+}
+
+impl Type {
+    /// The types this one holds, so a walk over a type tree needs no list of variants.
+    /// Length and tag prefixes are numbers, not data, so they are not included.
+    #[must_use]
+    pub fn children(&self) -> Vec<&Type> {
+        match self {
+            Self::Option(inner)
+            | Self::COption(inner)
+            | Self::Vec(inner)
+            | Self::Array(inner, _)
+            | Self::Set(inner)
+            | Self::BigEndian(inner)
+            | Self::Counted { ty: inner, .. }
+            | Self::CodamaOption { item: inner, .. } => vec![inner],
+            Self::Map(key, value) => vec![key, value],
+            Self::Tuple(items) => items.iter().collect(),
+            Self::Struct(fields) => fields.iter().map(|f| &f.ty).collect(),
+            Self::Defined { generics, .. } => generics
+                .iter()
+                .filter_map(|g| match g {
+                    GenericArg::Type { ty } => Some(&**ty),
+                    GenericArg::Const { .. } => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A generic argument to a `Defined` type.
@@ -469,7 +558,7 @@ impl Idl {
 /// Codama's `camelCase`, which differs from heck on acronyms (`AMMConfig` is `aMMConfig`).
 /// Anchor 0.30 names foreign types by path (`whirlpool::state::Position`); legacy IDLs
 /// flattened the same path to `WhirlpoolStatePosition`, so `::` splits a word too.
-fn camel(name: &str) -> String {
+pub(crate) fn camel(name: &str) -> String {
     let mut spaced = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_uppercase() {
@@ -513,12 +602,16 @@ fn camel_type(ty: &mut Type) {
         | Type::COption(inner)
         | Type::Vec(inner)
         | Type::Array(inner, _)
-        | Type::Set(inner) => camel_type(inner),
+        | Type::Set(inner)
+        | Type::BigEndian(inner)
+        | Type::Counted { ty: inner, .. }
+        | Type::CodamaOption { item: inner, .. } => camel_type(inner),
         Type::Map(key, value) => {
             camel_type(key);
             camel_type(value);
         }
         Type::Tuple(items) => items.iter_mut().for_each(camel_type),
+        Type::Struct(fields) => fields.iter_mut().for_each(camel_field),
         _ => {}
     }
 }

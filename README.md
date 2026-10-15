@@ -44,8 +44,11 @@ idl-drift diff old.json new.json --fail-on dangerous
 
 Either file can be Anchor JSON (0.30 spec or legacy) or Codama `rootNode` JSON; the two
 don't have to match. Each format names things its own way (`deposit_vault`, `depositVault`),
-so when they differ, names are compared in camelCase, as Codama writes them. Struct-typed
-instruction args are compared field by field then too, since Codama inlines them. Legacy
+so when they differ, names are compared in camelCase, as Codama writes them. Then an
+instruction arg that links a struct is compared field by field, at every depth, and an arg
+that links an alias is compared as the alias target. Codama inlines only a type with one
+use, and Borsh writes a struct as its fields, so the bytes are the same. A tuple struct and
+a tuple alias also compare as the same type. Legacy
 Anchor IDLs leave discriminators out, so they are computed from the names, the way Anchor
 does. The human report lists changes by tier and ends with a summary.
 `--json` gives every change with its `severity`, `kind` (the rule, such as
@@ -57,7 +60,7 @@ For example, `idl-drift diff tests/fixtures/amm_old.json tests/fixtures/amm_new.
 
 ```
   [BREAKING] FIELD changed (Pool#1) via reachable type: feeBps: u16 -> u32 (Borsh layout)
-  [DANGEROUS] new account on instruction (swap#2): shifts count/positions -> check_min_accounts_req expects more
+  [DANGEROUS] new account on instruction (swap#2): a parser built from the new IDL reads it by index, so it fails on a transaction without it
   [ADDITIVE] new instruction: collectFees
 summary: 1 breaking, 1 dangerous, 1 additive, 0 cosmetic
 exit code: 1
@@ -68,6 +71,10 @@ exit code: 1
 | `0` | No change at or above `--fail-on` (default: Breaking) |
 | `1` | At least one change at or above `--fail-on` |
 | `2` | A file could not be read or parsed |
+
+With `--json`, a run that exits 2 prints one object to stdout,
+`{"error": "<message>", "exit_code": 2}`, and the message to stderr, as `idl-verify` does.
+A reader that closes the pipe early, such as `head`, does not change the exit code.
 
 In CI:
 
@@ -82,10 +89,11 @@ idl-drift inspect idl.json
 idl-drift inspect idl.json --layout
 ```
 
-Lists the fields whose byte layout `idl-drift` could not resolve, such as inline structs or
-Codama encodings with no Borsh equivalent (big-endian numbers, non-`u32` length prefixes,
-zeroable options). A change to such a field can't be classified, and `idl-verify` can't
-decode it, so run this before trusting a `diff` on a new IDL.
+Lists the fields whose byte layout `idl-drift` could not resolve, such as Codama hidden
+prefixes, offsets, sentinels, inline enums, or a size prefix around a struct. A change to
+such a field can't be classified, and `idl-verify` can't decode it, so run this before
+trusting a `diff` on a new IDL. Inline structs, big-endian numbers, `shortU16`, any integer
+length prefix, remainder lengths, and tagged, zeroable or remainder options are read.
 
 It also lists padded zero-copy types that Borsh also reads (`SHARED:` lines). A type inside
 a `bytemuckunsafe` account sits at `repr(C)` offsets, with implicit padding. When an
@@ -117,13 +125,19 @@ whose layout is treated as unknown.
 
 | Tier | Meaning | Rules |
 |---|---|---|
-| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Instruction removed; duplicate instruction name, or two names that differ only by ASCII case (Shipstern gives them one generated helper); instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap); account moved to another position; account removed mid-list; arg added, removed, retyped or moved; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed, retyped or moved, enum variant inserted mid-list, removed or moved, variant payload changed, alias target changed, type removed while still referenced, `serialization` or `repr` changed so that a field of a zero-copy type moves, including a nested type's `repr` (such as a converter dropping `bytemuckunsafe`) |
-| **Dangerous** | Existing positions and tags hold, but the parser must grow or its names change. Review. | Enum variant appended; account appended to an instruction; optional account removed from the tail; account `writable`, `signer` or `optional` flag changed; a field, arg, account or variant renamed in place (same type, same position, and neither name used elsewhere on the other side, otherwise it moved); discriminator collision carried over; the set of account counts under a shared discriminator changed; `serialization` or `repr` changed with no field moving but the zero-copy size changing (trailing padding) |
+| **Breaking** | The parser misreads bytes or can't route them. Fails the build. | Program address changed (the parser drops every update from the new address); instruction removed; duplicate instruction name, or two names that differ only by ASCII case (Shipstern gives them one generated helper); instruction, account or event discriminator changed (or its length, as in an Anchor to Quasar swap), including a Codama size discriminator, an event discriminator's offset, and a later constant in an event's discriminator chain; account moved to another position; account removed mid-list; arg added, removed, retyped or moved; unresolvable discriminator collision (same discriminator and account count); account or event type removed; event envelope discriminator or payload offset changed; type kind changed; and, on a reachable type: field added, removed, retyped or moved, enum variant inserted mid-list, removed or moved, variant payload changed, alias target changed, type removed while still referenced, `serialization` or `repr` changed so that a field of a zero-copy account moves (such as a converter dropping `bytemuckunsafe` from a padded type), or on a zero-copy account whose layout can't be computed (such as one that holds an enum) |
+| **Dangerous** | Existing positions and tags hold, but the parser must grow or its names change. Review. | Program renamed (the generated module name changes); enum variant appended; account appended to an instruction; optional account removed from the tail; account `writable`, `signer` or `optional` flag changed; a field, arg, account or variant renamed in place (same type, same position, and neither name used elsewhere on the other side, otherwise it moved); discriminator collision carried over; the set of account counts under a shared discriminator changed; `serialization` or `repr` changed with no field moving but the zero-copy size changing (trailing padding) |
 | **Additive** | New surface; old parsers are unaffected. | New instruction, account type or event type |
-| **Cosmetic** | No byte a parser reads changes. | Any of the layout changes above on an unreachable type; `serialization` or `repr` changed with no zero-copy field moving, or on a type only ever read as Borsh |
+| **Cosmetic** | No byte a parser reads changes. | Any of the layout changes above on an unreachable type; `serialization` or `repr` changed with no zero-copy field moving, on a type only ever read as Borsh, or where no zero-copy layout uses it (a nested type's own `serialization`) |
 
 Only Breaking sets the exit code, unless `--fail-on` lowers the bar (`dangerous`, `additive`
 or `cosmetic`).
+
+`serialization` and `repr` changes follow Shipstern's converter: only accounts are cast from
+memory, and instruction args and events are always Borsh. Each zero-copy account is read
+once with every old `serialization` and `repr` and once with every new one, and the field
+offsets are compared. So changes that cancel out, such as a converter that drops `packed`
+from an account and from each type inside it, are Cosmetic.
 
 Two rules follow Shipstern's dispatch: instructions that share a discriminator are told
 apart by account count, most first, so the same discriminator and count can't be resolved;
@@ -169,4 +183,6 @@ No test needs the network.
 
 ## License
 
-MIT OR Apache-2.0
+The code is licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your
+option. The IDLs and samples in `fixtures/`, `tests/idls/` and `shipstern-integration/` belong to their
+programs' authors. They are not covered by this license, and the crates do not ship them.

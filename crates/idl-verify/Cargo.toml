@@ -8,6 +8,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["solana", "idl", "anchor", "borsh", "zero-copy"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
 idl-drift = { path = "../..", version = "0.1.0" }

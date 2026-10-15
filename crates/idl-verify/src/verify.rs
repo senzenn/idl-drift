@@ -12,7 +12,7 @@ use crate::report::{
     AccountSummary, Check, Coverage, EventSources, EventSummary, Finding, InstructionSummary,
     ProgramInfo, Range, ReferenceSummary, Report, Severity, SizeCount,
 };
-use crate::samples::{EventSample, EventSource, Samples};
+use crate::samples::{EventSample, EventSource, KeyFlags, Samples};
 
 /// Anchor's `EVENT_IX_TAG` in little-endian: the envelope `emit_cpi!` puts before an event.
 pub(crate) const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
@@ -134,6 +134,7 @@ impl Verifier<'_> {
         let by_size = table.is_empty() && !sized.is_empty();
         // Key: the head of the error message, so each kind of miss groups on its own.
         let mut unknown: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut empty = Vec::new();
         for (i, sample) in self.samples.accounts.iter().enumerate() {
             if let Some(matches) = longest_match(&table, &sample.data) {
                 groups[matches[0]].push(i);
@@ -148,6 +149,10 @@ impl Verifier<'_> {
             let key = match fits.as_slice() {
                 [t] => {
                     groups[*t].push(i);
+                    continue;
+                }
+                [] if len == 0 => {
+                    empty.push(i);
                     continue;
                 }
                 [] if by_size => format!("{len}-byte data matches no account type size"),
@@ -179,18 +184,7 @@ impl Verifier<'_> {
                 None,
             );
         } else {
-            let hint = if by_size {
-                let known: Vec<String> = sized
-                    .iter()
-                    .map(|(t, size)| format!("{} {size}", idl.accounts[*t].name))
-                    .collect();
-                format!(
-                    "the IDL tells these accounts apart by size ({}); a longer account has room the IDL does not declare, or is a type it lacks",
-                    known.join(", ")
-                )
-            } else {
-                "the program uses an account type the IDL does not declare, or these accounts belong to another program".to_string()
-            };
+            let hint = unknown_account_hint(idl, &sized, by_size);
             for (head, idxs) in &unknown {
                 let example = self.samples.accounts[idxs[0]].address.as_str();
                 self.push(
@@ -207,6 +201,7 @@ impl Verifier<'_> {
                 );
             }
         }
+        self.report_empty_accounts(&empty);
 
         let mut summaries = Vec::new();
         let mut not_sampled = Vec::new();
@@ -219,10 +214,30 @@ impl Verifier<'_> {
         }
         let coverage = Coverage {
             sampled: self.samples.accounts.len(),
-            classified: self.samples.accounts.len() - unknown_count,
+            classified: self.samples.accounts.len() - unknown_count - empty.len(),
             not_sampled,
         };
         (coverage, summaries)
+    }
+
+    /// An account with no data is not an IDL fault, so it is a note.
+    fn report_empty_accounts(&mut self, empty: &[usize]) {
+        let Some(&first) = empty.first() else {
+            return;
+        };
+        let example = self.samples.accounts[first].address.clone();
+        self.push(
+            Severity::Note,
+            Check::Discriminator,
+            "accounts",
+            format!(
+                "{} {} no data; not checked",
+                empty.len(),
+                plural(empty.len(), "account holds", "accounts hold")
+            ),
+            Some("an account with no data has no discriminator, so no IDL can describe it; a generated parser such as Shipstern's reports it as an unknown account".into()),
+            Some(&example),
+        );
     }
 
     fn check_account_type(&mut self, nd: &NamedDisc, idxs: &[usize]) -> AccountSummary {
@@ -796,6 +811,7 @@ impl Verifier<'_> {
         self.report_trailing_args(&subject, &outcomes);
         self.report_account_counts(&subject, &flat, idxs);
         self.report_fixed_addresses(&subject, &flat, idxs);
+        self.report_account_flags(&subject, &flat, idxs);
         self.compare_instructions(&subject, ix, &outcomes);
 
         let zero = Range { min: 0, max: 0 };
@@ -1030,6 +1046,70 @@ impl Verifier<'_> {
                     Some(&example),
                 );
             }
+        }
+    }
+
+    /// A key's message flags are the union over all instructions, so only a missing privilege
+    /// is evidence. A CPI can sign for a PDA, so only top-level samples count for `signer`.
+    fn report_account_flags(&mut self, subject: &str, flat: &[&Account], idxs: &[usize]) {
+        let samples = &self.samples.instructions;
+        let program_id = self.program_id().to_string();
+        let flagged: Vec<(usize, &KeyFlags)> = idxs
+            .iter()
+            .filter_map(|&i| Some((i, samples[i].flags.as_ref()?)))
+            .collect();
+        let top_level = flagged.iter().filter(|(_, f)| !f.cpi).count();
+        let mut found = Vec::new();
+        for (pos, account) in flat.iter().enumerate() {
+            let mut read_only = Vec::new();
+            let mut unsigned = Vec::new();
+            for &(i, flags) in &flagged {
+                let Some(key) = samples[i].accounts.get(pos) else {
+                    continue;
+                };
+                // Anchor passes the program id in place of an absent optional account.
+                if account.optional && *key == program_id {
+                    continue;
+                }
+                if account.writable && flags.writable.get(pos) == Some(&false) {
+                    read_only.push((i, key.as_str()));
+                }
+                let must_sign = account.signer && !account.may_sign && !flags.cpi;
+                if must_sign && flags.signer.get(pos) == Some(&false) {
+                    unsigned.push((i, key.as_str()));
+                }
+            }
+            if let Some(&(first, key)) = read_only.first() {
+                found.push((
+                    first,
+                    format!(
+                        "account #{pos} `{}` is writable in the IDL, but the key passed there is read-only in {} (such as {key})",
+                        account.name,
+                        of_samples(read_only.len(), flagged.len())
+                    ),
+                ));
+            }
+            if let Some(&(first, key)) = unsigned.first() {
+                found.push((
+                    first,
+                    format!(
+                        "account #{pos} `{}` is a signer in the IDL, but the key passed there does not sign the transaction in {} (top-level calls only; such as {key})",
+                        account.name,
+                        of_samples(unsigned.len(), top_level)
+                    ),
+                ));
+            }
+        }
+        for (first, message) in found {
+            let example = samples[first].signature.clone();
+            self.push(
+                Severity::Error,
+                Check::AccountFlags,
+                subject,
+                message,
+                Some("the IDL's account order likely does not match the program, or an earlier account is missing".into()),
+                Some(&example),
+            );
         }
     }
 
@@ -1307,6 +1387,21 @@ impl Verifier<'_> {
     }
 }
 
+fn unknown_account_hint(idl: &Idl, sized: &[(usize, usize)], by_size: bool) -> String {
+    if by_size {
+        let known: Vec<String> = sized
+            .iter()
+            .map(|(t, size)| format!("{} {size}", idl.accounts[*t].name))
+            .collect();
+        format!(
+            "the IDL tells these accounts apart by size ({}); a longer account has room the IDL does not declare, or is a type it lacks",
+            known.join(", ")
+        )
+    } else {
+        "the program uses an account type the IDL does not declare, or these accounts belong to another program".to_string()
+    }
+}
+
 /// The self-CPI envelope before an event: the bytes it starts with, and its length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Envelope<'a> {
@@ -1471,7 +1566,7 @@ fn flatten(items: &[AccountItem]) -> Vec<&Account> {
 
 pub(crate) fn prefix_hex(data: &[u8]) -> String {
     if data.is_empty() {
-        return "no data".to_string();
+        return "empty data".to_string();
     }
     let mut out = String::from("0x");
     for b in data.iter().take(8) {
@@ -1592,6 +1687,7 @@ mod tests {
                     signature: "sig".into(),
                     data: data.to_vec(),
                     accounts: keys.iter().map(ToString::to_string).collect(),
+                    flags: None,
                 })
                 .collect(),
             events: Vec::new(),
@@ -1728,6 +1824,40 @@ mod tests {
     }
 
     #[test]
+    fn accounts_with_no_data_are_a_note_not_an_error() {
+        // perpetuals owns an empty account on mainnet; no discriminator can match it.
+        let mut samples = accounts(&[&[5, 0, 0, 0]]);
+        samples.accounts.push(AccountSample {
+            address: "empty".into(),
+            data: Vec::new(),
+        });
+        let report = verify(&account_idl(U32_TYPE), &samples, None);
+        let f = only(&report);
+        assert_eq!(
+            (
+                f.severity,
+                f.check,
+                f.message.as_str(),
+                f.example.as_deref()
+            ),
+            (
+                Severity::Note,
+                Check::Discriminator,
+                "1 account holds no data; not checked",
+                Some("empty")
+            )
+        );
+        assert_eq!(report.exit_code(), 0);
+        assert_eq!(
+            (
+                report.account_coverage.sampled,
+                report.account_coverage.classified
+            ),
+            (2, 1)
+        );
+    }
+
+    #[test]
     fn idl_without_discriminators_says_so() {
         // A string field leaves no fixed size to tell accounts apart by.
         let idl = idl(
@@ -1825,6 +1955,109 @@ mod tests {
             "[]",
         );
         let report = verify(&idl, &instructions(&[(&[1], &["P"])]), None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    fn go(accounts: &str) -> Idl {
+        idl(
+            "[]",
+            &format!(r#"[{{"name":"go","discriminator":[1],"accounts":{accounts}}}]"#),
+            "[]",
+        )
+    }
+
+    /// One `go` sample: its keys, `(signer, writable)` per key, and whether it is a CPI.
+    fn flagged(keys: &[&str], flags: &[(bool, bool)], cpi: bool) -> Samples {
+        let mut samples = instructions(&[(&[1], keys)]);
+        samples.instructions[0].flags = Some(KeyFlags {
+            signer: flags.iter().map(|f| f.0).collect(),
+            writable: flags.iter().map(|f| f.1).collect(),
+            cpi,
+        });
+        samples
+    }
+
+    fn flag_findings(report: &Report) -> Vec<String> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.check == Check::AccountFlags)
+            .map(|f| f.message.clone())
+            .collect()
+    }
+
+    /// The program takes `vault` (writable), then `authority` (signer).
+    const SWAPPED: &str =
+        r#"[{"name":"authority","signer":true},{"name":"vault","writable":true}]"#;
+    const VAULT_THEN_AUTH: [(bool, bool); 2] = [(false, true), (true, false)];
+
+    #[test]
+    fn swapped_accounts_lack_the_privileges_the_idl_gives_them() {
+        let samples = flagged(&["Vault", "Auth"], &VAULT_THEN_AUTH, false);
+        let found = flag_findings(&verify(&go(SWAPPED), &samples, None));
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(
+            found[0].contains("#0 `authority` is a signer"),
+            "{found:#?}"
+        );
+        assert!(found[1].contains("#1 `vault` is writable"), "{found:#?}");
+        // A CPI can sign for a PDA, so only the writable check holds there.
+        let samples = flagged(&["Vault", "Auth"], &VAULT_THEN_AUTH, true);
+        let found = flag_findings(&verify(&go(SWAPPED), &samples, None));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("`vault` is writable"), "{found:#?}");
+    }
+
+    #[test]
+    fn a_dropped_account_shifts_a_read_only_key_into_a_writable_slot() {
+        // The program takes `authority`, `mint`, `vault`; the IDL lost `mint`.
+        let idl = go(r#"[{"name":"authority","signer":true},{"name":"vault","writable":true}]"#);
+        let samples = flagged(
+            &["Auth", "Mint", "Vault"],
+            &[(true, false), (false, false), (false, true)],
+            false,
+        );
+        let found = flag_findings(&verify(&idl, &samples, None));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].contains("#1 `vault` is writable in the IDL, but the key passed there is read-only in 1 of 1 sample (such as Mint)"),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn extra_privileges_absent_optionals_and_either_signers_are_not_errors() {
+        let mut idl = go(
+            r#"[{"name":"authority","signer":true},{"name":"vault","writable":true},
+            {"name":"mint"},{"name":"payer","signer":true},{"name":"rent","optional":true,"writable":true}]"#,
+        );
+        // Codama `isSigner: "either"`.
+        if let AccountItem::Single(payer) = &mut idl.instructions[0].accounts[3] {
+            payer.may_sign = true;
+        }
+        let samples = flagged(
+            &["Auth", "Vault", "Mint", "Payer", "P"],
+            &[
+                (true, true),
+                (false, true),
+                (false, true),
+                (false, false),
+                (false, false),
+            ],
+            false,
+        );
+        let report = verify(&idl, &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn samples_without_flags_load_and_skip_the_check() {
+        let samples = Samples::from_json(
+            r#"{"instructions":[{"signature":"S","data":"AQ==","accounts":["Vault","Auth"]}]}"#,
+        )
+        .unwrap();
+        assert!(samples.instructions[0].flags.is_none());
+        let report = verify(&go(SWAPPED), &samples, None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
     }
 

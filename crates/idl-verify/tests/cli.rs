@@ -11,6 +11,7 @@ fn idl_verify(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_idl-verify"))
         .args(args)
         .env("NO_COLOR", "1")
+        .env_remove("IDL_VERIFY_RPC_URL")
         .output()
         .unwrap()
 }
@@ -121,14 +122,35 @@ fn reads_the_rpc_url_from_the_environment() {
 
 #[test]
 fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
-    let empty = std::env::temp_dir().join("idl-verify-empty-samples.json");
+    let dir = std::env::temp_dir();
+    let empty = dir.join("idl-verify-empty-samples.json");
     std::fs::write(&empty, "{}").unwrap();
-    let cases: [(&[&str], &str); 3] = [
+    let no_data = dir.join("idl-verify-no-data-samples.json");
+    std::fs::write(&no_data, r#"{"accounts":[{"address":"A","data":""}]}"#).unwrap();
+    let saved = dir.join("idl-verify-not-saved.json");
+    let samples = live("voltr_vault/samples.json");
+    let cases: [(&[&str], &str); 5] = [
         (&["--samples", empty.to_str().unwrap()], "holds no samples"),
+        (
+            &["--samples", no_data.to_str().unwrap()],
+            "only accounts with no data",
+        ),
         (&["--rpc", " "], "the RPC URL is empty"),
         (
             &["--rpc", "http://127.0.0.1:9/k", "--program", "not-a-key"],
             "is not a base58 program address",
+        ),
+        // The env var can supply --rpc, but --samples still wins, so nothing would be saved.
+        (
+            &[
+                "--samples",
+                &samples,
+                "--rpc",
+                "http://127.0.0.1:9/k",
+                "--save-samples",
+                saved.to_str().unwrap(),
+            ],
+            "--save-samples saves only live samples",
         ),
     ];
     let idl = live("voltr_vault/idl.json");
@@ -140,4 +162,86 @@ fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
         assert!(stderr.contains(message), "{args:?}: {stderr}");
     }
+    assert!(!saved.exists());
+}
+
+#[test]
+fn json_exit_2_prints_one_error_object() {
+    let idl = live("voltr_vault/idl.json");
+    let cases: [&[&str]; 3] = [
+        &["--idl", "does-not-exist.json", "--samples", &idl],
+        &["--idl", &idl, "--samples", &idl],
+        &["--idl", &idl, "--rpc", "http://127.0.0.1:9/k"],
+    ];
+    for args in cases {
+        let mut all = args.to_vec();
+        all.push("--json");
+        let out = idl_verify(&all);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        // The human message stays on stderr; stdout holds the same text as JSON.
+        let message = stderr.trim().strip_prefix("error: ").unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"error": message, "exit_code": 2}),
+            "{args:?}"
+        );
+    }
+    // A usage error that clap reports exits 2 too.
+    let out = idl_verify(&["--idl", &idl, "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["exit_code"], 2);
+    assert!(
+        json["error"].as_str().unwrap().contains("--samples"),
+        "{json}"
+    );
+}
+
+#[test]
+fn fail_on_warning_exits_1_on_a_narrowed_field() {
+    use base64::Engine;
+    // The program writes `amount` as a u64; the IDL says u32. Borsh leaves 4 non-zero bytes.
+    let dir = std::env::temp_dir().join("idl-verify-fail-on");
+    std::fs::create_dir_all(&dir).unwrap();
+    let idl = dir.join("idl.json");
+    std::fs::write(
+        &idl,
+        r#"{"address":"11111111111111111111111111111111","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+            "instructions":[],"accounts":[{"name":"Pool","discriminator":[1,2,3,4,5,6,7,8]}],
+            "types":[{"name":"Pool","type":{"kind":"struct","fields":[
+                {"name":"name","type":"string"},{"name":"amount","type":"u32"}]}}]}"#,
+    )
+    .unwrap();
+    let mut data = vec![1, 2, 3, 4, 5, 6, 7, 8, 2, 0, 0, 0, b'a', b'b'];
+    data.extend((1u64 << 32 | 5).to_le_bytes());
+    let data = base64::engine::general_purpose::STANDARD.encode(data);
+    let samples = dir.join("samples.json");
+    std::fs::write(
+        &samples,
+        format!(r#"{{"accounts":[{{"address":"A","data":"{data}"}}]}}"#),
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--idl",
+            idl.to_str().unwrap(),
+            "--samples",
+            samples.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = idl_verify(&args);
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (
+            out.status.code(),
+            report["exit_code"].clone(),
+            report["counts"].clone(),
+        )
+    };
+    let counts = serde_json::json!({"errors": 0, "warnings": 1, "notes": 0});
+    assert_eq!(run(&[]), (Some(0), 0.into(), counts.clone()));
+    assert_eq!(run(&["--fail-on", "warning"]), (Some(1), 1.into(), counts));
 }

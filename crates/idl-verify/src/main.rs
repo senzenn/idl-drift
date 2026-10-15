@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use idl_drift::model::Idl;
 use idl_verify::rpc::{sample, Limits};
-use idl_verify::{run_decoder, verify, Error, Reference, Report, Samples, SamplingSummary};
+use idl_verify::{
+    run_decoder, verify, Error, Reference, Report, Samples, SamplingSummary, Severity,
+};
 use serde_json::{json, Value};
 
 /// Check a Solana program IDL against real account and instruction data.
@@ -18,8 +20,8 @@ use serde_json::{json, Value};
 #[derive(Parser)]
 #[command(name = "idl-verify", version, about, long_about)]
 #[command(after_help = "Exit codes:
-  0  no errors (warnings and notes may be present)
-  1  at least one error
+  0  no finding at or above --fail-on (notes may be present)
+  1  at least one finding at or above --fail-on (default: error)
   2  idl-verify could not run: a file could not be read or parsed, the RPC or the
      decoder failed, or nothing was sampled")]
 struct Cli {
@@ -63,25 +65,86 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["reference", "decoder"])]
     compare_idl: Option<PathBuf>,
     /// Write what a live run sampled to this file, to rerun it offline with --samples.
+    /// Live runs only: it cannot be combined with --samples.
     #[arg(long, value_name = "PATH", requires = "rpc")]
     save_samples: Option<PathBuf>,
+    /// Fail (exit 1) when less than this percent of the IDL's account types, instructions
+    /// or events have a sample. Without it, a run passes on any number of samples.
+    #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..=100))]
+    min_coverage: Option<u8>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
+    /// Lowest severity that sets exit code 1.
+    #[arg(long, value_enum, default_value_t = Tier::Error)]
+    fail_on: Tier,
+}
+
+/// `Severity` as a CLI value; the lib enum stays free of clap.
+#[derive(Clone, Copy, ValueEnum)]
+enum Tier {
+    Error,
+    Warning,
+}
+
+impl From<Tier> for Severity {
+    fn from(tier: Tier) -> Self {
+        match tier {
+            Tier::Error => Self::Error,
+            Tier::Warning => Self::Warning,
+        }
+    }
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version are not errors; a usage error exits 2, so JSON must say so.
+            if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+                let text = e.to_string();
+                let text = text.trim();
+                print_error_json(text.strip_prefix("error: ").unwrap_or(text));
+            }
+            e.exit()
+        }
+    };
     match run(&cli) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let _ = writeln!(io::stderr(), "error: {e}");
+            // A failed report write can leave part of a JSON object; do not add a second one.
+            if cli.json && !matches!(e, Error::Write(_)) {
+                print_error_json(&e.to_string());
+            }
             ExitCode::from(2)
         }
     }
 }
 
+/// The `--json` form of a run that exits 2. The keys are the same as in `idl-drift`.
+fn print_error_json(message: &str) {
+    let _ = writeln!(
+        io::stdout(),
+        "{:#}",
+        json!({ "error": message, "exit_code": 2 })
+    );
+}
+
+/// Only accounts with no data give nothing to check, since no IDL can describe them.
+fn nothing_to_check(samples: &Samples) -> bool {
+    samples.accounts.iter().all(|a| a.data.is_empty())
+        && samples.instructions.is_empty()
+        && samples.events.is_empty()
+}
+
 fn run(cli: &Cli) -> Result<u8, Error> {
+    // `--samples` wins over `--rpc`, so a save request would write nothing.
+    if cli.samples.is_some() && cli.save_samples.is_some() {
+        return Err(Error::Usage(
+            "--save-samples saves only live samples, and --samples turns live sampling off; drop one of the two".into(),
+        ));
+    }
     let idl_src = read(&cli.idl)?;
     let idl = Idl::from_json(&idl_src).map_err(|source| Error::Idl {
         path: cli.idl.clone(),
@@ -89,12 +152,9 @@ fn run(cli: &Cli) -> Result<u8, Error> {
     })?;
     let (samples, sampling) = if let Some(path) = &cli.samples {
         let samples = Samples::from_json(&read(path)?)?;
-        if samples.accounts.is_empty()
-            && samples.instructions.is_empty()
-            && samples.events.is_empty()
-        {
+        if nothing_to_check(&samples) {
             return Err(Error::NothingSampled(format!(
-                "{} holds no samples",
+                "{} holds no samples, or only accounts with no data",
                 path.display()
             )));
         }
@@ -131,7 +191,7 @@ fn run(cli: &Cli) -> Result<u8, Error> {
         let sampled = sample(call, &idl, program, &limits)?;
         let s = &sampled.samples;
         // A run that saw nothing has checked nothing; passing it would hide a wrong address.
-        if s.accounts.is_empty() && s.instructions.is_empty() && s.events.is_empty() {
+        if nothing_to_check(s) {
             return Err(Error::NothingSampled(format!(
                 "read {} successful transactions of {program} and found no instruction, account or event of it; check the program address",
                 sampled.transactions
@@ -172,8 +232,12 @@ fn run(cli: &Cli) -> Result<u8, Error> {
 
     let mut report = verify(&idl, &samples, reference.as_ref());
     report.sampling = sampling;
-    print(&report, cli.json).map_err(Error::Write)?;
-    Ok(report.exit_code())
+    if let Some(min) = cli.min_coverage {
+        report.require_coverage(min);
+    }
+    let code = u8::from(report.fails_at(cli.fail_on.into()));
+    print(&report, cli.json, code).map_err(Error::Write)?;
+    Ok(code)
 }
 
 /// One JSON-RPC request, retried with backoff on rate limits and server errors. Errors
@@ -222,12 +286,14 @@ fn read(path: &Path) -> Result<String, Error> {
     })
 }
 
-fn print(report: &Report, json: bool) -> io::Result<()> {
+fn print(report: &Report, json: bool, exit_code: u8) -> io::Result<()> {
     let stdout = io::stdout();
     let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = stdout.lock();
     if json {
-        let text = report.to_json().map_err(io::Error::other)?;
+        let text = report
+            .to_json_with_exit_code(exit_code)
+            .map_err(io::Error::other)?;
         writeln!(out, "{text}")
     } else {
         report.write_human(&mut out, color)

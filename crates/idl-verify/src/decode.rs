@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use idl_drift::model::{ArrayLen, EnumFields, Field, GenericArg, Type, TypeDef, TypeDefTy};
+use idl_drift::model::{
+    ArrayLen, Count, EnumFields, Field, GenericArg, OptionTag, Type, TypeDef, TypeDefTy,
+};
 
 use crate::layout::{LayoutError, TypeIndex, MAX_DEPTH};
 
@@ -66,13 +68,15 @@ pub enum DecodeErrorKind {
     UnexpectedEnd { needed: usize, remaining: usize },
     TooLong { len: usize, remaining: usize },
     InvalidBool(u8),
-    InvalidOptionTag(u8),
+    InvalidOptionTag(u128),
     InvalidCOptionTag(u32),
     InvalidEnumTag { tag: u64, variants: usize },
     InvalidUtf8,
+    InvalidShortU16,
     UndefinedType(String),
     UnresolvedGeneric(String),
     Unsupported(String),
+    ZeroSizedItems(String),
     TooDeep,
     Layout(LayoutError),
 }
@@ -141,12 +145,17 @@ impl fmt::Display for DecodeErrorKind {
                 write!(f, "enum tag {tag} is out of range ({variants} variants)")
             }
             Self::InvalidUtf8 => f.write_str("string is not valid UTF-8"),
+            Self::InvalidShortU16 => f.write_str("shortU16 is not in its shortest form"),
             Self::UndefinedType(name) => write!(f, "type `{name}` is not defined in the IDL"),
             Self::UnresolvedGeneric(name) => write!(
                 f,
                 "`{name}` is an unbound generic or an encoding idl-verify cannot decode"
             ),
             Self::Unsupported(what) => f.write_str(what),
+            Self::ZeroSizedItems(item) => write!(
+                f,
+                "borsh refuses a collection of `{item}` because that type holds no data; the IDL may lack its fields"
+            ),
             Self::TooDeep => write!(f, "types nest deeper than {MAX_DEPTH} levels"),
             Self::Layout(e) => write!(f, "{e}"),
         }
@@ -305,18 +314,159 @@ impl<'a> Decoder<'a> {
         &self,
         r: &mut Reader<'_>,
         item: &Type,
-        len: usize,
+        len: Option<usize>,
         scope: &Scope,
         depth: usize,
     ) -> Result<Value, DecodeError> {
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            out.push(
-                self.value(r, item, scope, depth + 1)
-                    .map_err(|e| e.within(format!("[{i}]")))?,
-            );
-        }
-        Ok(Value::List(out))
+        repeat(r, len, |r| self.value(r, item, scope, depth + 1)).map(Value::List)
+    }
+
+    fn map(
+        &self,
+        r: &mut Reader<'_>,
+        (key, value): (&Type, &Type),
+        len: Option<usize>,
+        scope: &Scope,
+        depth: usize,
+    ) -> Result<Value, DecodeError> {
+        repeat(r, len, |r| {
+            let k = self.value(r, key, scope, depth + 1)?;
+            let v = self.value(r, value, scope, depth + 1)?;
+            Ok((k, v))
+        })
+        .map(Value::Map)
+    }
+
+    /// A Codama collection: the length comes from `count`, not from a Borsh `u32`.
+    fn counted(
+        &self,
+        r: &mut Reader<'_>,
+        ty: &Type,
+        count: &Count,
+        scope: &Scope,
+        depth: usize,
+    ) -> Result<Value, DecodeError> {
+        let at = r.pos;
+        let len = match count {
+            Count::Prefix(prefix) => Some(self.prefix(r, prefix, depth)?),
+            Count::Remainder => None,
+        };
+        let fits = |r: &Reader<'_>, min| len.map(|n| r.fits(at, n, min)).transpose();
+        Ok(match ty {
+            Type::Bytes | Type::String => {
+                let len = fits(r, 1)?.unwrap_or_else(|| r.remaining());
+                let start = r.pos;
+                let bytes = r.take(len)?;
+                if matches!(ty, Type::Bytes) {
+                    Value::Bytes(bytes.to_vec())
+                } else {
+                    let s = std::str::from_utf8(bytes)
+                        .map_err(|_| DecodeError::new(start, DecodeErrorKind::InvalidUtf8))?;
+                    Value::String(s.to_string())
+                }
+            }
+            Type::Vec(item) | Type::Set(item) => {
+                let len = fits(r, self.min_size(item, 0))?;
+                self.list(r, item, len, scope, depth)?
+            }
+            Type::Map(key, value) => {
+                let min = self
+                    .min_size(key, 0)
+                    .saturating_add(self.min_size(value, 0));
+                let len = fits(r, min)?;
+                self.map(r, (key, value), len, scope, depth)?
+            }
+            _ => {
+                return Err(DecodeError::new(
+                    at,
+                    DecodeErrorKind::Unsupported(format!("a length on `{ty:?}`")),
+                ))
+            }
+        })
+    }
+
+    /// A Codama option without Borsh's `u8` tag.
+    fn codama_option(
+        &self,
+        r: &mut Reader<'_>,
+        item: &Type,
+        tag: &OptionTag,
+        scope: &Scope,
+        depth: usize,
+    ) -> Result<Value, DecodeError> {
+        let present = match tag {
+            OptionTag::Prefix { ty, fixed } => {
+                let at = r.pos;
+                match self.prefix(r, ty, depth)? {
+                    0 => {
+                        if *fixed {
+                            r.take(self.fixed_size(item, scope, r.pos, "fixed option")?)?;
+                        }
+                        false
+                    }
+                    1 => true,
+                    t => return Err(DecodeError::new(at, DecodeErrorKind::InvalidOptionTag(t))),
+                }
+            }
+            OptionTag::Zeroable => {
+                let size = self.fixed_size(item, scope, r.pos, "zeroable option")?;
+                let at = r.pos;
+                let zero = r.take(size)?.iter().all(|b| *b == 0);
+                if !zero {
+                    r.pos = at;
+                }
+                !zero
+            }
+            OptionTag::Remainder => r.remaining() > 0,
+        };
+        Ok(Value::Option(if present {
+            Some(Box::new(self.value(r, item, scope, depth + 1)?))
+        } else {
+            None
+        }))
+    }
+
+    /// Read a length or tag prefix, which can be any integer type.
+    fn prefix(&self, r: &mut Reader<'_>, ty: &Type, depth: usize) -> Result<u128, DecodeError> {
+        let at = r.pos;
+        let n = match self.value(r, ty, &Scope::new(), depth + 1)? {
+            Value::U8(v) => Some(u128::from(v)),
+            Value::U16(v) => Some(u128::from(v)),
+            Value::U32(v) => Some(u128::from(v)),
+            Value::U64(v) => Some(u128::from(v)),
+            Value::U128(v) => Some(v),
+            Value::I8(v) => u128::try_from(v).ok(),
+            Value::I16(v) => u128::try_from(v).ok(),
+            Value::I32(v) => u128::try_from(v).ok(),
+            Value::I64(v) => u128::try_from(v).ok(),
+            Value::I128(v) => u128::try_from(v).ok(),
+            _ => None,
+        };
+        n.ok_or_else(|| {
+            DecodeError::new(
+                at,
+                DecodeErrorKind::Unsupported("a prefix that is not a positive integer".to_string()),
+            )
+        })
+    }
+
+    /// The Borsh size of `ty`, for an option that keeps the item's bytes when it is absent.
+    fn fixed_size(
+        &self,
+        ty: &Type,
+        scope: &Scope,
+        at: usize,
+        what: &str,
+    ) -> Result<usize, DecodeError> {
+        self.types
+            .borsh_size(&subst(ty, scope))
+            .map_err(|e| DecodeError::new(at, DecodeErrorKind::Layout(e)))?
+            .ok_or_else(|| {
+                DecodeError::new(
+                    at,
+                    DecodeErrorKind::Unsupported(format!("{what} of a variable-size type")),
+                )
+            })
     }
 
     // One arm per IDL type; splitting it would only scatter the dispatch.
@@ -372,7 +522,12 @@ impl<'a> Decoder<'a> {
                 match r.u8()? {
                     0 => Value::Option(None),
                     1 => Value::Option(Some(Box::new(self.value(r, inner, scope, depth + 1)?))),
-                    t => return Err(DecodeError::new(at, DecodeErrorKind::InvalidOptionTag(t))),
+                    t => {
+                        return Err(DecodeError::new(
+                            at,
+                            DecodeErrorKind::InvalidOptionTag(u128::from(t)),
+                        ))
+                    }
                 }
             }
             Type::COption(inner) => {
@@ -380,19 +535,7 @@ impl<'a> Decoder<'a> {
                 match u32::from_le_bytes(r.array()?) {
                     // The value's bytes are present, zeroed, even when there is none.
                     0 => {
-                        let size = self
-                            .types
-                            .borsh_size(&subst(inner, scope))
-                            .map_err(|e| DecodeError::new(r.pos, DecodeErrorKind::Layout(e)))?
-                            .ok_or_else(|| {
-                                DecodeError::new(
-                                    r.pos,
-                                    DecodeErrorKind::Unsupported(
-                                        "coption of a variable-size type".to_string(),
-                                    ),
-                                )
-                            })?;
-                        r.take(size)?;
+                        r.take(self.fixed_size(inner, scope, r.pos, "coption")?)?;
                         Value::Option(None)
                     }
                     1 => Value::Option(Some(Box::new(self.value(r, inner, scope, depth + 1)?))),
@@ -400,8 +543,15 @@ impl<'a> Decoder<'a> {
                 }
             }
             Type::Vec(item) | Type::Set(item) => {
+                // Borsh refuses before it reads the length, so an empty collection fails too.
+                if self.is_zero_sized(item, scope, depth) {
+                    return Err(DecodeError::new(
+                        r.pos,
+                        DecodeErrorKind::ZeroSizedItems(type_label(item)),
+                    ));
+                }
                 let len = r.len_prefix(self.min_size(item, 0))?;
-                self.list(r, item, len, scope, depth)?
+                self.list(r, item, Some(len), scope, depth)?
             }
             Type::Array(item, len) => {
                 let at = r.pos;
@@ -418,24 +568,26 @@ impl<'a> Decoder<'a> {
                         DecodeErrorKind::TooLong { len, remaining },
                     ));
                 }
-                self.list(r, item, len, scope, depth)?
+                self.list(r, item, Some(len), scope, depth)?
             }
             Type::Map(key, value) => {
+                // Shipstern reads a map as a Vec of key-value structs, so only empty pairs fail.
+                if self.is_zero_sized(key, scope, depth) && self.is_zero_sized(value, scope, depth)
+                {
+                    return Err(DecodeError::new(
+                        r.pos,
+                        DecodeErrorKind::ZeroSizedItems(format!(
+                            "({}, {})",
+                            type_label(key),
+                            type_label(value)
+                        )),
+                    ));
+                }
                 let min = self
                     .min_size(key, 0)
                     .saturating_add(self.min_size(value, 0));
                 let len = r.len_prefix(min)?;
-                let mut out = Vec::with_capacity(len);
-                for i in 0..len {
-                    let k = self
-                        .value(r, key, scope, depth + 1)
-                        .map_err(|e| e.within(format!("[{i}]")))?;
-                    let v = self
-                        .value(r, value, scope, depth + 1)
-                        .map_err(|e| e.within(format!("[{i}]")))?;
-                    out.push((k, v));
-                }
-                Value::Map(out)
+                self.map(r, (key, value), Some(len), scope, depth)?
             }
             Type::Tuple(items) => self.tuple(r, items, scope, depth)?,
             Type::Defined { name, generics } => {
@@ -452,7 +604,69 @@ impl<'a> Decoder<'a> {
                     ))
                 }
             },
+            Type::Struct(fields) => self.fields(r, fields, scope, depth)?,
+            Type::ShortU16 => Value::U16(r.short_u16()?),
+            Type::BigEndian(inner) => r.big_endian(inner)?,
+            Type::Counted { ty, count } => self.counted(r, ty, count, scope, depth)?,
+            Type::CodamaOption { item, tag } => self.codama_option(r, item, tag, scope, depth)?,
         })
+    }
+
+    /// `true` when Rust stores `ty` in zero bytes. Borsh refuses a Vec of such items. A fixed
+    /// array is never zero-sized here: Shipstern stores it as a `Vec`.
+    fn is_zero_sized(&self, ty: &Type, scope: &Scope, depth: usize) -> bool {
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        match ty {
+            Type::Tuple(items) => self.all_zero_sized(items.iter(), scope, depth),
+            // A Codama struct type node, written inline instead of as a defined type.
+            Type::Struct(fields) => self.all_zero_sized(fields.iter().map(|f| &f.ty), scope, depth),
+            Type::Generic(name) => match scope.get(name) {
+                Some(GenericArg::Type { ty }) => self.is_zero_sized(ty, &Scope::new(), depth + 1),
+                _ => false,
+            },
+            Type::Defined { name, generics } => {
+                let Some(td) = self.types.get(name) else {
+                    return false;
+                };
+                let Ok(inner) = bind(td, generics, scope) else {
+                    return false;
+                };
+                match &td.ty {
+                    TypeDefTy::Struct { fields } => {
+                        self.all_zero_sized(fields.iter().map(|f| &f.ty), &inner, depth)
+                    }
+                    TypeDefTy::Type { alias } => self.is_zero_sized(alias, &inner, depth + 1),
+                    // A Rust enum with one variant stores no tag.
+                    TypeDefTy::Enum {
+                        variants,
+                        tag: None,
+                    } => match variants.as_slice() {
+                        [only] => match &only.fields {
+                            EnumFields::Named(fields) => {
+                                self.all_zero_sized(fields.iter().map(|f| &f.ty), &inner, depth)
+                            }
+                            EnumFields::Tuple(items) => {
+                                self.all_zero_sized(items.iter(), &inner, depth)
+                            }
+                        },
+                        _ => false,
+                    },
+                    TypeDefTy::Enum { .. } => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn all_zero_sized<'t>(
+        &self,
+        mut types: impl Iterator<Item = &'t Type>,
+        scope: &Scope,
+        depth: usize,
+    ) -> bool {
+        types.all(|ty| self.is_zero_sized(ty, scope, depth + 1))
     }
 
     /// Smallest Borsh encoding of `ty`, used to reject length prefixes the data cannot hold.
@@ -461,7 +675,7 @@ impl<'a> Decoder<'a> {
             return 0;
         }
         match ty {
-            Type::Bool | Type::U8 | Type::I8 | Type::Option(_) => 1,
+            Type::Bool | Type::U8 | Type::I8 | Type::Option(_) | Type::ShortU16 => 1,
             Type::U16 | Type::I16 => 2,
             Type::U32
             | Type::I32
@@ -479,6 +693,28 @@ impl<'a> Decoder<'a> {
                 self.min_size(item, depth + 1).saturating_mul(*len)
             }
             Type::Tuple(items) => self.min_sum(items.iter(), depth),
+            Type::Struct(fields) => self.min_sum(fields.iter().map(|f| &f.ty), depth),
+            Type::BigEndian(inner)
+            | Type::Counted {
+                count: Count::Prefix(inner),
+                ..
+            }
+            | Type::CodamaOption {
+                item: inner,
+                tag: OptionTag::Zeroable,
+            }
+            | Type::CodamaOption {
+                tag:
+                    OptionTag::Prefix {
+                        ty: inner,
+                        fixed: false,
+                    },
+                ..
+            } => self.min_size(inner, depth + 1),
+            Type::CodamaOption {
+                item,
+                tag: OptionTag::Prefix { ty, fixed: true },
+            } => self.min_sum([&**ty, &**item].into_iter(), depth),
             Type::Defined { name, .. } => match self.types.get(name).map(|td| &td.ty) {
                 Some(TypeDefTy::Struct { fields }) => {
                     self.min_sum(fields.iter().map(|f| &f.ty), depth)
@@ -488,7 +724,16 @@ impl<'a> Decoder<'a> {
                 Some(TypeDefTy::Enum { tag: Some(tag), .. }) => self.min_size(tag, depth + 1),
                 None => 0,
             },
-            Type::Array(_, ArrayLen::Generic(_)) | Type::Generic(_) => 0,
+            Type::Array(_, ArrayLen::Generic(_))
+            | Type::Generic(_)
+            | Type::Counted {
+                count: Count::Remainder,
+                ..
+            }
+            | Type::CodamaOption {
+                tag: OptionTag::Remainder,
+                ..
+            } => 0,
         }
     }
 
@@ -604,6 +849,17 @@ impl<'a> Decoder<'a> {
                 self.value(&mut r, ty, &Scope::new(), depth)
             }
         }
+    }
+}
+
+/// A short name for `ty` in an error message.
+fn type_label(ty: &Type) -> String {
+    match ty {
+        Type::Defined { name, .. } | Type::Generic(name) => name.clone(),
+        Type::Tuple(items) if items.is_empty() => "()".to_string(),
+        Type::Tuple(_) => "tuple".to_string(),
+        Type::Struct(_) => "struct".to_string(),
+        _ => "item".to_string(),
     }
 }
 
@@ -731,8 +987,14 @@ impl<'d> Reader<'d> {
     fn len_prefix(&mut self, min_item: usize) -> Result<usize, DecodeError> {
         let at = self.pos;
         let raw = u32::from_le_bytes(self.array()?);
+        self.fits(at, u128::from(raw), min_item)
+    }
+
+    /// `len` items of at least `min_item` bytes each, if the remaining bytes can hold them.
+    /// `at` is where the length was read, for the error.
+    fn fits(&self, at: usize, len: u128, min_item: usize) -> Result<usize, DecodeError> {
         let remaining = self.remaining();
-        let len = usize::try_from(raw).unwrap_or(usize::MAX);
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
         let fits = match min_item {
             0 => len <= remaining,
             n => len <= remaining / n,
@@ -746,6 +1008,70 @@ impl<'d> Reader<'d> {
             ))
         }
     }
+
+    /// Solana's compact `u16`, read as Shipstern reads it: 1 to 3 bytes, shortest form only.
+    fn short_u16(&mut self) -> Result<u16, DecodeError> {
+        let at = self.pos;
+        let mut value = 0u16;
+        for index in 0..3 {
+            let byte = self.u8()?;
+            if (index == 2 && byte > 3) || (index > 0 && byte == 0) {
+                return Err(DecodeError::new(at, DecodeErrorKind::InvalidShortU16));
+            }
+            value |= u16::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        Ok(value)
+    }
+
+    fn big_endian(&mut self, ty: &Type) -> Result<Value, DecodeError> {
+        Ok(match ty {
+            Type::U8 => Value::U8(self.u8()?),
+            Type::I8 => Value::I8(i8::from_be_bytes(self.array()?)),
+            Type::U16 => Value::U16(u16::from_be_bytes(self.array()?)),
+            Type::I16 => Value::I16(i16::from_be_bytes(self.array()?)),
+            Type::U32 => Value::U32(u32::from_be_bytes(self.array()?)),
+            Type::I32 => Value::I32(i32::from_be_bytes(self.array()?)),
+            Type::U64 => Value::U64(u64::from_be_bytes(self.array()?)),
+            Type::I64 => Value::I64(i64::from_be_bytes(self.array()?)),
+            Type::U128 => Value::U128(u128::from_be_bytes(self.array()?)),
+            Type::I128 => Value::I128(i128::from_be_bytes(self.array()?)),
+            Type::F32 => Value::F32(f32::from_be_bytes(self.array()?)),
+            Type::F64 => Value::F64(f64::from_be_bytes(self.array()?)),
+            _ => {
+                return Err(DecodeError::new(
+                    self.pos,
+                    DecodeErrorKind::Unsupported(format!("big-endian `{ty:?}`")),
+                ))
+            }
+        })
+    }
+}
+
+/// Read `len` items, or items up to the end of the data when `len` is `None`.
+fn repeat<T>(
+    r: &mut Reader<'_>,
+    len: Option<usize>,
+    mut read: impl FnMut(&mut Reader<'_>) -> Result<T, DecodeError>,
+) -> Result<Vec<T>, DecodeError> {
+    let mut out = Vec::with_capacity(len.unwrap_or(0));
+    while len.map_or(r.remaining() > 0, |n| out.len() < n) {
+        let at = r.pos;
+        let item = read(r).map_err(|e| e.within(format!("[{}]", out.len())))?;
+        // An item of zero bytes never reaches the end of the data.
+        if len.is_none() && r.pos == at {
+            return Err(DecodeError::new(
+                at,
+                DecodeErrorKind::Unsupported(
+                    "items of zero bytes cannot fill the rest of the data".to_string(),
+                ),
+            ));
+        }
+        out.push(item);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -931,5 +1257,117 @@ mod tests {
             .borsh(&Type::COption(Box::new(Type::U64)), &data)
             .unwrap();
         assert_eq!((d.value, d.len), (Value::Option(None), 12));
+    }
+
+    #[test]
+    fn vec_of_an_empty_struct_fails_like_borsh() {
+        // pump.fun `distributeCreatorFeesEvent` in an IDL where `Shareholder` has no fields.
+        let idl = idl(
+            r#"[{"name":"Shareholder","type":{"kind":"struct","fields":[]}},
+                {"name":"Ev","type":{"kind":"struct","fields":[
+                    {"name":"fee","type":"u8"},{"name":"shareholders","type":{"vec":{"defined":{"name":"Shareholder"}}}}]}},
+                {"name":"Ok","type":{"kind":"struct","fields":[
+                    {"name":"maybe","type":{"vec":{"option":{"defined":{"name":"Shareholder"}}}}}]}}]"#,
+        );
+        // Borsh checks the item type before the length, so zero items fail too.
+        for len in [3u32, 0] {
+            let mut data = vec![7];
+            data.extend(len.to_le_bytes());
+            let err = decode(&idl, "Ev", &data).unwrap_err();
+            assert_eq!(
+                (err.path(), err.offset, err.kind),
+                (
+                    "shareholders".to_string(),
+                    1,
+                    DecodeErrorKind::ZeroSizedItems("Shareholder".into())
+                )
+            );
+        }
+        // An option takes a tag byte in Rust, so a Vec of options decodes.
+        assert_eq!(decode(&idl, "Ok", &[1, 0, 0, 0, 0]).map(|d| d.len), Ok(5));
+    }
+
+    #[test]
+    fn vec_of_an_inline_empty_struct_fails_like_borsh() {
+        // A Codama `structTypeNode` with no fields, written inline as the item type.
+        let idl = idl("[]");
+        let decoder = Decoder::new(TypeIndex::new(&idl));
+        let ty = Type::Vec(Box::new(Type::Struct(Vec::new())));
+        let err = decoder.borsh(&ty, &[0, 0, 0, 0]).unwrap_err();
+        assert_eq!(err.kind, DecodeErrorKind::ZeroSizedItems("struct".into()));
+    }
+
+    #[test]
+    fn codama_only_encodings_decode_and_bad_tags_are_errors() {
+        let num = |format: &str, endian: &str| {
+            format!(r#"{{"kind":"numberTypeNode","format":"{format}","endian":"{endian}"}}"#)
+        };
+        let args = [
+            format!(
+                r#"{{"kind":"structTypeNode","fields":[{{"kind":"structFieldTypeNode","name":"a","type":{}}}]}}"#,
+                num("u8", "le")
+            ),
+            format!(
+                r#"{{"kind":"sizePrefixTypeNode","type":{{"kind":"stringTypeNode","encoding":"utf8"}},"prefix":{}}}"#,
+                num("u8", "le")
+            ),
+            num("u16", "be"),
+            num("shortU16", "le"),
+            format!(
+                r#"{{"kind":"optionTypeNode","item":{},"prefix":{}}}"#,
+                num("u8", "le"),
+                num("u16", "be")
+            ),
+            r#"{"kind":"zeroableOptionTypeNode","item":{"kind":"publicKeyTypeNode"}}"#.to_string(),
+            format!(
+                r#"{{"kind":"arrayTypeNode","item":{},"count":{{"kind":"remainderCountNode"}}}}"#,
+                num("u16", "le")
+            ),
+        ];
+        let args: Vec<String> = args
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                format!(r#"{{"kind":"instructionArgumentNode","name":"a{i}","type":{ty}}}"#)
+            })
+            .collect();
+        let idl = Idl::from_json(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+            "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111",
+            "version":"0","accounts":[],"pdas":[],"errors":[],"definedTypes":[],
+            "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],
+            "arguments":[{}]}}]}}}}"#,
+            args.join(",")
+        ))
+        .unwrap();
+        let fields = &idl.instructions[0].args;
+        let decoder = Decoder::new(TypeIndex::new(&idl));
+        let mut data = vec![7, 2, b'h', b'i', 1, 2, 0x80, 0x01, 0, 1, 9];
+        data.extend([0u8; 32]);
+        data.extend([5, 0, 6, 0]);
+        let d = decoder.borsh_fields(fields, &data).unwrap();
+        let values: Vec<Value> = match d.value {
+            Value::Struct(fields) => fields.into_iter().map(|(_, v)| v).collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            values,
+            [
+                Value::Struct(vec![("a".to_string(), Value::U8(7))]),
+                Value::String("hi".to_string()),
+                Value::U16(0x0102),
+                Value::U16(128),
+                Value::Option(Some(Box::new(Value::U8(9)))),
+                Value::Option(None),
+                Value::List(vec![Value::U16(5), Value::U16(6)]),
+            ]
+        );
+        assert_eq!(d.len, data.len());
+
+        // An option tag of 2, and a shortU16 that is not in its shortest form.
+        let bad_tag = decoder.borsh(&fields[4].ty, &[0, 2, 9]).unwrap_err();
+        assert_eq!(bad_tag.kind, DecodeErrorKind::InvalidOptionTag(2));
+        let long_form = decoder.borsh(&Type::ShortU16, &[0x80, 0x00]).unwrap_err();
+        assert_eq!(long_form.kind, DecodeErrorKind::InvalidShortU16);
     }
 }

@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use idl_drift::model::Idl;
 
 use crate::error::Error;
-use crate::samples::{AccountSample, EventSample, EventSource, InstructionSample, Samples};
+use crate::samples::{
+    AccountSample, EventSample, EventSource, InstructionSample, KeyFlags, Samples,
+};
 use crate::verify::{cpi_envelopes, disc_table, event_body, longest_match, prefix_hex, Disc};
 
 #[derive(Deserialize)]
@@ -55,7 +57,21 @@ struct Body {
 #[serde(rename_all = "camelCase")]
 struct Message {
     account_keys: Vec<String>,
+    #[serde(default)]
+    header: Option<Header>,
     instructions: Vec<CompiledInstruction>,
+}
+
+/// The first `signers` keys sign. The last `readonly_signed` signers and the last
+/// `readonly_unsigned` static keys are read-only.
+#[derive(Deserialize, Clone, Copy)]
+struct Header {
+    #[serde(rename = "numRequiredSignatures")]
+    signers: usize,
+    #[serde(rename = "numReadonlySignedAccounts")]
+    readonly_signed: usize,
+    #[serde(rename = "numReadonlyUnsignedAccounts")]
+    readonly_unsigned: usize,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +89,49 @@ pub struct TransactionSamples {
     pub events: Vec<EventSample>,
 }
 
+/// `(signer, writable)` per key, static keys then loaded ones, by the header rule that
+/// `solana-message` 4.6 applies to legacy, v0 and v1 messages. A later version gets none.
+fn key_privileges(
+    version: Option<&Value>,
+    message: &Message,
+    loaded: Option<&LoadedAddresses>,
+) -> Option<Vec<(bool, bool)>> {
+    // `version` is absent when the request sets no maximum version.
+    let known = match version {
+        None => true,
+        Some(Value::String(v)) => v == "legacy",
+        Some(v) => v.as_u64().is_some_and(|v| v <= 1),
+    };
+    let header = message.header.filter(|_| known)?;
+    let statics = message.account_keys.len();
+    let signers = header.signers;
+    let writable_signers = signers.saturating_sub(header.readonly_signed);
+    let writable_unsigned = statics
+        .saturating_sub(signers)
+        .saturating_sub(header.readonly_unsigned);
+    let static_keys = (0..statics).map(|i| {
+        if i < signers {
+            (true, i < writable_signers)
+        } else {
+            (false, i - signers < writable_unsigned)
+        }
+    });
+    let loaded_keys = loaded.into_iter().flat_map(|l| {
+        let writable = l.writable.iter().map(|_| (false, true));
+        writable.chain(l.readonly.iter().map(|_| (false, false)))
+    });
+    Some(static_keys.chain(loaded_keys).collect())
+}
+
+fn key_flags(privileges: &[(bool, bool)], accounts: &[usize], cpi: bool) -> KeyFlags {
+    let of = |i: &usize| privileges.get(*i).copied().unwrap_or_default();
+    KeyFlags {
+        signer: accounts.iter().map(|i| of(i).0).collect(),
+        writable: accounts.iter().map(|i| of(i).1).collect(),
+        cpi,
+    }
+}
+
 /// The instructions in one `getTransaction` result (`json` encoding) that call
 /// `program_id`, with their account keys resolved, and the events the program emitted.
 /// `idl` gives the envelopes that mark a self-CPI event.
@@ -85,6 +144,7 @@ pub fn samples_from_transaction(
     program_id: &str,
     tx: &Value,
 ) -> Result<TransactionSamples, Error> {
+    let version = tx.get("version");
     let tx = Transaction::deserialize(tx).map_err(|e| Error::RpcResponse(e.to_string()))?;
     let signature = tx
         .transaction
@@ -135,12 +195,14 @@ pub fn samples_from_transaction(
         .enumerate()
         .flat_map(|(i, top)| {
             let cpis = inner.iter().filter(move |g| g.index == i);
-            std::iter::once(top).chain(cpis.flat_map(|g| &g.instructions))
+            std::iter::once((false, top))
+                .chain(cpis.flat_map(|g| g.instructions.iter().map(|ix| (true, ix))))
         });
+    let privileges = key_privileges(version, &tx.transaction.message, loaded);
 
     let cpi = cpi_envelopes(idl);
     let mut out = TransactionSamples::default();
-    for ix in executed {
+    for (nested, ix) in executed {
         if key(ix.program_id_index)? != program_id {
             continue;
         }
@@ -163,6 +225,9 @@ pub fn samples_from_transaction(
                 .iter()
                 .map(|&i| key(i))
                 .collect::<Result<_, _>>()?,
+            flags: privileges
+                .as_deref()
+                .map(|p| key_flags(p, &ix.accounts, nested)),
         });
     }
 
@@ -870,6 +935,44 @@ mod tests {
     }
 
     #[test]
+    fn flags_follow_the_message_header() {
+        // Payer signs and is writable, Auth signs read-only, Vault is writable, Prog is
+        // read-only; then lookup-table keys L1 (writable) and L2 (read-only).
+        let mut tx = tx(
+            &["Payer", "Auth", "Vault", "Prog"],
+            &json!([{ "programIdIndex": 3, "accounts": [1, 2, 0, 4, 5], "data": "2" }]),
+        );
+        tx["transaction"]["message"]["header"] = json!({ "numRequiredSignatures": 2,
+            "numReadonlySignedAccounts": 1, "numReadonlyUnsignedAccounts": 1 });
+        tx["meta"]["loadedAddresses"] = json!({ "writable": ["L1"], "readonly": ["L2"] });
+        tx["meta"]["innerInstructions"] = json!([{ "index": 0, "instructions": [
+            { "programIdIndex": 3, "accounts": [2], "data": "2" }
+        ]}]);
+        tx["version"] = json!(0);
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
+        let expected = KeyFlags {
+            signer: vec![true, false, true, false, false],
+            writable: vec![false, true, true, true, false],
+            cpi: false,
+        };
+        assert_eq!(ixs[0].flags, Some(expected));
+        assert_eq!(ixs[1].flags.as_ref().map(|f| f.cpi), Some(true));
+        tx["version"] = json!(1);
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
+        assert!(ixs[0].flags.is_some());
+        // A later message version can order keys another way.
+        tx["version"] = json!(2);
+        let ixs = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .instructions;
+        assert!(ixs[0].flags.is_none());
+    }
+
+    #[test]
     fn keeps_inner_instructions_in_execution_order() {
         let mut tx = tx(
             &["Payer", "Other", "Prog"],
@@ -909,6 +1012,29 @@ mod tests {
             .unwrap()
             .instructions;
         assert_eq!(ixs[0].accounts, ["R1", "W1", "R2", "Payer"]);
+    }
+
+    #[test]
+    fn events_keep_execution_order_across_cpis() {
+        let event = |b: u8| bs58::encode([&EVENT_IX_TAG[..], &[b]].concat()).into_string();
+        let mut tx = tx(
+            &["Payer", "Prog"],
+            &json!([
+                { "programIdIndex": 1, "accounts": [0], "data": "2" },
+                { "programIdIndex": 1, "accounts": [0], "data": event(2) }
+            ]),
+        );
+        tx["meta"]["innerInstructions"] = json!([{ "index": 0, "instructions": [
+            { "programIdIndex": 1, "accounts": [0], "data": event(1) }
+        ]}]);
+        let events = samples_from_transaction(&idl(), "Prog", &tx)
+            .unwrap()
+            .events;
+        let last: Vec<u8> = events
+            .iter()
+            .filter_map(|e| e.data.last().copied())
+            .collect();
+        assert_eq!(last, [1, 2]);
     }
 
     #[test]
@@ -1052,7 +1178,16 @@ mod tests {
 
             let result = samples_from_transaction(&idl(), &program_id, &tx);
 
-            let executed: Vec<&Ix> = top.iter().chain(inner.iter().flat_map(|(_, ixs)| ixs)).collect();
+            // Execution order: each top-level instruction, then the CPIs it made.
+            let executed: Vec<&Ix> = top
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| {
+                    std::iter::once(t).chain(
+                        inner.iter().filter(move |(index, _)| *index == i).flat_map(|(_, ixs)| ixs),
+                    )
+                })
+                .collect();
             let valid = executed.iter().all(|ix| ix.0 < n && ix.1.iter().all(|&a| a < n) && !ix.3);
             if valid {
                 proptest::prop_assert!(result.is_ok(), "{result:?}");

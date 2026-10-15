@@ -2,8 +2,9 @@
 //! into the flat [`Idl`].
 
 use crate::model::{
-    Account, AccountItem, ArrayLen, Discriminator, EnumFields, EnumVariant, ErrorCode, Event,
-    Field, Format, Idl, Instruction, Metadata, NamedDisc, Type, TypeDef, TypeDefTy,
+    Account, AccountItem, ArrayLen, Count, Discriminator, EnumFields, EnumVariant, ErrorCode,
+    Event, Field, Format, Idl, Instruction, Metadata, NamedDisc, OptionTag, Type, TypeDef,
+    TypeDefTy,
 };
 use codama_nodes::{
     AccountNode, BytesEncoding, BytesValueNode, CountNode, DefaultValueStrategy, DefinedTypeNode,
@@ -43,6 +44,7 @@ pub fn from_codama(root: RootNode) -> Idl {
                     })
                     .and_then(|n| usize::try_from(n).ok()),
                 payload_offset: numeric_constant_discriminator(a).then_some(0),
+                size_discriminator: size_discriminator(&a.discriminators),
             }
         })
         .collect();
@@ -52,13 +54,14 @@ pub fn from_codama(root: RootNode) -> Idl {
         .iter()
         .map(|e| {
             types.push(event_as_type_def(e));
-            let (discriminator, envelope_discriminator, envelope_payload_offset) =
-                extract_event_parts(e);
+            let parts = extract_event_parts(e);
             Event {
                 name: e.name.to_string(),
-                discriminator,
-                envelope_discriminator,
-                envelope_payload_offset,
+                discriminator: parts.discriminator,
+                discriminator_offset: parts.discriminator_offset,
+                extra_discriminators: parts.extra_discriminators,
+                envelope_discriminator: parts.envelope,
+                envelope_payload_offset: parts.envelope_payload_offset,
             }
         })
         .collect();
@@ -112,8 +115,17 @@ fn convert_instruction(ix: &InstructionNode) -> Instruction {
         name: ix.name.to_string(),
         discriminator,
         discriminator_offset,
+        size_discriminator: size_discriminator(&ix.discriminators),
         accounts,
         args,
+    }
+}
+
+/// Shipstern reads only the first discriminator of an account or instruction.
+fn size_discriminator(discs: &[DiscriminatorNode]) -> Option<usize> {
+    match discs.first() {
+        Some(DiscriminatorNode::Size(d)) => usize::try_from(d.size).ok(),
+        _ => None,
     }
 }
 
@@ -122,6 +134,7 @@ fn convert_ix_account(a: &InstructionAccountNode) -> AccountItem {
         name: a.name.to_string(),
         writable: a.is_writable,
         signer: matches!(a.is_signer, IsSigner::True | IsSigner::Either),
+        may_sign: matches!(a.is_signer, IsSigner::Either),
         optional: a.is_optional.unwrap_or(false),
         address: match a.default_value.as_ref() {
             Some(InstructionInputValueNode::PublicKeyValue(pk)) => Some(pk.public_key.clone()),
@@ -258,13 +271,16 @@ fn default_serialization() -> String {
     "borsh".to_string()
 }
 
-/// Map a Codama type to the flat model. Encodings with no Borsh equivalent (big-endian
-/// numbers, non-`u32` length prefixes, remainder or zeroable options) become `Generic`.
+/// Map a Codama type to the flat model. Borsh encodings keep their Anchor types, so the
+/// two formats compare equal. Other encodings get Codama-only types; the rest are `Generic`.
 fn convert_type(t: &TypeNode) -> Type {
     match t {
-        TypeNode::SizePrefix(sp) if is_borsh_len_prefix(&sp.prefix) => match sp.r#type.as_ref() {
-            TypeNode::String(_) => Type::String,
-            TypeNode::Bytes(_) => Type::Bytes,
+        TypeNode::SizePrefix(sp) => match (sp.r#type.as_ref(), is_borsh_len_prefix(&sp.prefix)) {
+            (TypeNode::String(_), true) => Type::String,
+            (TypeNode::Bytes(_), true) => Type::Bytes,
+            (TypeNode::String(_), false) => counted(Type::String, &sp.prefix),
+            (TypeNode::Bytes(_), false) => counted(Type::Bytes, &sp.prefix),
+            // Around a struct the prefix sets a byte window, which the model cannot express.
             _ => Type::Generic("sizePrefixTypeNode".to_string()),
         },
         TypeNode::FixedSize(fs) => match fs.r#type.as_ref() {
@@ -278,11 +294,7 @@ fn convert_type(t: &TypeNode) -> Type {
                 Ok(len) => Type::Array(Box::new(convert_type(&arr.item)), ArrayLen::Value(len)),
                 Err(_) => Type::Generic("fixedCountNode".to_string()),
             },
-            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => {
-                Type::Vec(Box::new(convert_type(&arr.item)))
-            }
-            CountNode::Prefixed(_) => Type::Generic("prefixedCountNode".to_string()),
-            CountNode::Remainder(_) => Type::Generic("remainderCountNode".to_string()),
+            count => collection(Type::Vec(Box::new(convert_type(&arr.item))), count),
         },
         TypeNode::Boolean(_) => Type::Bool,
         TypeNode::Number(n) => number_type(n),
@@ -291,47 +303,103 @@ fn convert_type(t: &TypeNode) -> Type {
         TypeNode::DateTime(d) => number_type(d.number.get_nested_type_node()),
         TypeNode::PublicKey(_) => Type::Pubkey,
         TypeNode::Option(o) => {
-            let prefix = o.prefix.get_nested_type_node();
-            let le = prefix.endian == Endianness::Le;
-            match (prefix.format, o.fixed.unwrap_or(false)) {
-                (NumberFormat::U8, false) if le => Type::Option(Box::new(convert_type(&o.item))),
-                (NumberFormat::U32, true) if le => Type::COption(Box::new(convert_type(&o.item))),
-                _ => Type::Generic("optionTypeNode".to_string()),
+            let item = Box::new(convert_type(&o.item));
+            let fixed = o.fixed.unwrap_or(false);
+            match (prefix_type(&o.prefix), fixed) {
+                (Some(Type::U8), false) => Type::Option(item),
+                (Some(Type::U32), true) => Type::COption(item),
+                (Some(ty), fixed) => Type::CodamaOption {
+                    item,
+                    tag: OptionTag::Prefix {
+                        ty: Box::new(ty),
+                        fixed,
+                    },
+                },
+                (None, _) => Type::Generic("optionTypeNode".to_string()),
             }
         }
+        // A custom zero value is rare, and a wrong guess at it would misread the item.
+        TypeNode::ZeroableOption(z) if z.zero_value.is_none() => Type::CodamaOption {
+            item: Box::new(convert_type(&z.item)),
+            tag: OptionTag::Zeroable,
+        },
+        TypeNode::RemainderOption(o) => Type::CodamaOption {
+            item: Box::new(convert_type(&o.item)),
+            tag: OptionTag::Remainder,
+        },
         TypeNode::Link(link) => Type::Defined {
             name: link.name.to_string(),
             generics: vec![],
         },
-        TypeNode::Map(m) => match m.count.as_ref() {
-            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => Type::Map(
+        TypeNode::Map(m) => collection(
+            Type::Map(
                 Box::new(convert_type(m.key.as_ref())),
                 Box::new(convert_type(m.value.as_ref())),
             ),
-            _ => Type::Generic("mapTypeNode".to_string()),
-        },
-        TypeNode::Set(st) => match st.count.as_ref() {
-            CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => {
-                Type::Set(Box::new(convert_type(st.item.as_ref())))
-            }
-            _ => Type::Generic("setTypeNode".to_string()),
-        },
+            &m.count,
+        ),
+        TypeNode::Set(st) => collection(
+            Type::Set(Box::new(convert_type(st.item.as_ref()))),
+            &st.count,
+        ),
         TypeNode::Tuple(t) => Type::Tuple(t.items.iter().map(convert_type).collect()),
-        // Inline structs and enums as field types have no flat equivalent yet. Real IDLs
-        // almost always link to a defined type instead.
-        TypeNode::Struct(_) => Type::Generic("structTypeNode".to_string()),
+        TypeNode::Struct(st) => Type::Struct(struct_fields_skipping_omitted(st)),
+        // Shipstern cannot read an inline enum, and real IDLs link to a defined type.
         TypeNode::Enum(_) => Type::Generic("enumTypeNode".to_string()),
-        // Bare strings and bytes run to the end of the data; Borsh has no such encoding.
-        TypeNode::String(_) => Type::Generic("stringTypeNode".to_string()),
-        TypeNode::Bytes(_) => Type::Generic("bytesTypeNode".to_string()),
-        TypeNode::SizePrefix(_) => Type::Generic("sizePrefixTypeNode".to_string()),
+        // Bare strings and bytes run to the end of the data.
+        TypeNode::String(_) => Type::Counted {
+            ty: Box::new(Type::String),
+            count: Count::Remainder,
+        },
+        TypeNode::Bytes(_) => Type::Counted {
+            ty: Box::new(Type::Bytes),
+            count: Count::Remainder,
+        },
         TypeNode::HiddenPrefix(_) => Type::Generic("hiddenPrefixTypeNode".to_string()),
         TypeNode::HiddenSuffix(_) => Type::Generic("hiddenSuffixTypeNode".to_string()),
         TypeNode::PreOffset(_) => Type::Generic("preOffsetTypeNode".to_string()),
         TypeNode::PostOffset(_) => Type::Generic("postOffsetTypeNode".to_string()),
         TypeNode::Sentinel(_) => Type::Generic("sentinelTypeNode".to_string()),
-        TypeNode::RemainderOption(_) => Type::Generic("remainderOptionTypeNode".to_string()),
         TypeNode::ZeroableOption(_) => Type::Generic("zeroableOptionTypeNode".to_string()),
+    }
+}
+
+/// `ty` (a `Bytes` or `String`) with a byte length in `prefix` instead of Borsh's `u32`.
+fn counted(ty: Type, prefix: &NestedTypeNode<NumberTypeNode>) -> Type {
+    match prefix_type(prefix) {
+        Some(p) => Type::Counted {
+            ty: Box::new(ty),
+            count: Count::Prefix(Box::new(p)),
+        },
+        None => Type::Generic("sizePrefixTypeNode".to_string()),
+    }
+}
+
+/// `ty` (a `Vec`, `Map` or `Set`) with its item count from `count`. Borsh's `u32` prefix keeps
+/// the plain type.
+fn collection(ty: Type, count: &CountNode) -> Type {
+    let count = match count {
+        CountNode::Prefixed(p) if is_borsh_len_prefix(&p.prefix) => return ty,
+        CountNode::Prefixed(p) => match prefix_type(&p.prefix) {
+            Some(prefix) => Count::Prefix(Box::new(prefix)),
+            None => return Type::Generic("prefixedCountNode".to_string()),
+        },
+        CountNode::Remainder(_) => Count::Remainder,
+        CountNode::Fixed(_) => return Type::Generic("fixedCountNode".to_string()),
+    };
+    Type::Counted {
+        ty: Box::new(ty),
+        count,
+    }
+}
+
+/// The integer type of a length or tag prefix. A float or a wrapped number gives `None`.
+fn prefix_type(prefix: &NestedTypeNode<NumberTypeNode>) -> Option<Type> {
+    match prefix {
+        NestedTypeNode::Value(n) if !matches!(n.format, NumberFormat::F32 | NumberFormat::F64) => {
+            Some(number_type(n))
+        }
+        _ => None,
     }
 }
 
@@ -357,12 +425,12 @@ fn number_type(n: &NumberTypeNode) -> Type {
         NumberFormat::I128 => Type::I128,
         NumberFormat::F32 => Type::F32,
         NumberFormat::F64 => Type::F64,
-        // Variable-length (1 to 3 bytes); not a Borsh scalar.
-        NumberFormat::ShortU16 => return Type::Generic("shortu16".to_string()),
+        // Solana's compact length: its encoding has no byte order.
+        NumberFormat::ShortU16 => return Type::ShortU16,
     };
     // Single bytes have no byte order.
     if n.endian == Endianness::Be && !matches!(ty, Type::U8 | Type::I8) {
-        return Type::Generic(format!("{ty:?}be").to_lowercase());
+        return Type::BigEndian(Box::new(ty));
     }
     ty
 }
@@ -413,11 +481,21 @@ fn extract_event_discriminator(e: &EventNode) -> (Discriminator, usize) {
     })
 }
 
-/// The event discriminator and the self-CPI envelope, by Shipstern's rule
-/// (`proc-macro/src/parse.rs`): Codama has no node for the envelope, so in an all-constant
-/// chain sorted by offset, one constant at offset 0 is the tag and the next one starts the
-/// event. The `hiddenPrefix` around the data only hides those bytes from the struct.
-fn extract_event_parts(e: &EventNode) -> (Discriminator, Discriminator, Option<usize>) {
+/// An event's discriminators and self-CPI envelope.
+struct EventParts {
+    discriminator: Discriminator,
+    discriminator_offset: usize,
+    extra_discriminators: Vec<(usize, Discriminator)>,
+    envelope: Discriminator,
+    envelope_payload_offset: Option<usize>,
+}
+
+/// The event discriminators and the self-CPI envelope, by Shipstern's rule
+/// (`proc-macro/src/parse.rs`, `rebased_event_discriminators`): Codama has no node for the
+/// envelope, so in an all-constant chain sorted by offset, one constant at offset 0 is the
+/// tag. The next one starts the event, and every later one is checked too, all at offsets
+/// after the envelope. The `hiddenPrefix` around the data only hides those bytes from the struct.
+fn extract_event_parts(e: &EventNode) -> EventParts {
     let mut constants: Vec<(usize, Vec<u8>)> = e
         .discriminators
         .iter()
@@ -435,8 +513,26 @@ fn extract_event_parts(e: &EventNode) -> (Discriminator, Discriminator, Option<u
     }
     constants.sort_by_key(|(offset, _)| *offset);
     match constants.as_slice() {
-        [(0, tag), (offset, disc), ..] if *offset > 0 => (disc.clone(), tag.clone(), Some(*offset)),
-        _ => (extract_event_discriminator(e).0, Vec::new(), None),
+        [(0, tag), (base, disc), rest @ ..] if *base > 0 => EventParts {
+            discriminator: disc.clone(),
+            discriminator_offset: 0,
+            extra_discriminators: rest
+                .iter()
+                .map(|(offset, bytes)| (offset - base, bytes.clone()))
+                .collect(),
+            envelope: tag.clone(),
+            envelope_payload_offset: Some(*base),
+        },
+        _ => {
+            let (discriminator, discriminator_offset) = extract_event_discriminator(e);
+            EventParts {
+                discriminator,
+                discriminator_offset,
+                extra_discriminators: Vec::new(),
+                envelope: Vec::new(),
+                envelope_payload_offset: None,
+            }
+        }
     }
 }
 

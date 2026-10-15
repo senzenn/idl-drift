@@ -21,6 +21,8 @@ pub enum Error {
         index: usize,
         source: base64::DecodeError,
     },
+    #[error("instructions[{index}]: give `signer`, `writable` and `cpi` together, with one flag per account")]
+    SampleFlags { index: usize },
     #[error("cannot write the report: {0}")]
     Write(std::io::Error),
     #[error("cannot write {path}: {source}")]

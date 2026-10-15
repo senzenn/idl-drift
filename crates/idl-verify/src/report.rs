@@ -30,9 +30,13 @@ pub enum Check {
     SizeDistribution,
     AccountCount,
     FixedAddress,
+    /// An account the IDL marks writable or signer gets a key without that privilege.
+    AccountFlags,
     /// A self-CPI event sample without the envelope the IDL (or Anchor) puts before events.
     Envelope,
     Reference,
+    /// Too few of the IDL's items have a sample, with a required minimum set.
+    Coverage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,10 +195,53 @@ impl Report {
             .count()
     }
 
+    /// Add an error for each kind of IDL item (account types, instructions, events) where
+    /// less than `min_percent` of the items have a sample: a pass must not rest on little data.
+    pub fn require_coverage(&mut self, min_percent: u8) {
+        let kinds = [
+            ("account types", self.accounts.len(), &self.account_coverage),
+            (
+                "instructions",
+                self.instructions.len(),
+                &self.instruction_coverage,
+            ),
+            ("events", self.events.len(), &self.event_coverage),
+        ];
+        let mut short = Vec::new();
+        for (what, sampled, coverage) in kinds {
+            let total = sampled + coverage.not_sampled.len();
+            if total == 0
+                || sampled.saturating_mul(100) >= usize::from(min_percent).saturating_mul(total)
+            {
+                continue;
+            }
+            short.push(Finding {
+                severity: Severity::Error,
+                check: Check::Coverage,
+                subject: "program".to_string(),
+                message: format!(
+                    "only {sampled} of {total} {what} have a sample ({}%), less than the {min_percent}% required",
+                    sampled.saturating_mul(100) / total
+                ),
+                hint: Some(
+                    "with --rpc, raise --max-tx and --stall to read more transactions; else add samples of the items under \"not sampled\"".to_string(),
+                ),
+                example: None,
+            });
+        }
+        self.findings.extend(short);
+    }
+
+    /// `true` when any finding is at `threshold` or above, for a stricter CI gate.
+    #[must_use]
+    pub fn fails_at(&self, threshold: Severity) -> bool {
+        self.findings.iter().any(|f| f.severity >= threshold)
+    }
+
     /// 1 when any finding is an error, else 0. (2, for I/O and parse errors, is the CLI's.)
     #[must_use]
     pub fn exit_code(&self) -> u8 {
-        u8::from(self.count(Severity::Error) > 0)
+        u8::from(self.fails_at(Severity::Error))
     }
 
     /// Pretty-printed JSON, with counts and the exit code added.
@@ -203,6 +250,15 @@ impl Report {
     ///
     /// Only if serialization fails, which plain data like this does not.
     pub fn to_json(&self) -> serde_json::Result<String> {
+        self.to_json_with_exit_code(self.exit_code())
+    }
+
+    /// As [`Self::to_json`], with the exit code a stricter gate gave.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::to_json`].
+    pub fn to_json_with_exit_code(&self, exit_code: u8) -> serde_json::Result<String> {
         #[derive(Serialize)]
         struct Counts {
             errors: usize,
@@ -223,7 +279,7 @@ impl Report {
                 warnings: self.count(Severity::Warning),
                 notes: self.count(Severity::Note),
             },
-            exit_code: self.exit_code(),
+            exit_code,
         })
     }
 
@@ -460,4 +516,49 @@ fn write_table<const N: usize>(
         writeln!(out, "{}", line(row.each_ref().map(String::as_str)))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::samples::{InstructionSample, Samples};
+    use idl_drift::model::Idl;
+
+    #[test]
+    fn low_coverage_is_an_error_only_below_the_minimum() {
+        // Two instructions, one sampled: 50%. The IDL has no account types or events.
+        let idl = Idl::from_json(
+            r#"{"address":"P","metadata":{"name":"t","version":"0","spec":"0.1.0"},"instructions":[
+                {"name":"a","discriminator":[1],"accounts":[],"args":[]},
+                {"name":"b","discriminator":[2],"accounts":[],"args":[]}]}"#,
+        )
+        .unwrap();
+        let samples = Samples {
+            program_id: None,
+            accounts: Vec::new(),
+            instructions: vec![InstructionSample {
+                signature: "S".into(),
+                data: vec![1],
+                accounts: Vec::new(),
+                flags: None,
+            }],
+            events: Vec::new(),
+        };
+        let report = crate::verify(&idl, &samples, None);
+        assert_eq!(report.exit_code(), 0);
+
+        let mut enough = report.clone();
+        enough.require_coverage(50);
+        assert_eq!(enough.exit_code(), 0);
+
+        let mut short = report;
+        short.require_coverage(51);
+        assert_eq!(short.exit_code(), 1);
+        let finding = short.findings.last().unwrap();
+        assert_eq!(finding.check, Check::Coverage);
+        assert_eq!(
+            finding.message,
+            "only 1 of 2 instructions have a sample (50%), less than the 51% required"
+        );
+    }
 }

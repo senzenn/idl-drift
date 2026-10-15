@@ -4,13 +4,15 @@
 //! {
 //!   "programId": "vVoLTRjQmtFpiYoegx285Ze4gsLJ8ZxgFKVcuvmG1a8",
 //!   "accounts": [{ "address": "...", "data": "<base64>" }],
-//!   "instructions": [{ "signature": "...", "data": "<base64>", "accounts": ["<base58>"] }],
+//!   "instructions": [{ "signature": "...", "data": "<base64>", "accounts": ["<base58>"],
+//!                      "signer": [true], "writable": [false], "cpi": false }],
 //!   "events": [{ "signature": "...", "source": "log", "data": "<base64>" }]
 //! }
 //! ```
 //!
 //! Any other keys, such as an account's `type` label, are ignored: samples are classified
-//! by discriminator, never by a label.
+//! by discriminator, never by a label. `signer`, `writable` and `cpi` are optional, so older
+//! files still load.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -40,6 +42,19 @@ pub struct InstructionSample {
     pub signature: String,
     pub data: Vec<u8>,
     pub accounts: Vec<String>,
+    /// What the transaction message says about each key; `None` when the sample has no flags.
+    pub flags: Option<KeyFlags>,
+}
+
+/// Message-level privileges of an instruction's keys, one entry per key in `accounts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyFlags {
+    /// The key signs the transaction.
+    pub signer: Vec<bool>,
+    /// The message makes the key writable.
+    pub writable: Vec<bool>,
+    /// The instruction is a CPI, not a top-level instruction.
+    pub cpi: bool,
 }
 
 /// Where an event sample came from.
@@ -95,6 +110,12 @@ struct InstructionJson {
     data: String,
     #[serde(default)]
     accounts: Vec<String>,
+    #[serde(default)]
+    signer: Option<Vec<bool>>,
+    #[serde(default)]
+    writable: Option<Vec<bool>>,
+    #[serde(default)]
+    cpi: Option<bool>,
 }
 
 impl Samples {
@@ -121,10 +142,25 @@ impl Samples {
             .into_iter()
             .enumerate()
             .map(|(index, ix)| {
+                let flags = match (ix.signer, ix.writable, ix.cpi) {
+                    (None, None, None) => None,
+                    (Some(signer), Some(writable), Some(cpi))
+                        if signer.len() == ix.accounts.len()
+                            && writable.len() == ix.accounts.len() =>
+                    {
+                        Some(KeyFlags {
+                            signer,
+                            writable,
+                            cpi,
+                        })
+                    }
+                    _ => return Err(Error::SampleFlags { index }),
+                };
                 Ok(InstructionSample {
                     data: decode_base64(&ix.data, "instructions", index)?,
                     signature: ix.signature,
                     accounts: ix.accounts,
+                    flags,
                 })
             })
             .collect::<Result<_, Error>>()?;
@@ -162,8 +198,15 @@ impl Samples {
             .instructions
             .iter()
             .map(|ix| {
-                serde_json::json!({ "signature": ix.signature, "data": STANDARD.encode(&ix.data),
-                                    "accounts": ix.accounts })
+                let mut v = serde_json::json!({ "signature": ix.signature,
+                                                "data": STANDARD.encode(&ix.data),
+                                                "accounts": ix.accounts });
+                if let Some(flags) = &ix.flags {
+                    v["signer"] = serde_json::json!(flags.signer);
+                    v["writable"] = serde_json::json!(flags.writable);
+                    v["cpi"] = serde_json::json!(flags.cpi);
+                }
+                v
             })
             .collect();
         let events: Vec<serde_json::Value> = self
@@ -228,13 +271,34 @@ mod tests {
     #[test]
     fn saved_samples_load_back_unchanged() {
         let src = r#"{"programId":"P","accounts":[{"address":"A","data":"AQID"}],
-            "instructions":[{"signature":"S","data":"BA==","accounts":["X"]}],
+            "instructions":[{"signature":"S","data":"BA==","accounts":["X"]},
+                {"signature":"S","data":"BA==","accounts":["X"],"signer":[true],"writable":[false],"cpi":true}],
             "events":[{"signature":"S","source":"log","data":"BQY="}]}"#;
         let samples = Samples::from_json(src).unwrap();
         let again = Samples::from_json(&samples.to_json()).unwrap();
         assert_eq!(again.to_json(), samples.to_json());
         assert_eq!(again.events[0].source, EventSource::Log);
         assert_eq!(again.instructions[0].accounts, ["X"]);
+        assert!(again.instructions[0].flags.is_none());
+        let flags = KeyFlags {
+            signer: vec![true],
+            writable: vec![false],
+            cpi: true,
+        };
+        assert_eq!(again.instructions[1].flags, Some(flags));
+    }
+
+    #[test]
+    fn flags_must_come_together_and_cover_every_account() {
+        for ix in [
+            r#"{"data":"BA==","accounts":["X","Y"],"signer":[true],"writable":[true,false],"cpi":false}"#,
+            r#"{"data":"BA==","accounts":["X"],"signer":[true]}"#,
+        ] {
+            let err = Samples::from_json(&format!(r#"{{"instructions":[{ix}]}}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("instructions[0]: give `signer`"), "{err}");
+        }
     }
 
     #[test]

@@ -13,9 +13,10 @@ use serde_json::{json, Map, Value as Json};
 use crate::decode::{Decoder, Value};
 use crate::error::Error;
 use crate::layout::TypeIndex;
-use crate::samples::{InstructionSample, Samples};
+use crate::samples::{EventSample, InstructionSample, Samples};
 use crate::verify::{
-    disc_table, longest_match, pick_by_account_count, prefix_hex, sized_account_types, Disc,
+    disc_table, envelopes, event_body, longest_match, pick_by_account_count, prefix_hex,
+    sized_account_types, Disc, Envelope,
 };
 
 /// Reference decodes, aligned with the samples by index.
@@ -186,9 +187,14 @@ impl Reference {
                 }
             })
             .collect();
+        let events = samples
+            .events
+            .iter()
+            .map(|sample| old_event(sample, &ours, &theirs, &decoder))
+            .collect();
         Self {
             label: "the old IDL",
-            ..Self::from_decoder(accounts, instructions, Vec::new())
+            ..Self::from_decoder(accounts, instructions, events)
         }
     }
 }
@@ -200,6 +206,8 @@ struct Classifier<'a> {
     accounts: Vec<(Disc<'a>, usize)>,
     sized: Vec<(usize, usize)>,
     instructions: Vec<(Disc<'a>, usize)>,
+    events: Vec<(Disc<'a>, usize)>,
+    envelopes: Vec<Envelope<'a>>,
 }
 
 impl<'a> Classifier<'a> {
@@ -218,7 +226,14 @@ impl<'a> Classifier<'a> {
                     .iter()
                     .map(|ix| (ix.discriminator_offset, ix.discriminator.as_slice())),
             ),
+            events: disc_table(idl.events.iter().map(|e| (0, e.discriminator.as_slice()))),
+            envelopes: envelopes(idl),
         }
+    }
+
+    /// The event for `body`, the event bytes with any envelope removed.
+    fn event(&self, body: &[u8]) -> Option<usize> {
+        longest_match(&self.events, body)?.first().copied()
     }
 
     fn account(&self, data: &[u8]) -> Option<usize> {
@@ -239,6 +254,48 @@ impl<'a> Classifier<'a> {
             &candidates,
             sample.accounts.len(),
         ))
+    }
+}
+
+/// `sample` decoded with the old IDL, which `theirs` classifies by; `ours` holds the new IDL.
+fn old_event(
+    sample: &EventSample,
+    ours: &Classifier<'_>,
+    theirs: &Classifier<'_>,
+    decoder: &Decoder<'_>,
+) -> Outcome {
+    let (old, new) = (theirs.idl, ours.idl);
+    if old.events.is_empty() {
+        return Outcome::Failed("the old IDL declares no events".into());
+    }
+    // Each IDL removes its own envelope: the two can wrap self-CPI events apart.
+    let Some(body) = event_body(sample, &theirs.envelopes) else {
+        let list: Vec<String> = theirs.envelopes.iter().map(ToString::to_string).collect();
+        return Outcome::Failed(format!(
+            "self-CPI data {} lacks the old IDL's envelope {}",
+            prefix_hex(&sample.data),
+            list.join(" or ")
+        ));
+    };
+    let Some(t) = theirs.event(body) else {
+        return Outcome::Failed("no event discriminator in the old IDL matches".into());
+    };
+    let ev = &old.events[t];
+    let disc = (0, ev.discriminator.as_slice());
+    if let Some(o) = event_body(sample, &ours.envelopes).and_then(|b| ours.event(b)) {
+        let new_disc = (0, new.events[o].discriminator.as_slice());
+        if new_disc != disc {
+            return Outcome::Failed(other_disc("event", &ev.name, disc, new_disc));
+        }
+    }
+    let Some(td) = decoder.types().get(&ev.name) else {
+        return Outcome::Failed(format!("the old IDL has no type `{}`", ev.name));
+    };
+    let start = ev.discriminator.len();
+    let payload = body.get(start..).unwrap_or_default();
+    match decoder.type_def(td, payload) {
+        Ok(d) => Outcome::Ok(json!({ "name": ev.name, "data": to_json(&d.value) })),
+        Err(e) => Outcome::Failed(e.offset_by(start).to_string()),
     }
 }
 
@@ -890,6 +947,7 @@ mod tests {
                 signature: "sig".into(),
                 data: vec![1, 0],
                 accounts: Vec::new(),
+                flags: None,
             }],
             events: Vec::new(),
         };
@@ -907,6 +965,65 @@ mod tests {
         assert!(
             found.contains(&(Severity::Error, "the old IDL failed on 1 of 1 sample: the old IDL classifies it as instruction `stop` by discriminator 0x0100, the new IDL by discriminator 0x01")),
             "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn old_idl_events_are_decoded_and_compared() {
+        use crate::samples::EventSource;
+        use crate::verify::EVENT_IX_TAG;
+        let idl = |disc: u8, fields: &str| {
+            Idl::from_json(&format!(
+                r#"{{"address":"P","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},"instructions":[],
+                    "events":[{{"name":"Ev","discriminator":[{disc}]}}],
+                    "types":[{{"name":"Ev","type":{{"kind":"struct","fields":{fields}}}}}]}}"#
+            ))
+            .unwrap()
+        };
+        let a_b = r#"[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]"#;
+        let b_a = r#"[{"name":"b","type":"u8"},{"name":"a","type":"u8"}]"#;
+        let event = |source, data: Vec<u8>| EventSample {
+            signature: "sig".into(),
+            source,
+            data,
+        };
+        let samples = Samples {
+            program_id: None,
+            accounts: Vec::new(),
+            instructions: Vec::new(),
+            events: vec![
+                event(EventSource::Log, vec![7, 1, 2]),
+                event(
+                    EventSource::Cpi,
+                    [EVENT_IX_TAG.as_slice(), &[7, 1, 2]].concat(),
+                ),
+            ],
+        };
+        let new = idl(7, a_b);
+        let errors = |old: &Idl| {
+            let report = crate::verify(
+                &new,
+                &samples,
+                Some(&Reference::from_idl(old, &new, &samples)),
+            );
+            let reference = report.reference.clone().unwrap();
+            let messages: Vec<String> = report
+                .findings
+                .into_iter()
+                .filter(|f| f.severity == Severity::Error)
+                .map(|f| f.message)
+                .collect();
+            (reference.events_compared, messages)
+        };
+        // The old IDL swaps the two fields, so both samples read other values.
+        assert_eq!(
+            errors(&idl(7, b_a)),
+            (2, vec!["values differ from the old IDL in 2 of 2 samples, first at `a`: idl-verify read 1, the old IDL 2".to_string()])
+        );
+        // An old IDL that cannot classify the event is an error, as for instructions.
+        assert_eq!(
+            errors(&idl(8, a_b)),
+            (0, vec!["the old IDL failed on 2 of 2 samples: no event discriminator in the old IDL matches".to_string()])
         );
     }
 }

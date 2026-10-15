@@ -21,6 +21,8 @@ license.workspace = true
 repository.workspace = true
 keywords = ["solana", "idl", "anchor", "codama", "borsh"]
 categories = ["command-line-utilities", "development-tools"]
+# The fixture and test IDLs belong to third parties, so the package ships only the code.
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 # Dependencies are limited to permissive licenses (MIT / Apache-2.0).
 [dependencies]

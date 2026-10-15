@@ -30,5 +30,5 @@ pub use decoder::run_decoder;
 pub use error::Error;
 pub use reference::Reference;
 pub use report::{Finding, Report, SamplingSummary, Severity};
-pub use samples::{AccountSample, EventSample, EventSource, InstructionSample, Samples};
+pub use samples::{AccountSample, EventSample, EventSource, InstructionSample, KeyFlags, Samples};
 pub use verify::verify;

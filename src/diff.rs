@@ -1,13 +1,14 @@
 //! Semantic diff of two IDLs, with every change classified by its effect on a parser
 //! generated from the old one.
 //!
-//! The rules follow how Shipstern's generated parsers read bytes: accounts by position,
-//! `check_min_accounts_req(len, N)` on every instruction, dispatch by discriminator, and
-//! enum variants by tag index.
+//! The rules follow how Shipstern's generated parsers read bytes: accounts by position (a
+//! missing one fails with `Account does not exist at index N`), dispatch by discriminator,
+//! and enum variants by tag index.
 
 use crate::layout::{self, LayoutError, Reading, TypeIndex};
 use crate::model::{
-    AccountItem, ArrayLen, EnumFields, Field, Format, GenericArg, Idl, Type, TypeDef, TypeDefTy,
+    AccountItem, ArrayLen, Count, EnumFields, Field, Format, GenericArg, Idl, OptionTag, Type,
+    TypeDef, TypeDefTy,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,8 @@ pub enum Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
+    ProgramAddressChanged,
+    ProgramRenamed,
     InstructionAdded,
     InstructionRemoved,
     InstructionDuplicate,
@@ -147,9 +150,8 @@ pub fn diff(old: &Idl, new: &Idl) -> Report {
     let mut r = if old.format == new.format {
         diff_names_as_given(old, new)
     } else {
-        let mut old = old.with_camel_case_names();
-        let mut new = new.with_camel_case_names();
-        // Codama inlines struct args; Borsh writes a struct as its fields, so the bytes match.
+        let mut old = with_tuple_structs(old).with_camel_case_names();
+        let mut new = with_tuple_structs(new).with_camel_case_names();
         inline_struct_args(&mut old);
         inline_struct_args(&mut new);
         // Anchor IDLs can't describe an event envelope, so there is nothing to compare.
@@ -161,32 +163,130 @@ pub fn diff(old: &Idl, new: &Idl) -> Report {
     };
     // On the names as written: the camelCase step above can split names that collide.
     report_generated_name_collisions(&new.instructions, &mut r);
+    diff_program(old, new, &mut r);
     r
 }
 
-/// Replace each arg whose type is a non-generic struct with that struct's fields.
+/// A generated parser keeps only updates whose program is its `PROGRAM_ID`, and names its
+/// module `to_snake_case(program name)`.
+fn diff_program(old: &Idl, new: &Idl, r: &mut Report) {
+    // A legacy IDL can have no address, and then there is nothing to compare.
+    if !old.address.is_empty() && !new.address.is_empty() && old.address != new.address {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::ProgramAddressChanged,
+            "program",
+            format!(
+                "program address changed: {} -> {}: parsers built from the old IDL drop every update from the new address",
+                old.address, new.address
+            ),
+        );
+    }
+    let old_mod = module_name(old);
+    let new_mod = module_name(new);
+    if old_mod != new_mod {
+        r.push(
+            Severity::Dangerous,
+            ChangeKind::ProgramRenamed,
+            "program",
+            format!(
+                "program renamed: {} -> {}: the generated module changes from `{old_mod}` to `{new_mod}`, so code that names it no longer compiles",
+                old.metadata.name, new.metadata.name
+            ),
+        );
+    }
+}
+
+/// A copy with each tuple alias written as a tuple struct, fields `_0`, `_1`, ..., as Anchor
+/// writes it (see `normalize_type_defs`). Codama writes a tuple struct as a tuple alias, and
+/// Borsh writes both the same way. A struct keeps the zero-copy layout computable.
+fn with_tuple_structs(idl: &Idl) -> Idl {
+    let mut idl = idl.clone();
+    for td in &mut idl.types {
+        if let TypeDefTy::Type {
+            alias: Type::Tuple(items),
+        } = &td.ty
+        {
+            if !items.is_empty() {
+                let fields = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| Field {
+                        name: format!("_{i}"),
+                        ty: ty.clone(),
+                    })
+                    .collect();
+                td.ty = TypeDefTy::Struct { fields };
+            }
+        }
+    }
+    idl
+}
+
+/// Replace each arg that links a non-generic struct with the struct's fields, and each arg
+/// that links a non-generic alias with the alias target, until no such arg is left. Borsh
+/// writes a struct as its fields. Converters inline to different depths: Codama inlines only
+/// a type with one use.
 fn inline_struct_args(idl: &mut Idl) {
-    let structs: BTreeMap<String, Vec<Field>> = idl
+    let bodies: BTreeMap<String, TypeDefTy> = idl
         .types
         .iter()
         .filter(|td| td.generics.is_empty())
-        .filter_map(|td| match &td.ty {
-            TypeDefTy::Struct { fields } => Some((td.name.clone(), fields.clone())),
-            _ => None,
-        })
+        .filter(|td| !matches!(td.ty, TypeDefTy::Enum { .. }))
+        .map(|td| (td.name.clone(), td.ty.clone()))
         .collect();
+    let body = |ty: &Type| match ty {
+        Type::Defined { name, generics } if generics.is_empty() => bodies.get(name),
+        _ => None,
+    };
     for ix in &mut idl.instructions {
-        ix.args = std::mem::take(&mut ix.args)
-            .into_iter()
-            .flat_map(|arg| match &arg.ty {
-                Type::Defined { name, generics } if generics.is_empty() => structs
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| vec![arg.clone()]),
-                _ => vec![arg],
-            })
-            .collect();
+        // An IDL can make a type hold itself, or nest wide structs, so cap the depth and size.
+        for _ in 0..MAX_INLINE_DEPTH {
+            if !ix.args.iter().any(|a| body(&a.ty).is_some()) {
+                break;
+            }
+            let next_len: usize = ix
+                .args
+                .iter()
+                .map(|a| match body(&a.ty) {
+                    Some(TypeDefTy::Struct { fields }) if !is_tuple(fields) => fields.len(),
+                    _ => 1,
+                })
+                .sum();
+            if next_len > MAX_INLINED_ARGS {
+                break;
+            }
+            ix.args = std::mem::take(&mut ix.args)
+                .into_iter()
+                .flat_map(|arg| match body(&arg.ty) {
+                    // Codama inlines a tuple struct as a tuple and keeps the arg name.
+                    Some(TypeDefTy::Struct { fields }) if is_tuple(fields) => vec![Field {
+                        name: arg.name.clone(),
+                        ty: Type::Tuple(fields.iter().map(|f| f.ty.clone()).collect()),
+                    }],
+                    Some(TypeDefTy::Struct { fields }) => fields.clone(),
+                    Some(TypeDefTy::Type { alias }) => vec![Field {
+                        name: arg.name.clone(),
+                        ty: alias.clone(),
+                    }],
+                    _ => vec![arg],
+                })
+                .collect();
+        }
     }
+}
+
+const MAX_INLINE_DEPTH: usize = 16;
+/// Far above any real instruction, far below what fills memory.
+const MAX_INLINED_ARGS: usize = 1024;
+
+/// Tuple fields after the camelCase step: `_0` becomes `0`.
+fn is_tuple(fields: &[Field]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .enumerate()
+            .all(|(i, f)| f.name == i.to_string())
 }
 
 fn clear_envelopes(idl: &mut Idl) {
@@ -301,6 +401,16 @@ fn diff_account_types(
                     oa.discriminator_offset, na.discriminator_offset
                 ),
             ),
+            Some(oa) if oa.size_discriminator != na.size_discriminator => r.push(
+                Severity::Breaking,
+                ChangeKind::AccountDiscriminatorChanged,
+                *name,
+                format!(
+                    "account size discriminator changed ({name}): {} -> {}: parsers built from the old IDL select it by data length",
+                    size_text(oa.size_discriminator),
+                    size_text(na.size_discriminator)
+                ),
+            ),
             _ => {}
         }
     }
@@ -345,6 +455,15 @@ fn diff_events(old: &[crate::model::Event], new: &[crate::model::Event], r: &mut
                         ChangeKind::EventDiscriminatorChanged,
                         *name,
                         msg,
+                    );
+                } else if oe.discriminator_offset != ne.discriminator_offset
+                    || oe.extra_discriminators != ne.extra_discriminators
+                {
+                    r.push(
+                        Severity::Breaking,
+                        ChangeKind::EventDiscriminatorChanged,
+                        *name,
+                        format!("event discriminator offset or chain changed ({name})"),
                     );
                 }
                 diff_event_envelope(name, oe, ne, r);
@@ -417,6 +536,10 @@ fn diff_event_envelope(
     }
 }
 
+fn size_text(size: Option<usize>) -> String {
+    size.map_or_else(|| "none".into(), |n| format!("{n} bytes"))
+}
+
 fn diff_instruction(
     oi: &crate::model::Instruction,
     ni: &crate::model::Instruction,
@@ -448,6 +571,18 @@ fn diff_instruction(
             format!(
                 "discriminator offset changed ({ix}): {} -> {}",
                 oi.discriminator_offset, ni.discriminator_offset
+            ),
+        );
+    }
+    if oi.size_discriminator != ni.size_discriminator {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::DiscriminatorChanged,
+            ix,
+            format!(
+                "size discriminator changed ({ix}): {} -> {}: parsers built from the old IDL select it by data length",
+                size_text(oi.size_discriminator),
+                size_text(ni.size_discriminator)
             ),
         );
     }
@@ -586,7 +721,7 @@ fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
                 Severity::Dangerous,
                 ChangeKind::AccountAdded,
                 subject,
-                format!("new account on instruction ({ix}#{pos}): shifts count/positions -> check_min_accounts_req expects more"),
+                format!("new account on instruction ({ix}#{pos}): a parser built from the new IDL reads it by index, so it fails on a transaction without it"),
             ),
             _ => {}
         }
@@ -756,12 +891,21 @@ fn counts_list(counts: &BTreeSet<usize>) -> String {
 fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
     let om = old.type_map();
     let nm = new.type_map();
+    let layout_attrs_changed = |(name, nt): (&String, &&TypeDef)| {
+        om.get(name)
+            .is_some_and(|ot| ot.serialization != nt.serialization || ot.repr != nt.repr)
+    };
+    let roots = if nm.iter().any(layout_attrs_changed) {
+        zero_copy_roots(old, &nm)
+    } else {
+        Vec::new()
+    };
     for (name, nt) in &nm {
         let Some(ot) = om.get(name) else { continue }; // added types reported via refs
         let is_reached = reached.contains(name);
 
         if ot.serialization != nt.serialization || ot.repr != nt.repr {
-            diff_layout_attrs(name, (old, ot), nt, reached, r);
+            diff_layout_attrs(name, ot, nt, reached, &roots, r);
         }
 
         match (&ot.ty, &nt.ty) {
@@ -850,13 +994,60 @@ fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) 
     }
 }
 
-/// `serialization` and `repr` only matter where a type is cast as zero-copy memory. Apply
-/// just this type's change to the old IDL and compare every reached zero-copy type holding it.
+/// A zero-copy account, read once with every old `serialization` and `repr`, and once with
+/// every new one. One reading per side, because changes on nested types can cancel out.
+struct Root {
+    name: String,
+    before: Reading,
+    after: Reading,
+    /// The account type and every type it holds, at any depth.
+    holds: BTreeSet<String>,
+    effect: (LayoutEffect, String),
+}
+
+/// Only accounts are cast from memory, as in Shipstern's converter: instruction args and
+/// events are always Borsh. The new attributes go on the old types, so field changes,
+/// which are reported on their own, do not count twice.
+fn zero_copy_roots(old: &Idl, new_types: &BTreeMap<String, &TypeDef>) -> Vec<Root> {
+    let mut hybrid = old.clone();
+    for td in &mut hybrid.types {
+        if let Some(nt) = new_types.get(&td.name) {
+            td.serialization.clone_from(&nt.serialization);
+            td.repr = nt.repr;
+        }
+    }
+    let (oi, hi) = (TypeIndex::new(old), TypeIndex::new(&hybrid));
+    old.accounts
+        .iter()
+        .filter_map(|account| {
+            let (before, after) = (oi.get(&account.name)?, hi.get(&account.name)?);
+            (before.is_zero_copy() || after.is_zero_copy()).then(|| Root {
+                name: account.name.clone(),
+                before: reading(before),
+                after: reading(after),
+                holds: held_types(&oi, &account.name),
+                effect: layout_effect(&oi, before, &hi, after),
+            })
+        })
+        .collect()
+}
+
+fn reading(td: &TypeDef) -> Reading {
+    if td.is_zero_copy() {
+        Reading::ZeroCopy
+    } else {
+        Reading::Borsh
+    }
+}
+
+/// `serialization` and `repr` only matter where a type is cast as zero-copy memory. Judge
+/// the change by the zero-copy accounts that hold this type and whose reading it is part of.
 fn diff_layout_attrs(
     name: &str,
-    (old, ot): (&Idl, &TypeDef),
+    ot: &TypeDef,
     nt: &TypeDef,
     reached: &BTreeSet<String>,
+    roots: &[Root],
     r: &mut Report,
 ) {
     let repr = |td: &TypeDef| {
@@ -886,40 +1077,36 @@ fn diff_layout_attrs(
         );
         return;
     }
-    let mut hybrid = old.clone();
-    for td in &mut hybrid.types {
-        if td.name == name {
-            td.serialization.clone_from(&nt.serialization);
-            td.repr = nt.repr;
-        }
-    }
-    let (oi, hi) = (TypeIndex::new(old), TypeIndex::new(&hybrid));
-    let mut worst = (LayoutEffect::None, String::new());
-    let mut any_zero_copy = false;
-    for (before, after) in old.types.iter().zip(&hybrid.types) {
-        if !(before.is_zero_copy() || after.is_zero_copy())
-            || !reached.contains(&before.name)
-            || !contains(&oi, before, name, 0)
-        {
-            continue;
-        }
-        any_zero_copy = true;
-        let effect = layout_effect(&oi, before, &hi, after);
-        if effect.0 > worst.0 {
-            worst = effect;
-        }
-    }
-    let (severity, detail) = match worst.0 {
-        LayoutEffect::None if any_zero_copy => (
-            Severity::Cosmetic,
-            "no field of a zero-copy type moves, so the bytes are the same".to_string(),
-        ),
-        LayoutEffect::None => (
+    let holders: Vec<&Root> = roots
+        .iter()
+        .filter(|root| root.holds.contains(name))
+        .collect();
+    // A zero-copy reading uses the account's own serialization and the repr of every type
+    // inside it. A nested type's serialization has no effect on it.
+    let repr_changed = layout::layout_repr(ot) != layout::layout_repr(nt);
+    let worst = holders
+        .iter()
+        .filter(|root| {
+            (root.name == name && root.before != root.after)
+                || (root.after == Reading::ZeroCopy && repr_changed)
+        })
+        .map(|root| &root.effect)
+        .max_by_key(|effect| effect.0);
+    let (severity, detail) = match worst {
+        None if holders.is_empty() => (
             Severity::Cosmetic,
             "only read as Borsh, which ignores both".to_string(),
         ),
-        LayoutEffect::Size => (Severity::Dangerous, worst.1),
-        LayoutEffect::Moves => (Severity::Breaking, worst.1),
+        None => (
+            Severity::Cosmetic,
+            "no zero-copy reading depends on this change, so the bytes are the same".to_string(),
+        ),
+        Some((LayoutEffect::None, _)) => (
+            Severity::Cosmetic,
+            "no field of a zero-copy type moves, so the bytes are the same".to_string(),
+        ),
+        Some((LayoutEffect::Size, detail)) => (Severity::Dangerous, detail.clone()),
+        Some((LayoutEffect::Moves, detail)) => (Severity::Breaking, detail.clone()),
     };
     r.push(
         severity,
@@ -937,19 +1124,13 @@ enum LayoutEffect {
 }
 
 /// Compare how a parser reads `before` and `after`; the string explains a non-`None` effect.
+/// The two must have the same fields and differ only in `serialization` and `repr`.
 fn layout_effect(
     bi: &TypeIndex<'_>,
     before: &TypeDef,
     ai: &TypeIndex<'_>,
     after: &TypeDef,
 ) -> (LayoutEffect, String) {
-    let reading = |td: &TypeDef| {
-        if td.is_zero_copy() {
-            Reading::ZeroCopy
-        } else {
-            Reading::Borsh
-        }
-    };
     let ty = Type::Defined {
         name: before.name.clone(),
         generics: Vec::new(),
@@ -964,10 +1145,9 @@ fn layout_effect(
     let type_name = &before.name;
     match (read(bi, before), read(ai, after)) {
         (Ok((bl, bs)), Ok((al, as_))) => {
-            let moved = bl.iter().find_map(|b| {
-                let a = al.iter().find(|a| a.path == b.path)?;
-                (a.offset != b.offset).then_some((b, a))
-            });
+            // Same fields, so the leaves pair up by position. Names can repeat, such as
+            // `padding_0` and `_padding_0`, which are both `padding0` in camelCase.
+            let moved = bl.iter().zip(&al).find(|(b, a)| a.offset != b.offset);
             if let Some((b, a)) = moved {
                 return (
                     LayoutEffect::Moves,
@@ -986,31 +1166,32 @@ fn layout_effect(
                 )
             }
         }
-        (Err(b), Err(a)) if a == b => (LayoutEffect::None, String::new()),
+        // Without a layout, a field can move unseen, even when both sides fail the same way.
         (Err(e), _) | (_, Err(e)) => (
             LayoutEffect::Moves,
-            format!("the zero-copy layout of {type_name} can't be computed: {e}"),
+            format!(
+                "the zero-copy layout of {type_name} can't be computed, so a field may move: {e}"
+            ),
         ),
     }
 }
 
-/// Whether `td` is `target` or holds it in its body, at any depth.
-fn contains(index: &TypeIndex<'_>, td: &TypeDef, target: &str, depth: usize) -> bool {
-    if td.name == target {
-        return true;
+/// `root` and every type it holds through fields, variant payloads and aliases.
+fn held_types(index: &TypeIndex<'_>, root: &str) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    let mut stack = vec![root.to_string()];
+    while let Some(name) = stack.pop() {
+        if held.contains(&name) {
+            continue;
+        }
+        if let Some(td) = index.get(&name) {
+            for ty in body_types(&td.ty) {
+                collect_defined_refs(ty, &mut stack);
+            }
+        }
+        held.insert(name);
     }
-    if depth > crate::layout::MAX_DEPTH {
-        return false;
-    }
-    body_types(&td.ty).into_iter().any(|ty| {
-        let mut refs = Vec::new();
-        collect_defined_refs(ty, &mut refs);
-        refs.iter().any(|name| {
-            index
-                .get(name)
-                .is_some_and(|inner| contains(index, inner, target, depth + 1))
-        })
-    })
+    held
 }
 
 fn diff_fields(ty: &str, of: &[Field], nf: &[Field], reached: bool, r: &mut Report) {
@@ -1265,6 +1446,14 @@ fn report_generated_name_collisions(instructions: &[crate::model::Instruction], 
     }
 }
 
+/// Shipstern camel-cases an Anchor program name into Codama's `program.name` first.
+fn module_name(idl: &Idl) -> String {
+    match idl.format {
+        Format::Codama => shipstern_snake_case(&idl.metadata.name),
+        _ => shipstern_snake_case(&crate::model::camel(&idl.metadata.name)),
+    }
+}
+
 /// Shipstern's `to_snake_case` (`crates/proc-macro/src/utils.rs`).
 fn shipstern_snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
@@ -1283,33 +1472,12 @@ fn shipstern_snake_case(name: &str) -> String {
 }
 
 fn collect_defined_refs(t: &Type, out: &mut Vec<String>) {
-    match t {
-        Type::Defined { name, generics } => {
-            out.push(name.clone());
-            // A generic instantiation like `Wrapper<Node>` references Node too.
-            for g in generics {
-                if let GenericArg::Type { ty } = g {
-                    collect_defined_refs(ty, out);
-                }
-            }
-        }
-        Type::Option(inner)
-        | Type::COption(inner)
-        | Type::Vec(inner)
-        | Type::Array(inner, _)
-        | Type::Set(inner) => {
-            collect_defined_refs(inner, out);
-        }
-        Type::Map(key, value) => {
-            collect_defined_refs(key, out);
-            collect_defined_refs(value, out);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                collect_defined_refs(item, out);
-            }
-        }
-        _ => {}
+    // A generic instantiation like `Wrapper<Node>` references Node too.
+    if let Type::Defined { name, .. } = t {
+        out.push(name.clone());
+    }
+    for child in t.children() {
+        collect_defined_refs(child, out);
     }
 }
 
@@ -1371,5 +1539,28 @@ fn tystr(t: &Type) -> String {
             format!("{name}<{}>", args.join(", "))
         }
         Type::Generic(name) => name.clone(),
+        Type::Struct(fields) => {
+            let fields: Vec<String> = fields.iter().map(field_str).collect();
+            format!("{{ {} }}", fields.join(", "))
+        }
+        Type::ShortU16 => "shortU16".into(),
+        Type::BigEndian(i) => format!("{} big-endian", tystr(i)),
+        Type::Counted {
+            ty,
+            count: Count::Prefix(p),
+        } => format!("{} with {} length", tystr(ty), tystr(p)),
+        Type::Counted {
+            ty,
+            count: Count::Remainder,
+        } => format!("{} to end of data", tystr(ty)),
+        Type::CodamaOption { item, tag } => {
+            let tag = match tag {
+                OptionTag::Prefix { ty, fixed: false } => format!("{} tag", tystr(ty)),
+                OptionTag::Prefix { ty, fixed: true } => format!("{} tag, fixed size", tystr(ty)),
+                OptionTag::Zeroable => "zero means none".to_string(),
+                OptionTag::Remainder => "none at end of data".to_string(),
+            };
+            format!("Option<{}> ({tag})", tystr(item))
+        }
     }
 }

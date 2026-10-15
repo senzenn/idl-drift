@@ -69,7 +69,20 @@ impl From<Tier> for Severity {
 }
 
 fn main() -> ExitCode {
-    let result = match Cli::parse().cmd {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version are not errors; a usage error exits 2, so JSON must say so.
+            if e.use_stderr() && std::env::args_os().any(|a| a == "--json") {
+                let text = e.to_string();
+                let text = text.trim();
+                print_error_json(text.strip_prefix("error: ").unwrap_or(text));
+            }
+            e.exit()
+        }
+    };
+    let json = matches!(cli.cmd, Cmd::Diff { json: true, .. });
+    let result = match cli.cmd {
         Cmd::Diff {
             old,
             new,
@@ -82,35 +95,73 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let _ = writeln!(io::stderr(), "error: {e}");
+            // A failed report write can leave part of a JSON object; do not add a second one.
+            if json && !matches!(e, Failure::Write(_)) {
+                print_error_json(&e.to_string());
+            }
             ExitCode::from(2)
         }
     }
 }
 
-fn load(path: &Path) -> Result<Idl, String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    Idl::from_json(&src).map_err(|e| format!("parse {}: {e}", path.display()))
+/// Why a run exits 2.
+enum Failure {
+    /// A file could not be read or parsed.
+    Input(String),
+    Write(io::Error),
 }
 
-fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8, String> {
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(message) => f.write_str(message),
+            Self::Write(e) => write!(f, "write report: {e}"),
+        }
+    }
+}
+
+/// The `--json` form of a run that exits 2. The keys are the same as in `idl-verify`.
+fn print_error_json(message: &str) {
+    let _ = writeln!(
+        io::stdout(),
+        "{:#}",
+        serde_json::json!({ "error": message, "exit_code": 2 })
+    );
+}
+
+/// A reader that stops early, such as `head`, closes the pipe. That does not change the
+/// result, so the exit code stays the same.
+fn written(result: io::Result<()>) -> Result<(), Failure> {
+    match result {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(Failure::Write(e)),
+        _ => Ok(()),
+    }
+}
+
+fn load(path: &Path) -> Result<Idl, Failure> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| Failure::Input(format!("read {}: {e}", path.display())))?;
+    Idl::from_json(&src).map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))
+}
+
+fn run_diff(old: &Path, new: &Path, json: bool, fail_on: Severity) -> Result<u8, Failure> {
     let report = diff(&load(old)?, &load(new)?);
     let code = u8::from(report.fails_at(fail_on));
-    let written = if json {
+    written(if json {
         print_json(&report, code)
     } else {
         print_human(&report, code)
-    };
-    written.map_err(|e| format!("write report: {e}"))?;
+    })?;
     Ok(code)
 }
 
-fn run_inspect(path: &Path, layout: bool) -> Result<u8, String> {
+fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
     let idl = load(path)?;
     let report = coverage(&idl);
     let shared = shared_types(&idl);
-    print_coverage(&report, &shared).map_err(|e| format!("write report: {e}"))?;
+    written(print_coverage(&report, &shared))?;
     if layout {
-        print_layouts(&layouts(&idl)).map_err(|e| format!("write report: {e}"))?;
+        written(print_layouts(&layouts(&idl)))?;
     }
     Ok(u8::from(!report.fully_mapped() || !shared.is_empty()))
 }

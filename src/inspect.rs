@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::diff::reachable_types;
 use crate::layout::{LayoutError, Padding, Reading, StructLayout, TypeIndex};
-use crate::model::{EnumFields, GenericArg, Idl, Repr, Type, TypeDef, TypeDefTy};
+use crate::model::{EnumFields, Idl, Repr, Type, TypeDef, TypeDefTy};
 
 /// A field or instruction arg whose type is or contains `Type::Generic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,54 +103,14 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
 }
 
 fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
-    match ty {
-        Type::Generic(kind) => {
-            out.push(UnmappedField {
-                path: path.to_string(),
-                kind: kind.clone(),
-            });
-        }
-        Type::Option(inner)
-        | Type::COption(inner)
-        | Type::Vec(inner)
-        | Type::Array(inner, _)
-        | Type::Set(inner) => {
-            collect_generic(path, inner, out);
-        }
-        Type::Map(key, value) => {
-            collect_generic(path, key, out);
-            collect_generic(path, value, out);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                collect_generic(path, item, out);
-            }
-        }
-        Type::Defined { generics, .. } => {
-            for g in generics {
-                if let crate::model::GenericArg::Type { ty } = g {
-                    collect_generic(path, ty, out);
-                }
-            }
-        }
-        Type::Bool
-        | Type::U8
-        | Type::I8
-        | Type::U16
-        | Type::I16
-        | Type::U32
-        | Type::I32
-        | Type::U64
-        | Type::I64
-        | Type::U128
-        | Type::I128
-        | Type::U256
-        | Type::I256
-        | Type::F32
-        | Type::F64
-        | Type::Bytes
-        | Type::String
-        | Type::Pubkey => {}
+    if let Type::Generic(kind) = ty {
+        out.push(UnmappedField {
+            path: path.to_string(),
+            kind: kind.clone(),
+        });
+    }
+    for child in ty.children() {
+        collect_generic(path, child, out);
     }
 }
 
@@ -285,30 +245,11 @@ fn reachable<'a>(index: &TypeIndex<'a>, mut stack: Vec<&'a str>) -> BTreeSet<&'a
 }
 
 fn push_defined<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
-    match ty {
-        Type::Defined { name, generics } => {
-            out.push(name);
-            for g in generics {
-                if let GenericArg::Type { ty } = g {
-                    push_defined(ty, out);
-                }
-            }
-        }
-        Type::Option(inner)
-        | Type::COption(inner)
-        | Type::Vec(inner)
-        | Type::Array(inner, _)
-        | Type::Set(inner) => push_defined(inner, out),
-        Type::Map(key, value) => {
-            push_defined(key, out);
-            push_defined(value, out);
-        }
-        Type::Tuple(items) => {
-            for item in items {
-                push_defined(item, out);
-            }
-        }
-        _ => {}
+    if let Type::Defined { name, .. } = ty {
+        out.push(name);
+    }
+    for child in ty.children() {
+        push_defined(child, out);
     }
 }
 

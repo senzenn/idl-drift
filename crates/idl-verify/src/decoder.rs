@@ -183,6 +183,7 @@ mod tests {
                 signature: "S".into(),
                 data: vec![3],
                 accounts: vec!["K".into()],
+                flags: None,
             }],
             events: Vec::new(),
         }

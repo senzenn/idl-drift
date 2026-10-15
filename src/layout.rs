@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::model::{ArrayLen, EnumFields, Idl, Repr, ReprKind, Type, TypeDef, TypeDefTy};
+use crate::model::{
+    ArrayLen, EnumFields, Idl, OptionTag, Repr, ReprKind, Type, TypeDef, TypeDefTy,
+};
 
 /// Deeper nesting than this is treated as a recursive type.
 pub const MAX_DEPTH: usize = 64;
@@ -210,11 +212,7 @@ impl<'a> TypeIndex<'a> {
         if !td.generics.is_empty() {
             return Err(LayoutError::unknown("generic types have no fixed layout"));
         }
-        let repr = td.repr.unwrap_or(Repr {
-            kind: ReprKind::C,
-            packed: false,
-            align: None,
-        });
+        let repr = layout_repr(td);
         match repr.kind {
             ReprKind::Rust => {
                 return Err(LayoutError::unknown("repr(Rust) may reorder fields"));
@@ -337,6 +335,16 @@ impl<'a> TypeIndex<'a> {
                     "`{name}` is generic or unsupported"
                 )));
             }
+            // Only Codama IDLs have these, and Codama types are always Borsh.
+            Type::Struct(_)
+            | Type::ShortU16
+            | Type::BigEndian(_)
+            | Type::Counted { .. }
+            | Type::CodamaOption { .. } => {
+                return Err(LayoutError::unknown(
+                    "a Codama encoding has no zero-copy layout",
+                ));
+            }
         })
     }
 
@@ -360,6 +368,16 @@ impl<'a> TypeIndex<'a> {
                 .map(|n| n.checked_mul(*len).ok_or(LayoutError::Overflow))
                 .transpose()?,
             Type::Tuple(items) => self.sum_sizes(items.iter(), depth)?,
+            Type::Struct(fields) => self.sum_sizes(fields.iter().map(|f| &f.ty), depth)?,
+            Type::BigEndian(inner)
+            | Type::CodamaOption {
+                item: inner,
+                tag: OptionTag::Zeroable,
+            } => self.borsh_size_at(inner, depth + 1)?,
+            Type::CodamaOption {
+                item,
+                tag: OptionTag::Prefix { ty, fixed: true },
+            } => self.sum_sizes([&**ty, &**item].into_iter(), depth)?,
             Type::Defined { name, generics } if generics.is_empty() => {
                 let td = self.lookup(name)?;
                 if !td.generics.is_empty() {
@@ -409,7 +427,10 @@ impl<'a> TypeIndex<'a> {
             | Type::Set(_)
             | Type::Array(_, ArrayLen::Generic(_))
             | Type::Defined { .. }
-            | Type::Generic(_) => None,
+            | Type::Generic(_)
+            | Type::ShortU16
+            | Type::Counted { .. }
+            | Type::CodamaOption { .. } => None,
         })
     }
 
@@ -536,6 +557,16 @@ impl fmt::Display for LayoutError {
 }
 
 impl std::error::Error for LayoutError {}
+
+/// The `repr` that sets a struct's zero-copy layout. A type with no `repr` is laid out as
+/// `repr(C)`.
+pub(crate) fn layout_repr(td: &TypeDef) -> Repr {
+    td.repr.unwrap_or(Repr {
+        kind: ReprKind::C,
+        packed: false,
+        align: None,
+    })
+}
 
 fn round_up(offset: usize, align: usize) -> Result<usize, LayoutError> {
     offset
