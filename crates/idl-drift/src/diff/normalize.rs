@@ -266,7 +266,7 @@ fn substitute(ty: &mut Type, scope: &BTreeMap<&str, &GenericArg>) {
         }
         Type::Array(_, len) => {
             if let ArrayLen::Generic(name) = len {
-                if let Some(n) = konst(name).and_then(|v| v.parse().ok()) {
+                if let Some(n) = konst(name).and_then(|v| crate::model::const_len(&v)) {
                     *len = ArrayLen::Value(n);
                 }
             }

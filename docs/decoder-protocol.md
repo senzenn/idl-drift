@@ -81,7 +81,7 @@ Write values in serde's plain JSON shapes. idl-verify accepts these forms:
 |---|---|
 | Integer, up to 32 bits | A JSON number. |
 | Integer, 64 bits or wider | A JSON number, a decimal string, or `{"bn":"<decimal>"}`. Use a string or `{"bn":...}` for a value that does not fit in a `u64`. |
-| Pubkey | A base58 string. |
+| Pubkey | A base58 string, or an array of its 32 bytes, as serde writes a `Pubkey`. |
 | Bytes | An array of numbers. |
 | Option | `null` for `None`, else the inner value. |
 | Struct | An object. Field names compare without case and without underscores, so `last_updated_epoch` matches `lastUpdatedEpoch`. A Shipstern tuple field `item_0` matches `0`. |

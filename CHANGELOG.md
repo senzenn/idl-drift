@@ -28,6 +28,8 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   define, and padded zero-copy types that Borsh also reads. `--layout` prints each zero-copy
   type field by field. A generic parameter that its type declares is not unresolved.
 - Shank IDLs: instruction tags come from `discriminant`. Shank maps and sets load.
+- Const generic values are read as Codama's Anchor converter and Shipstern read them (JS
+  `parseInt`), so `" +0X20zz"` is 32.
 - `type_undefined` (Breaking): the new IDL uses a type that it does not define.
 - An account that leaves `accounts` while its type stays in `types` is Dangerous, not
   Breaking. Anchor 1.x lists only the accounts that the program owns.
@@ -46,6 +48,9 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
 - Live sampling stops at the program's last deploy, skips a transaction that the RPC no
   longer keeps, and downloads only the accounts that the program owns.
 - Shank accounts give one note, not errors: a Shank IDL does not map its accounts to types.
+- An account type that only its size picked, with no discriminator, gives a note: a parser
+  that selects accounts only by a discriminator, such as Shipstern's, cannot decode it.
+- Value comparison accepts a public key as its 32 bytes, as serde writes a `Pubkey` (Carbon).
 - `--upgrade-impact` puts each sampled account in a class under a new IDL: ok, shorter,
   needs a realloc (with the extra rent) or broken. The `upgrade_impact` check reports them.
 - Checks for discriminators, missing types, decode failures, unused bytes, zero-copy

@@ -618,6 +618,23 @@ pub enum GenericArg {
     Const { value: String },
 }
 
+/// The length in a const generic argument, read the way Codama's Anchor converter and Shipstern
+/// read it (JS `parseInt`): leading spaces, an optional `+`, hex after `0x`, digits up to the
+/// first other character.
+#[must_use]
+pub fn const_len(value: &str) -> Option<usize> {
+    let s = value.trim_start();
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (s, 10),
+    };
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    usize::from_str_radix(digits.get(..end)?, radix).ok()
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(from = "ArrayLenJson")]
 pub enum ArrayLen {

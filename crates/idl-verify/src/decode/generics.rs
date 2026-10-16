@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use idl_drift::model::{ArrayLen, GenericArg, Type, TypeDef};
+use idl_drift::model::{const_len, ArrayLen, GenericArg, Type, TypeDef};
 
 use super::DecodeErrorKind;
 
@@ -82,9 +82,9 @@ pub(super) fn resolve_len(len: &ArrayLen, scope: &Scope) -> Result<usize, Decode
     match len {
         ArrayLen::Value(n) => Ok(*n),
         ArrayLen::Generic(name) => match scope.get(name) {
-            Some(GenericArg::Const { value }) => value
-                .parse()
-                .map_err(|_| DecodeErrorKind::UnresolvedGeneric(name.clone())),
+            Some(GenericArg::Const { value }) => {
+                const_len(value).ok_or_else(|| DecodeErrorKind::UnresolvedGeneric(name.clone()))
+            }
             _ => Err(DecodeErrorKind::UnresolvedGeneric(name.clone())),
         },
     }

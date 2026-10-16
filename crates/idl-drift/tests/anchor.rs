@@ -206,3 +206,20 @@ fn account_dropped_from_accounts_with_its_type_kept_is_dangerous() {
         ]
     );
 }
+
+#[test]
+fn const_generic_values_read_like_js_parse_int() {
+    use idl_drift::model::const_len;
+    // Shipstern's `shapes` fixture writes `[u8; N]` with N = " +0X20zz" and expects 32.
+    let cases = [
+        ("32", Some(32)),
+        (" +0X20zz", Some(32)),
+        ("12abc", Some(12)),
+        ("0x", None),
+        ("abc", None),
+        ("-5", None),
+    ];
+    for (value, want) in cases {
+        assert_eq!(const_len(value), want, "{value:?}");
+    }
+}

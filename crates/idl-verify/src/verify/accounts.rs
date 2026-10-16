@@ -95,6 +95,22 @@ impl Verifier<'_> {
             if idxs.is_empty() {
                 not_sampled.push(nd.name.clone());
             } else {
+                // Only a size guess picked this type. Shipstern's parser, for one, selects
+                // accounts only by a discriminator, so it rejects these accounts.
+                if nd.discriminator.is_empty() && nd.size_discriminator.is_none() {
+                    self.push(
+                        Severity::Note,
+                        Check::Discriminator,
+                        &format!("account {}", nd.name),
+                        format!(
+                            "the IDL gives no discriminator, so idl-verify picked {} {} by size",
+                            idxs.len(),
+                            plural(idxs.len(), "sample", "samples")
+                        ),
+                        Some("a parser that selects accounts only by a discriminator, such as Shipstern's, cannot decode this type".to_string()),
+                        None,
+                    );
+                }
                 summaries.push(self.check_account_type(nd, idxs));
             }
         }
@@ -548,6 +564,28 @@ mod tests {
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
 
     #[test]
+    fn account_picked_only_by_size_is_a_note() {
+        let idl = idl(
+            r#""accounts":[{"name":"A","discriminator":[]}],"instructions":[],
+            "types":[{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}]"#,
+        );
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "a".into(),
+                data: vec![1, 0, 0, 0],
+            }],
+            ..Samples::default()
+        };
+        let report = verify(&idl, &samples, None);
+        let f = only(&report);
+        assert_eq!(
+            (f.severity, f.check),
+            (Severity::Note, Check::Discriminator)
+        );
+        assert_eq!(report.account_coverage.classified, 1);
+    }
+
+    #[test]
     fn shank_accounts_are_a_note_not_an_error() {
         let shank = Idl::from_json(
             r#"{"version":"1","name":"t","metadata":{"origin":"shank","address":"P"},"instructions":[],
@@ -742,7 +780,18 @@ mod tests {
         };
         // 4 bytes by the declared size, 16 by the computed Borsh size.
         let report = verify(&idl, &raw(&[&[1, 0, 0, 0], &[0; 16]]), None);
-        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        // One note for each type that only its size picked.
+        let kinds: Vec<_> = report
+            .findings
+            .iter()
+            .map(|f| (f.severity, f.check))
+            .collect();
+        assert_eq!(
+            kinds,
+            [(Severity::Note, Check::Discriminator); 2],
+            "{:#?}",
+            report.findings
+        );
         assert_eq!(report.accounts.len(), 2);
         // A length that no type has is an error that names the length.
         let report = verify(&idl, &raw(&[&[0; 7]]), None);

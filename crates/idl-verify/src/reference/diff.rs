@@ -62,6 +62,28 @@ fn diff_at(ours: &Json, theirs: &Json, path: &mut Vec<String>) -> Option<Differe
     }
 }
 
+/// A public key as base58 text on one side and as its 32 bytes on the other, as a serde derive
+/// on `Pubkey` writes it (Carbon's decoders do). `None` when the pair is not of that shape.
+fn key_as_bytes(ours: &Json, theirs: &Json) -> Option<bool> {
+    let ((Json::String(text), Json::Array(items)) | (Json::Array(items), Json::String(text))) =
+        (ours, theirs)
+    else {
+        return None;
+    };
+    if items.len() != 32 {
+        return None;
+    }
+    let bytes: Vec<u8> = items
+        .iter()
+        .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+        .collect::<Option<_>>()?;
+    let key = bs58::decode(text)
+        .into_vec()
+        .ok()
+        .filter(|k| k.len() == 32)?;
+    Some(key == bytes)
+}
+
 /// Whether a shape rule applies, and if so its result.
 enum Shape {
     NoRule,
@@ -71,6 +93,9 @@ enum Shape {
 /// Rules for two writings of the same value: wrappers that one decoder adds and the other
 /// does not.
 fn shape_rule(ours: &Json, theirs: &Json, path: &mut Vec<String>) -> Shape {
+    if let Some(same) = key_as_bytes(ours, theirs) {
+        return Shape::Compared((!same).then(|| difference(path, ours, theirs)));
+    }
     Shape::Compared(match (ours, theirs) {
         // Big integers are a single value, however they are wrapped: `{"bn":"5"}`, 5 or "5".
         (Json::Object(a), _) | (_, Json::Object(a)) if is_big_int(a) => (big_int_text(peel(ours))
@@ -284,6 +309,15 @@ fn short(value: &Json) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_key_as_base58_matches_its_32_bytes() {
+        let system = json!("11111111111111111111111111111111");
+        assert_eq!(first_difference(&system, &json!(vec![0; 32])), None);
+        let mut other = vec![0; 32];
+        other[31] = 1;
+        assert!(first_difference(&system, &json!(other)).is_some());
+    }
 
     #[test]
     fn serde_shapes_compare_equal_to_the_plain_form() {
