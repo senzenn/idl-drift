@@ -5,7 +5,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
+## [0.1.0] - 2026-10-16
+
+The first release of `idl-drift` and `idl-verify`.
 
 ### Added
 

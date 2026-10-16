@@ -3,8 +3,8 @@
 Find the Solana IDL changes that make parsers, indexers and clients read the wrong bytes.
 Find them before your users do.
 
-**Status:** 0.1.0 is not released. Rule names, check names, JSON keys and exit codes are
-stable.
+**Status:** 0.1.0 is the first release. Rule names, check names, JSON keys and exit codes
+are stable.
 
 ## The problem
 
@@ -63,9 +63,17 @@ flowchart LR
 You need Rust 1.91 or newer.
 
 ```bash
-cargo install --locked --git https://github.com/senzenn/idl-drift idl-drift
-cargo install --locked --git https://github.com/senzenn/idl-drift idl-verify
+cargo install --locked idl-drift idl-verify
 ```
+
+To build the latest commit on `main`:
+
+```bash
+cargo install --locked --git https://github.com/senzenn/idl-drift idl-drift idl-verify
+```
+
+Binaries for Linux and macOS (x86_64 and arm64) are on the
+[releases page](https://github.com/senzenn/idl-drift/releases).
 
 The commands in [Quick start](#quick-start) use the fixture files of this repository. Clone
 it to run them:
@@ -170,7 +178,6 @@ Both tools use the same exit codes:
 ## Use it in CI
 
 The GitHub Action runs either tool in one step and writes the report to the job summary.
-It works after the first release (v0.1.0).
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
