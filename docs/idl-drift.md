@@ -250,7 +250,7 @@ The `#` in `Pool#1` is part of the subject, because no space comes before it.
 
 ## Exit codes
 
-The exit codes are in the [quick guide](../QUICKGUIDE.md#exit-codes). A reader that closes
+The exit codes are in the [README](../README.md#exit-codes). A reader that closes
 the pipe early, such as `head`, does not change the exit code.
 
 ## JSON output

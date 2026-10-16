@@ -71,7 +71,7 @@ In the tables:
 | `--rpc <URL>` | Take samples from a live cluster over JSON-RPC. The env var `IDL_VERIFY_RPC_URL` sets the same value. Use the env var: `ps` and shell history show a URL on the command line. |
 | `--program <ID>` | With `--rpc`: the program to sample. Default: the IDL's `address`. |
 | `--max-tx <N>` | With `--rpc`: read at most N successful transactions. Default: 40. |
-| `--stall <N>` | With `--rpc`: stop after N successful transactions in a row bring no new instruction or event kind. Default: 40. |
+| `--stall <N>` | With `--rpc`: stop after N successful transactions in a row bring no new instruction or event kind. Default: 40. It stops a run only when `--max-tx` is larger than N, so with the defaults `--max-tx` stops first. |
 | `--save-samples <PATH>` | With `--rpc`: write the live samples to this file, in the samples format. |
 | `--reference <PATH>` | Compare values with the output of the reference decoder. See [reference decoder](#reference-decoder). |
 | `--decoder <CMD>` | Compare values with a decoder under test. See [decoder-protocol.md](decoder-protocol.md). |
@@ -96,7 +96,7 @@ Rules for the options:
 
 ## Exit codes
 
-The exit codes are in the [quick guide](../QUICKGUIDE.md#exit-codes). With the default
+The exit codes are in the [README](../README.md#exit-codes). With the default
 `--fail-on error`, a run that exits 0 can still report warnings and notes. A run never
 passes on data that it did not check: it exits 2.
 
@@ -138,7 +138,7 @@ explorer.
 | `layout` | error or warning | Error: a `bytemuck` (Pod) type whose calculated layout has padding. Pod forbids padding, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not fix (an option, vec, enum or generic inside it, `repr(Rust)` without `packed`, or `repr(Rust, packed)` with a bool inside it). idl-verify reports it as not verifiable, and does not guess. |
 | `size_distribution` | note | A fixed-size account type has more than one size, such as accounts created before an upgrade. |
 | `coverage` | error | Only with `--min-coverage`: less than the given percent of the IDL's account types, instructions or events have a sample. One finding for each kind that is short. |
-| `account_count` | error, warning or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Note: only optional accounts are missing at the tail, or a Codama instruction with `optionalAccountStrategy: "omitted"` leaves out absent optional accounts. Note: samples pass more accounts than the IDL lists (remaining accounts). |
+| `account_count` | error or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Note: only optional accounts are missing at the tail, or a Codama instruction with `optionalAccountStrategy: "omitted"` leaves out absent optional accounts. Note: samples pass more accounts than the IDL lists (remaining accounts). |
 | `fixed_address` | error, warning or note | An account that the IDL gives an address (a program or sysvar) holds another key. Error: an Anchor `address` holds another key, so the IDL's account order does not match the program. A Codama `publicKeyValueNode` default fills the account only when the caller gives no key, so the program can accept another key. Note: another key is at the position of a Codama default. Warning: the default key is at another position, so the accounts likely moved. An absent optional account passed as the program id is accepted. |
 | `account_flags` | error | An account that the IDL marks `writable` gets a key that the transaction makes read-only, or an account that the IDL marks `signer` gets a key that does not sign the transaction. The IDL's account order probably does not match the program, or an earlier account is missing. Only samples with flags are checked (see [the samples file](#the-samples-file)). A key with more privileges than the IDL asks for is accepted, because the transaction flags cover each instruction in it. The signer check uses only top-level instructions, because a CPI can sign for a PDA. A Codama `isSigner: "either"` account and an absent optional account are accepted. |
 | `pda` | error or note | An account that the IDL derives from seeds (Anchor `pda`, Codama `pdaValueNode` default) gets a key that its seeds do not give. Error: the derived address is passed at another position in the same instruction, so the IDL's account order does not match the program, or an earlier account is missing. Note: the derived address is not in the instruction, so the seeds may read data that the IDL does not show. A sample is skipped when a seed cannot be resolved: a path into account data (`pool.mint`) or an absent optional account. A seed path into a struct argument (`params.id`) reads the decoded argument. When the IDL names a program for the seeds, the sampled program id is also tried, because the IDL can come from another deployment. |
@@ -153,8 +153,8 @@ When an account has more bytes than the IDL reads, idl-verify tries to explain t
 - **The size is the `repr(C)` size.** The IDL lays out as Borsh a type that the program
   casts as `repr(C)`, and drops its implicit padding. Fields after the first gap are
   misread. Error, with the location of the padding.
-- **The size is the used size rounded up to 8.** This is a common pattern of spare
-  allocation, but not proof. Warning: compare with the program source.
+- **The size is the used size rounded up to 8, on a Borsh type.** This is a common pattern
+  of spare allocation, but not proof. Warning: compare with the program source.
 - **Extra bytes that are all zero on a fixed-size Borsh type.** This is usually spare
   allocation from Anchor's `space`, but a missing field that is zero in each sample looks
   the same. Warning.

@@ -400,9 +400,9 @@ fn deploy_slot(
             Ok(Some((account.owner, data)))
         };
     let slot_at = |data: &[u8], at: usize| {
-        data.get(at..at + 8)
-            .and_then(|b| b.try_into().ok())
-            .map(u64::from_le_bytes)
+        data.get(at..)
+            .and_then(<[u8]>::first_chunk::<8>)
+            .map(|b| u64::from_le_bytes(*b))
     };
     let Some((owner, data)) = first_bytes(program_id, 36)? else {
         return Ok(None);

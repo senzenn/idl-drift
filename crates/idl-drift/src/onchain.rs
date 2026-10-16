@@ -383,7 +383,7 @@ pub fn anchor_idl_address(program: &[u8; 32]) -> Option<[u8; 32]> {
 /// When the data is short, has another discriminator, or does not decompress to UTF-8 text
 /// of at most [`MAX_IDL_BYTES`].
 pub fn decode_anchor(data: &[u8]) -> Result<String, DecodeError> {
-    let header = header(data, ANCHOR_HEADER_LEN)?;
+    let header = header::<ANCHOR_HEADER_LEN>(data)?;
     if header[..8] != ANCHOR_DISCRIMINATOR {
         return Err(DecodeError::Discriminator);
     }
@@ -401,7 +401,7 @@ pub fn decode_anchor(data: &[u8]) -> Result<String, DecodeError> {
 /// stored in the account, or the data does not decompress to UTF-8 text of at most
 /// [`MAX_IDL_BYTES`].
 pub fn decode_metadata(data: &[u8], program: &[u8; 32]) -> Result<String, DecodeError> {
-    let header = header(data, METADATA_HEADER_LEN)?;
+    let header = header::<METADATA_HEADER_LEN>(data)?;
     if header[0] != METADATA_DISCRIMINATOR {
         return Err(DecodeError::Discriminator);
     }
@@ -437,9 +437,10 @@ pub fn decode_metadata(data: &[u8], program: &[u8; 32]) -> Result<String, Decode
     }
 }
 
-fn header(data: &[u8], len: usize) -> Result<&[u8], DecodeError> {
-    data.get(..len).ok_or(DecodeError::Truncated {
-        need: len,
+/// The first `N` bytes as an array, so that the compiler checks each constant field offset.
+fn header<const N: usize>(data: &[u8]) -> Result<&[u8; N], DecodeError> {
+    data.first_chunk::<N>().ok_or(DecodeError::Truncated {
+        need: N,
         len: data.len(),
     })
 }

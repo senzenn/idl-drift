@@ -51,7 +51,8 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
 - Checks for discriminators, missing types, decode failures, unused bytes, zero-copy
   layouts, size distribution, account counts, fixed addresses, account flags, PDA seeds,
   event envelopes, program id and coverage, with hints for unused bytes. All-zero extra
-  bytes on a fixed-size Borsh account are a warning, not an error.
+  bytes on a fixed-size Borsh account are a warning, not an error. On a zero-copy
+  account, unused bytes stay an error, also at a size rounded up to 8.
 - Codama instructions with `optionalAccountStrategy: "omitted"` map the passed accounts to
   IDL positions, so a left-out optional account gives no false finding.
 - A Codama default public key is not a constraint. Another key there is a note. An Anchor

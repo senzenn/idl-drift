@@ -44,8 +44,7 @@ There are two tools:
   program. It counts the bytes that the IDL does not read, so it finds a missing field even
   when the decoded values look correct.
 
-Both tools read Anchor IDLs (0.30 spec and legacy) and Codama IDLs (spec 1.x). Both use the
-same exit codes: 0 when clean, 1 on a finding, 2 when the tool cannot run.
+Both tools read Anchor IDLs (0.30 spec and legacy), Codama IDLs (spec 1.x) and Shank IDLs.
 
 ```mermaid
 flowchart LR
@@ -57,10 +56,44 @@ flowchart LR
     verify --> report[report and upgrade impact]
 ```
 
-### 1. Compare two versions of an IDL
+## Install
+
+You need Rust 1.91 or newer.
 
 ```bash
-idl-drift diff old.json new.json
+cargo install --locked --git https://github.com/senzenn/idl-drift idl-drift
+cargo install --locked --git https://github.com/senzenn/idl-drift idl-verify
+```
+
+The commands in [Quick start](#quick-start) use the fixture files of this repository. Clone
+it to run them:
+
+```bash
+git clone https://github.com/senzenn/idl-drift && cd idl-drift
+```
+
+## Quick start
+
+### 1. Make sure that the tools can read each field
+
+```bash
+idl-drift inspect fixtures/live/voltr_vault/idl.json
+```
+
+```text
+instructions: 28  accounts: 6  events: 26  types: 44
+unmapped (Generic) fields: 0
+undefined types: 0
+padded zero-copy types also read as Borsh: 0
+```
+
+An `UNMAPPED:` line names a field that neither tool can check. An `UNDEFINED:` line names a
+type that the IDL uses but does not define.
+
+### 2. Compare two versions of an IDL
+
+```bash
+idl-drift diff crates/idl-drift/tests/fixtures/amm_old.json crates/idl-drift/tests/fixtures/amm_new.json
 ```
 
 ```text
@@ -71,7 +104,10 @@ summary: 1 breaking, 1 dangerous, 1 additive, 0 cosmetic
 exit code: 1
 ```
 
-### 2. Compare your new IDL with the IDL on chain
+`--fail-on dangerous` also fails on Dangerous changes. `--json` and `--markdown` print the
+report for a script or a job summary.
+
+### 3. Compare your new IDL with the IDL on chain
 
 The old version is the IDL that the program publishes, in its Program Metadata account or
 its Anchor IDL account. Keep the RPC URL out of the command line.
@@ -81,11 +117,12 @@ export IDL_DRIFT_RPC_URL=<your RPC URL>
 idl-drift diff --onchain <PROGRAM_ID> target/idl/my_program.json
 ```
 
-### 3. Check an IDL against mainnet data
+### 4. Check an IDL against real data
+
+From captured samples. This Codama conversion drops 7 bytes of padding:
 
 ```bash
-export IDL_VERIFY_RPC_URL=<your RPC URL>
-idl-verify --idl idl.json
+idl-verify --idl fixtures/live/voltr_vault/idl.js-codama.json --samples fixtures/live/voltr_vault/samples.json
 ```
 
 ```text
@@ -93,7 +130,15 @@ error: account adaptorAddReceipt: 7 of 152 bytes unused in 5 of 5 samples
   hint: 152 bytes is exactly the repr(C) layout (8 + 144), which pads 7 bytes before `lastUpdatedEpoch`. ...
 ```
 
-### 4. Measure the upgrade impact before a deploy
+From live mainnet data, at the IDL's address. `--save-samples` keeps the samples, so that
+you can run the same check again offline with `--samples`:
+
+```bash
+export IDL_VERIFY_RPC_URL=<your RPC URL>
+idl-verify --idl idl.json --save-samples samples.json
+```
+
+### 5. Measure the upgrade impact before a deploy
 
 `--upgrade-impact` reads the live accounts of the program with the new IDL. It counts the
 accounts that break or need a realloc, and the extra rent.
@@ -110,17 +155,15 @@ idl-verify --idl new.json --upgrade-impact
 extra rent for the 5 accounts that need a realloc: 203200 lamports, ...
 ```
 
-## Install
+## Exit codes
 
-You need Rust 1.91 or newer.
+Both tools use the same exit codes:
 
-```bash
-git clone https://github.com/senzenn/idl-drift && cd idl-drift
-cargo install --locked --path crates/idl-drift
-cargo install --locked --path crates/idl-verify
-```
-
-The [quick guide](QUICKGUIDE.md) runs each tool on the fixtures in this repository.
+| Code | Meaning |
+|---|---|
+| `0` | No finding at or above `--fail-on`. |
+| `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, or a padded zero-copy type that Borsh also reads. |
+| `2` | The tool could not run: a file could not be read or parsed, an option is wrong, or (idl-verify) the RPC or decoder failed or nothing was sampled. |
 
 ## Use it in CI
 
@@ -135,7 +178,42 @@ It works after the first release (v0.1.0).
 ```
 
 On a pull request, this compares the IDL with its version on the base branch. See
-[docs/ci.md](docs/ci.md) for the nightly `idl-verify` job, the allow file and the inputs.
+[docs/ci.md](https://github.com/senzenn/idl-drift/blob/main/docs/ci.md) for the nightly `idl-verify` job, the allow file and the inputs.
+
+## Use it as a library
+
+Both crates are also libraries. `idl_drift` diffs two IDLs:
+
+```rust
+use idl_drift::{diff, model::Idl};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let old = Idl::from_json(&std::fs::read_to_string("old.json")?)?;
+    let new = Idl::from_json(&std::fs::read_to_string("new.json")?)?;
+    let report = diff(&old, &new);
+    for change in &report.changes {
+        println!("{:?} {:?} {}: {}", change.severity, change.kind, change.subject, change.message);
+    }
+    std::process::exit(report.exit_code());
+}
+```
+
+`idl_verify` checks an IDL against samples:
+
+```rust
+use idl_drift::model::Idl;
+use idl_verify::{verify, Samples};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let idl = Idl::from_json(&std::fs::read_to_string("idl.json")?)?;
+    let samples = Samples::from_json(&std::fs::read_to_string("samples.json")?)?;
+    let report = verify(&idl, &samples, None);
+    for finding in &report.findings {
+        println!("{:?} {}: {}", finding.severity, finding.subject, finding.message);
+    }
+    std::process::exit(i32::from(report.exit_code()));
+}
+```
 
 ## Limits
 
@@ -146,26 +224,25 @@ On a pull request, this compares the IDL with its version on the base branch. Se
 - For Shank IDLs (for example Metaplex and Phoenix), the tools check instructions only.
   Shank accounts have no discriminator.
 
-The full lists are in [idl-drift](docs/idl-drift.md#limitations) and
-[idl-verify](docs/idl-verify.md#limitations).
+The full lists are in [idl-drift](https://github.com/senzenn/idl-drift/blob/main/docs/idl-drift.md#limitations) and
+[idl-verify](https://github.com/senzenn/idl-drift/blob/main/docs/idl-verify.md#limitations).
 
 ## Documentation
 
 | Page | Content |
 |---|---|
-| [Quick guide](QUICKGUIDE.md) | Install, the first commands, exit codes. |
-| [idl-drift reference](docs/idl-drift.md) | Commands, tiers, each diff rule, rule names, JSON format. |
-| [idl-verify reference](docs/idl-verify.md) | Options, checks, samples format, live sampling, upgrade impact, limitations. |
-| [Decoder protocol](docs/decoder-protocol.md) | Test a generated parser with `--decoder`. |
-| [CI](docs/ci.md) | The GitHub Action and example workflows for both tools. |
-| [Architecture](docs/architecture.md) | Crates, parts and data flow. |
-| [Contributing](CONTRIBUTING.md) | Setup, checks, tests, and how to add a rule or a check. |
-| [Security](SECURITY.md) | How to report a security problem. |
-| [Changelog](CHANGELOG.md), [Roadmap](ROADMAP.md) | Releases and planned work. |
+| [idl-drift reference](https://github.com/senzenn/idl-drift/blob/main/docs/idl-drift.md) | Commands, tiers, each diff rule, rule names, JSON format. |
+| [idl-verify reference](https://github.com/senzenn/idl-drift/blob/main/docs/idl-verify.md) | Options, checks, samples format, live sampling, upgrade impact, limitations. |
+| [Decoder protocol](https://github.com/senzenn/idl-drift/blob/main/docs/decoder-protocol.md) | Test a generated parser with `--decoder`. |
+| [CI](https://github.com/senzenn/idl-drift/blob/main/docs/ci.md) | The GitHub Action and example workflows for both tools. |
+| [Architecture](https://github.com/senzenn/idl-drift/blob/main/docs/architecture.md) | Crates, parts and data flow. |
+| [Contributing](https://github.com/senzenn/idl-drift/blob/main/CONTRIBUTING.md) | Setup, checks, tests, and how to add a rule or a check. |
+| [Security](https://github.com/senzenn/idl-drift/blob/main/SECURITY.md) | How to report a security problem. |
+| [Changelog](https://github.com/senzenn/idl-drift/blob/main/CHANGELOG.md), [Roadmap](https://github.com/senzenn/idl-drift/blob/main/ROADMAP.md) | Releases and planned work. |
 
 ## License
 
-The code is licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at
+The code is licensed under either of [Apache-2.0](https://github.com/senzenn/idl-drift/blob/main/LICENSE-APACHE) or [MIT](https://github.com/senzenn/idl-drift/blob/main/LICENSE-MIT), at
 your option.
 
 The IDLs and samples in `fixtures/` and in the test fixture directories belong to the

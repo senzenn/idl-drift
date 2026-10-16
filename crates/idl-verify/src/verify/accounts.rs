@@ -324,15 +324,15 @@ impl Verifier<'_> {
             let unused = size - used;
             let count = of_samples(idxs.len(), total);
             let example = accounts[idxs[0]].address.clone();
+            // Anchor's `space` often reserves more than a Borsh type needs. A zero-copy
+            // layout sets the size, so its unused bytes stay an error.
+            let borsh = zero_copy.is_none();
             // A Borsh-labeled struct whose padded repr(C) size is exactly the account size.
-            let padded = zero_copy
-                .is_none()
+            let padded = borsh
                 .then(|| self.decoder.types().struct_layout(td).ok())
                 .flatten()
                 .filter(|l| l.padding_len() > 0 && disc.checked_add(l.size) == Some(size));
-            // Anchor's `space` often reserves more than a Borsh type needs. A zero-copy
-            // layout sets the size, so its unused bytes stay an error.
-            let zeros = zero_copy.is_none()
+            let zeros = borsh
                 && idxs.iter().all(|&i| {
                     accounts[i]
                         .data
@@ -356,7 +356,7 @@ impl Verifier<'_> {
                         padding_list(&layout)
                     ),
                 )
-            } else if Some(size) == round_up_8(used) {
+            } else if borsh && Some(size) == round_up_8(used) {
                 (
                     Severity::Warning,
                     format!("{} after the data in {count}", bytes(unused)),
@@ -587,16 +587,18 @@ mod tests {
     }
 
     #[test]
-    fn size_rounded_up_to_8_is_a_warning() {
+    fn size_rounded_up_to_8_is_a_warning_on_borsh_only() {
         // 2 + 4 bytes used, 8 allocated.
-        let report = verify(
-            &account_idl(U32_TYPE),
-            &accounts(&[&[1, 0, 0, 0, 0, 0]]),
-            None,
-        );
+        let body: &[u8] = &[1, 0, 0, 0, 0, 0];
+        let report = verify(&account_idl(U32_TYPE), &accounts(&[body]), None);
         let f = only(&report);
         assert_eq!((f.severity, f.check), (Severity::Warning, Check::BytesUsed));
         assert_eq!(f.message, "2 bytes after the data in 1 of 1 sample");
+
+        let zero_copy = r#"{"name":"A","serialization":"bytemuck","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
+        let report = verify(&account_idl(zero_copy), &accounts(&[body]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
     }
 
     #[test]

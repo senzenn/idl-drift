@@ -8,7 +8,7 @@ use idl_drift::allow::AllowList;
 use idl_drift::markdown::escape;
 use idl_drift::model::Idl;
 use idl_verify::report::Check;
-use idl_verify::rpc::{rent_exempt_minimum, sample, Limits};
+use idl_verify::rpc::{rent_exempt_minimum, sample, Limits, StopReason};
 use idl_verify::{
     run_decoder, verify, verify_upgrade, Error, Reference, Report, Samples, SamplingSummary,
     Severity,
@@ -49,12 +49,12 @@ struct Cli {
     program: Option<String>,
     /// With --rpc: read at most this many successful transactions, paging back through
     /// the program's history.
-    #[arg(long, value_name = "N", requires = "rpc", value_parser = at_least_one(),
+    #[arg(long, value_name = "N", value_parser = at_least_one(),
         default_value_t = Limits::default().max_transactions)]
     max_tx: usize,
     /// With --rpc: stop after this many successful transactions in a row bring no new
     /// instruction or event kind.
-    #[arg(long, value_name = "N", requires = "rpc", value_parser = at_least_one(),
+    #[arg(long, value_name = "N", value_parser = at_least_one(),
         default_value_t = Limits::default().stall)]
     stall: usize,
     /// Reference decoder output to compare values with (see tools/reference).
@@ -75,7 +75,7 @@ struct Cli {
     upgrade_impact: bool,
     /// Write what a live run sampled to this file, to rerun it offline with --samples.
     /// Live runs only: it cannot be combined with --samples.
-    #[arg(long, value_name = "PATH", requires = "rpc")]
+    #[arg(long, value_name = "PATH")]
     save_samples: Option<PathBuf>,
     /// Fail (exit 1) when less than this percent of the IDL's account types, instructions
     /// or events have a sample. Without it, a run passes on any number of samples.
@@ -300,10 +300,19 @@ fn sample_live<'c>(cli: &'c Cli, idl: &Idl) -> Result<(Samples, Live<'c>), Error
         } else {
             "instruction, account or event of it"
         };
+        // A stop at the last deploy is not a wrong address: the older transactions ran old code.
+        let advice = match sampled.stop_reason {
+            StopReason::Upgrade(_) => format!("sampling stopped because {}", sampled.stop_reason),
+            // The newest transactions can name the program as an account without a call to it.
+            _ if sampled.transactions > 0 => format!(
+                "raise --max-tx and --stall to read more, or check the program address{}",
+                accounts_only_note(cli)
+            ),
+            _ => format!("check the program address{}", accounts_only_note(cli)),
+        };
         return Err(Error::NothingSampled(format!(
-            "read {} successful transactions of {program} and found no {what}; check the program address{}",
+            "read {} successful transactions of {program} and found no {what}; {advice}",
             sampled.transactions,
-            accounts_only_note(cli)
         )));
     }
     if let Some(path) = &cli.save_samples {

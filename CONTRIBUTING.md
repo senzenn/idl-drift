@@ -51,9 +51,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 bash integration/run-all.sh
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo +1.91 check --workspace --all-targets --locked
 ```
 
-No test needs the network. The RPC tests use a local address that refuses the connection.
+No test needs the network. The RPC tests use a local HTTP server, or a local address that
+refuses the connection.
 
 Code rules:
 

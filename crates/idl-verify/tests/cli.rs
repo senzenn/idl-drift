@@ -140,27 +140,18 @@ fn nothing_to_check_and_bad_input_exit_2_before_any_request() {
             &["--rpc", "http://127.0.0.1:9/k", "--program", "not-a-key"],
             "is not a base58 program address",
         ),
-        // The env var can supply --rpc, but --samples still wins, so nothing would be saved.
+        // --samples wins over --rpc, so nothing would be saved. No RPC URL is set here.
         (
             &[
                 "--samples",
                 &samples,
-                "--rpc",
-                "http://127.0.0.1:9/k",
                 "--save-samples",
                 saved.to_str().unwrap(),
             ],
             "--save-samples saves only live samples",
         ),
         (
-            &[
-                "--samples",
-                &samples,
-                "--rpc",
-                "http://127.0.0.1:9/k",
-                "--max-tx",
-                "5",
-            ],
+            &["--samples", &samples, "--max-tx", "5"],
             "--max-tx limits only live sampling",
         ),
         (
