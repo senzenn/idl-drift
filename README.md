@@ -217,6 +217,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Tested with
+
+On 2026-10-16, with live mainnet data:
+
+- Shipstern 0.12.0 parsers and idl-verify gave the same values on 148 accounts, 224
+  instructions and 116 events, across 15 programs. Shipstern rejects the 2 Raydium AMM v4
+  account types, because their IDL gives no discriminator. idl-verify gives a note for this.
+- Carbon's `carbon-pump-swap-decoder` 2.0.0 gave the same values on each field that it
+  decodes. idl-verify also found the fields that it does not read: 6 trailing fields in
+  `Pool` and in `GlobalConfig`, 8 in `BuyEvent` and in `SellEvent`, and 2 instructions.
+- Each of the 53 IDLs in the tests and examples of Shipstern and Carbon loads, and `inspect`
+  passes on each.
+
 ## Limits
 
 - The tools read IDLs, not program source code. A change that the IDL does not show is not
