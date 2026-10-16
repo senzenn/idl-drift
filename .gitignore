@@ -6,3 +6,16 @@ node_modules/
 
 # macOS Finder metadata.
 .DS_Store
+
+# Credentials: RPC URLs, gRPC endpoints and x-tokens, API tokens and keypairs.
+.env
+.env.*
+*.env
+Vixen.toml
+Shipstern.toml
+*.local.toml
+credentials.toml
+*.pem
+*.key
+id.json
+*keypair*.json
