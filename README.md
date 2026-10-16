@@ -34,6 +34,8 @@ This is common:
 | A Solana program | A release breaks the clients, indexers and SDKs of your users. | `idl-drift diff` on each pull request, and `--upgrade-impact` before a deploy. |
 | A Codama IDL made from an Anchor IDL | The conversion moves a field or drops padding. | `idl-drift diff anchor.json codama.json`, then `idl-verify`. |
 
+The [user guide](https://github.com/senzenn/idl-drift/blob/main/docs/user-guide.md) gives the steps for each case, with the real GitHub issues behind it.
+
 ## What it does
 
 There are two tools:
@@ -231,6 +233,7 @@ The full lists are in [idl-drift](https://github.com/senzenn/idl-drift/blob/main
 
 | Page | Content |
 |---|---|
+| [User guide](https://github.com/senzenn/idl-drift/blob/main/docs/user-guide.md) | The steps for each use case, with real cases from GitHub. |
 | [idl-drift reference](https://github.com/senzenn/idl-drift/blob/main/docs/idl-drift.md) | Commands, tiers, each diff rule, rule names, JSON format. |
 | [idl-verify reference](https://github.com/senzenn/idl-drift/blob/main/docs/idl-verify.md) | Options, checks, samples format, live sampling, upgrade impact, limitations. |
 | [Decoder protocol](https://github.com/senzenn/idl-drift/blob/main/docs/decoder-protocol.md) | Test a generated parser with `--decoder`. |
