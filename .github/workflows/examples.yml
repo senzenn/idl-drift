@@ -1,0 +1,58 @@
+name: Examples
+
+# The decoder examples pin Shipstern and Carbon. The weekly run finds a release that breaks them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "examples/decoders/**"
+      - "fixtures/live/pump_fun/**"
+      - ".github/workflows/examples.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "examples/decoders/**"
+      - "fixtures/live/pump_fun/**"
+      - ".github/workflows/examples.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  decoder:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [shipstern, carbon]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            .
+            examples/decoders/${{ matrix.example }}
+      - run: cargo build --release --locked -p idl-verify
+      - run: cargo build --locked --manifest-path examples/decoders/${{ matrix.example }}/Cargo.toml
+      # Exit 1 is expected: the IDL is older than the program. Only `reference` findings are
+      # about the decoder.
+      - name: Compare the decoder with idl-verify
+        run: |
+          status=0
+          target/release/idl-verify --idl fixtures/live/pump_fun/idl.json \
+            --samples fixtures/live/pump_fun/samples-2026-10-16.json \
+            --decoder examples/decoders/${{ matrix.example }}/target/debug/${{ matrix.example }}-decoder \
+            --json > report.json || status=$?
+          test "$status" -le 1
+          jq -e '.reference.instructions_compared > 0
+            and ([.findings[] | select(.check == "reference")] | length) == 0' report.json

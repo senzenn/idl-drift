@@ -22,6 +22,9 @@ sequenceDiagram
 idl-verify --idl idl.json --samples samples.json --decoder "./target/release/my-decoder spl_governance"
 ```
 
+[examples/decoders](../examples/decoders/README.md) has a working decoder for Shipstern and one
+for Carbon.
+
 idl-verify splits the command on whitespace. The first word is the program, and the other
 words are its arguments. There is no shell, so quotes and pipes have no special meaning.
 `--decoder` works with `--samples` and with live sampling.

@@ -11,6 +11,10 @@ samples came from the Shipstern parity harness (`solana-rpc/shipstern#338`) befo
 | `jupiter_vaults/` | `jupo974WCqAUMD3RtpayTap1me7StQCWtEkBbDb6Ba3` | 20 accounts (7 types), 20 instructions |
 | `pump_fun/` | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` | 16 events only: 8 log and 8 cpi (3 types) |
 
+`pump_fun/samples-2026-10-16.json` came from `idl-verify --save-samples` on 2026-10-16: 12
+accounts (4 types), 41 instructions and 20 events. The [decoder examples](../../examples/decoders/README.md)
+use it.
+
 ## Files
 
 - `idl.json`: the program's Anchor IDL (spec 0.1.0).

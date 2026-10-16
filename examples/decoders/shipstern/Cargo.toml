@@ -1,0 +1,26 @@
+[package]
+name = "shipstern-decoder"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "A Shipstern parser as the decoder under test for idl-verify --decoder"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the parser crates stay out of its build and MSRV.
+[workspace]
+
+[dependencies]
+shipstern-core = "=0.12.0"
+shipstern-parser = "=0.12.0"
+shipstern-proc-macro = { version = "=0.12.0", features = ["program-events"] }
+borsh = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+bs58 = "0.5"
+tokio = { version = "1", features = ["rt"] }
+
+[features]
+default = ["serde"]
+# The generated types derive serde only when the crate that holds them has this feature.
+serde = []

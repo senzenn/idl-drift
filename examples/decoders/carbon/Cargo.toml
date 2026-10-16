@@ -1,0 +1,20 @@
+[package]
+name = "carbon-decoder"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "A Carbon decoder as the decoder under test for idl-verify --decoder"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the decoder crates stay out of its build and MSRV.
+[workspace]
+
+[dependencies]
+carbon-core = "=2.0.0"
+carbon-pumpfun-decoder = { version = "=2.0.0", features = ["serde"] }
+solana-account = "4.3.2"
+solana-instruction = { version = "3.4.1", default-features = false }
+solana-pubkey = "4.2.1"
+serde = "1"
+serde_json = "1"
+base64 = "0.22"

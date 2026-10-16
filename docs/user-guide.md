@@ -54,6 +54,10 @@ error: instruction buy_exact_quote_in: fails to decode in 2 of 5 samples: `track
 Live transactions leave out the last argument, and the program accepts them. A parser that
 reads every argument from the IDL fails on those transactions.
 
+To test your parser itself, not only its IDL, add `--decoder`. The
+[decoder examples](../examples/decoders/README.md) do this for a Shipstern parser and a Carbon
+decoder.
+
 **Step 3. Run both checks every night.** Use the nightly workflow in
 [ci.md](ci.md#example-workflows). A new finding then reaches you before your users report it.
 

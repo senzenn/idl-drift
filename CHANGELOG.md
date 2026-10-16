@@ -64,6 +64,8 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   `address` stays an error. PDA seeds that read a field of a struct argument are checked.
 - Value comparison with `--reference` (`@coral-xyz/anchor`), `--decoder` (a decoder under
   test) or `--compare-idl` (a second IDL).
+- Decoder examples for Shipstern 0.12 and Carbon 2.0 in `examples/decoders/`, with a CI job
+  that runs them each week.
 - `--min-coverage`, `--fail-on warning` and `--json`.
 
 #### Both tools
