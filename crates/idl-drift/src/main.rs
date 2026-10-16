@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -21,7 +20,7 @@ use serde::Serialize;
 #[command(name = "idl-drift", version, about)]
 #[command(after_help = "Exit codes:
   0  diff: no change at or above --fail-on; inspect: every field resolved
-  1  diff: at least one change at or above --fail-on; inspect: unmapped fields,
+  1  diff: at least one change at or above --fail-on; inspect: unmapped fields, an undefined type,
      or a padded zero-copy type that Borsh also reads
   2  idl-drift could not run: a file could not be read or parsed, an option is
      wrong, or the on-chain IDL could not be fetched or read")]
@@ -302,64 +301,11 @@ fn fetch_onchain(
             "--onchain needs an RPC URL; set IDL_DRIFT_RPC_URL or --rpc".into(),
         ));
     }
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build(),
-    );
-    let call = |method: &str, params: serde_json::Value| rpc_call(&agent, url, method, &params);
-    onchain::fetch(call, program, source).map_err(Failure::Onchain)
-}
-
-/// The largest JSON-RPC answer to read: two accounts of the 10 MiB maximum, in base64.
-const MAX_RESPONSE_BYTES: u64 = 32 << 20;
-
-/// One JSON-RPC request, retried with backoff on rate limits and server errors. Errors
-/// never include `url`, which can hold an API key.
-fn rpc_call(
-    agent: &ureq::Agent,
-    url: &str,
-    method: &str,
-    params: &serde_json::Value,
-) -> Result<serde_json::Value, onchain::Error> {
-    let fail = |detail: String| onchain::Error::Rpc(format!("{method}: {detail}"));
-    // Other ureq errors can repeat the URL.
-    let transport = |e: ureq::Error| match e {
-        ureq::Error::Io(_)
-        | ureq::Error::Timeout(_)
-        | ureq::Error::HostNotFound
-        | ureq::Error::ConnectionFailed
-        | ureq::Error::BodyExceedsLimit(_)
-        | ureq::Error::Json(_) => fail(e.to_string()),
-        _ => fail("the request failed; check that the RPC URL is a valid http(s) URL".into()),
+    let agent = idl_drift::rpc::agent();
+    let call = |method: &str, params: serde_json::Value| {
+        idl_drift::rpc::call(&agent, url, method, &params).map_err(onchain::Error::Rpc)
     };
-    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    for attempt in 0..5 {
-        let mut response = agent.post(url).send_json(&body).map_err(transport)?;
-        let status = response.status().as_u16();
-        if status == 429 || status >= 500 {
-            std::thread::sleep(Duration::from_millis(500 << attempt));
-            continue;
-        }
-        if status != 200 {
-            return Err(fail(format!("HTTP {status}")));
-        }
-        let mut reply: serde_json::Value = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_RESPONSE_BYTES)
-            .read_json()
-            .map_err(transport)?;
-        // `Value` prints strings JSON-escaped, so control characters stay inert.
-        if let Some(error) = reply.get("error") {
-            return Err(fail(error.to_string()));
-        }
-        return Ok(reply["result"].take());
-    }
-    Err(fail(
-        "still rate limited or failing after 5 attempts".into(),
-    ))
+    onchain::fetch(call, program, source).map_err(Failure::Onchain)
 }
 
 /// What a diff report shows besides the changes.
@@ -437,6 +383,10 @@ fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<
     writeln!(out, "unmapped (Generic) fields: {}", report.unmapped.len())?;
     for u in &report.unmapped {
         writeln!(out, "UNMAPPED: {} -> Generic(\"{}\")", u.path, u.kind)?;
+    }
+    writeln!(out, "undefined types: {}", report.undefined.len())?;
+    for name in &report.undefined {
+        writeln!(out, "UNDEFINED: {name}")?;
     }
     writeln!(
         out,

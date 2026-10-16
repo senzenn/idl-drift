@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
@@ -275,12 +274,7 @@ fn sample_live<'c>(cli: &'c Cli, idl: &Idl) -> Result<(Samples, Live<'c>), Error
             "the RPC URL is empty; set --rpc or IDL_VERIFY_RPC_URL".into(),
         ));
     }
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build(),
-    );
+    let agent = idl_drift::rpc::agent();
     let program = cli.program.as_deref().unwrap_or(&idl.address);
     // A bad key gets an empty answer from the RPC, which would look like a quiet program.
     if bs58::decode(program)
@@ -332,39 +326,9 @@ fn sample_live<'c>(cli: &'c Cli, idl: &Idl) -> Result<(Samples, Live<'c>), Error
     ))
 }
 
-/// One JSON-RPC request, retried with backoff on rate limits and server errors. Errors
-/// never include `url`.
+/// One JSON-RPC request with the retry rules of `idl_drift::rpc`. Errors never include `url`.
 fn rpc_call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Result<Value, Error> {
-    let fail = |detail: String| Error::Rpc(format!("{method}: {detail}"));
-    // Other ureq errors can repeat the URL, which holds the API key.
-    let transport = |e: ureq::Error| match e {
-        ureq::Error::Io(_)
-        | ureq::Error::Timeout(_)
-        | ureq::Error::HostNotFound
-        | ureq::Error::ConnectionFailed
-        | ureq::Error::Json(_) => fail(e.to_string()),
-        _ => fail("the request failed; check that the RPC URL is a valid http(s) URL".into()),
-    };
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    for attempt in 0..5 {
-        let mut response = agent.post(url).send_json(&body).map_err(transport)?;
-        let status = response.status().as_u16();
-        if status == 429 || status >= 500 {
-            std::thread::sleep(Duration::from_millis(500 << attempt));
-            continue;
-        }
-        if status != 200 {
-            return Err(fail(format!("HTTP {status}")));
-        }
-        let mut reply: Value = response.body_mut().read_json().map_err(transport)?;
-        if let Some(error) = reply.get("error") {
-            return Err(fail(error.to_string()));
-        }
-        return Ok(reply["result"].take());
-    }
-    Err(fail(
-        "still rate limited or failing after 5 attempts".into(),
-    ))
+    idl_drift::rpc::call(agent, url, method, params).map_err(Error::Rpc)
 }
 
 fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {

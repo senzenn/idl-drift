@@ -2,9 +2,9 @@
 
 mod common;
 
-use common::{fixture, kinds, messages, parse};
-use idl_drift::coverage;
+use common::{fixture, idl_kinds, kinds, messages, parse};
 use idl_drift::model::{AccountItem, ArrayLen, GenericParam, Idl, Repr, ReprKind, Type, TypeDefTy};
+use idl_drift::{coverage, ChangeKind, Severity};
 
 #[test]
 fn default_omission_produces_no_changes() {
@@ -180,5 +180,29 @@ fn legacy_alias_kind_parses_as_a_type_alias() {
                 generics: vec![]
             }
         }
+    );
+}
+
+#[test]
+fn account_dropped_from_accounts_with_its_type_kept_is_dangerous() {
+    let idl = |accounts: &str, types: &str| {
+        parse(&format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"1","spec":"0.1.0"}},
+            "accounts":{accounts},"types":{types}}}"#
+        ))
+    };
+    let t = |name: &str| format!(r#"{{"name":"{name}","type":{{"kind":"struct","fields":[]}}}}"#);
+    let old = idl(
+        r#"[{"name":"TokenAccount","discriminator":[1]},{"name":"Vault","discriminator":[2]}]"#,
+        &format!("[{},{}]", t("TokenAccount"), t("Vault")),
+    );
+    // Anchor 1.x drops the external `TokenAccount` and keeps its type; `Vault` is gone.
+    let new = idl("[]", &format!("[{}]", t("TokenAccount")));
+    assert_eq!(
+        idl_kinds(&old, &new),
+        [
+            (Severity::Dangerous, ChangeKind::AccountTypeRemoved),
+            (Severity::Breaking, ChangeKind::AccountTypeRemoved),
+        ]
     );
 }

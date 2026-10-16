@@ -20,6 +20,24 @@ pub fn reachable_types(idl: &Idl) -> BTreeSet<String> {
         .collect()
 }
 
+/// Names that a `defined` type uses but `types` does not hold, from every instruction arg
+/// and every type, reached or not. A parser generator cannot build such an IDL.
+pub(crate) fn undefined_types(idl: &Idl) -> BTreeSet<String> {
+    let index = TypeIndex::new(idl);
+    let mut used: Vec<&str> = Vec::new();
+    for arg in idl.instructions.iter().flat_map(|ix| &ix.args) {
+        push_defined(&arg.ty, &mut used);
+    }
+    let all: Vec<&str> = idl.types.iter().map(|t| t.name.as_str()).collect();
+    for name in reachable(&index, all) {
+        used.push(name);
+    }
+    used.into_iter()
+        .filter(|name| index.get(name).is_none())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The roots and every type they reach through fields, variant payloads and aliases. A name
 /// with no definition stays in the set, but has nothing to follow.
 pub(crate) fn reachable<'a>(index: &TypeIndex<'a>, mut stack: Vec<&'a str>) -> BTreeSet<&'a str> {

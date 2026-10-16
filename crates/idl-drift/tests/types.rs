@@ -304,6 +304,9 @@ fn removing_a_type_that_an_arg_still_references_is_breaking() {
 }
 
 #[test]
-fn a_reference_dangling_in_both_idls_is_not_a_change() {
-    assert_eq!(max_sev(DANGLING_NEW, DANGLING_NEW), None);
+fn a_reference_dangling_in_both_idls_is_breaking() {
+    assert_eq!(
+        messages(&parse(DANGLING_NEW), &parse(DANGLING_NEW)),
+        ["type used but not defined (Config): no parser can be generated"]
+    );
 }

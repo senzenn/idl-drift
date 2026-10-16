@@ -203,10 +203,11 @@ which can change.
 | Instruction arguments | `arg_added`, `arg_removed`, `arg_changed`, `arg_moved` | Breaking |
 | | `arg_renamed` | Dangerous |
 | Account types | `account_type_removed`, `account_discriminator_changed`, `account_discriminator_offset_changed` | Breaking |
+| | `account_type_removed` when the type stays in `types`. Anchor 1.x lists only the accounts that the program owns. | Dangerous |
 | | `account_type_added` | Additive |
 | Events | `event_removed`, `event_discriminator_changed`, `event_envelope_changed`, `event_payload_offset_changed` | Breaking |
 | | `event_added` | Additive |
-| Defined types | `type_kind_changed`, `type_removed` | Breaking |
+| Defined types | `type_kind_changed`, `type_removed`, `type_undefined` | Breaking |
 | | `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
 | | `field_renamed`, `variant_renamed`, `variant_appended` | Dangerous on a reachable type, else Cosmetic |
 | | `layout_changed` | Breaking, Dangerous or Cosmetic. See [Zero-copy types](#zero-copy-types). |
@@ -295,8 +296,9 @@ The message also goes to stderr.
 
 ## inspect
 
-`inspect` lists the fields whose byte layout idl-drift cannot resolve. A change to such a
-field cannot be classified, and `idl-verify` cannot decode it. Run `inspect` on a new IDL
+`inspect` lists the fields whose byte layout idl-drift cannot resolve, and each type that
+the IDL uses but does not define. A change to such a field cannot be classified, and
+`idl-verify` cannot decode it. Run `inspect` on a new IDL
 before you trust a `diff` of it.
 
 idl-drift cannot resolve these Codama nodes, and `inspect` lists them:
@@ -329,6 +331,7 @@ A Codama IDL with a `hiddenPrefixTypeNode` on argument `n` of instruction `ping`
 instructions: 1  accounts: 0  events: 1  types: 1
 unmapped (Generic) fields: 1
 UNMAPPED: ix:ping.n -> Generic("hiddenPrefixTypeNode")
+undefined types: 0
 padded zero-copy types also read as Borsh: 0
 ```
 
@@ -354,6 +357,7 @@ idl-drift inspect --layout fixtures/live/voltr_vault/idl.json
 ```text
 instructions: 28  accounts: 6  events: 26  types: 44
 unmapped (Generic) fields: 0
+undefined types: 0
 padded zero-copy types also read as Borsh: 0
 zero-copy types: 13
 
@@ -382,6 +386,10 @@ the functions behind `inspect`.
 
 ## Limitations
 
+- **Shank IDLs: instructions only.** A Shank IDL (`metadata.origin: "shank"`, for example
+  from Metaplex or Phoenix) keeps each instruction tag in `discriminant`, and idl-drift reads
+  it. Shank accounts have no discriminator, so a change in how a program tells its accounts
+  apart is not found. A Shank `vec` with a `size` does not load (exit 2).
 - **IDL against IDL only.** idl-drift compares IDLs, also with `--onchain`. It cannot see a
   program that was upgraded on chain with no IDL update. Use [idl-verify](idl-verify.md) to
   check an IDL against real data.

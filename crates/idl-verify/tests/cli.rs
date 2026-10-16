@@ -103,7 +103,7 @@ fn rpc_failure_exits_2_without_printing_the_url() {
         let out = idl_verify(&["--idl", &live("voltr_vault/idl.json"), "--rpc", url]);
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert_eq!(out.status.code(), Some(2), "{stderr}");
-        assert!(stderr.contains("getSignaturesForAddress"), "{stderr}");
+        assert!(stderr.contains("getAccountInfo"), "{stderr}");
         assert!(!stderr.contains("secret-token"), "{stderr}");
     }
 }
@@ -117,7 +117,7 @@ fn reads_the_rpc_url_from_the_environment() {
         .unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("getSignaturesForAddress"), "{stderr}");
+    assert!(stderr.contains("getAccountInfo"), "{stderr}");
 }
 
 #[test]

@@ -135,4 +135,4 @@ error: account Branch: values differ from the decoder under test in 1 of 1 sampl
   hint: one of the two decoders misreads these bytes; check the field's type and offset
 ```
 
-To run this check each night, see [ci.md](ci.md#idl-verify-every-night).
+To run this check each night, see [ci.md](ci.md#example-workflows).

@@ -3,11 +3,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use idl_drift::model::{Idl, NamedDisc, Type, TypeDef};
+use idl_drift::model::{Format, Idl, NamedDisc, Type, TypeDef};
 
-use super::{
-    bytes_used, missing_field_hint, sample_count, size_counts, Groups, Outcomes, Verifier,
-};
+use super::{bytes_used, missing_field_hint, size_counts, Groups, Outcomes, Verifier};
 use crate::decode::Value;
 use crate::layout::StructLayout;
 use crate::reference::Outcome;
@@ -27,7 +25,29 @@ impl Verifier<'_> {
         let by_size = self.classifier.accounts.is_empty() && !self.classifier.sized.is_empty();
         let mut unknown = Groups::new();
         let mut empty = Vec::new();
-        for (i, sample) in self.samples.accounts.iter().enumerate() {
+        // The IDL is not wrong here: Shank programs tell account types apart by a field
+        // that the IDL does not map to a type, so no sample can be classified.
+        let shank = idl.format == Format::Shank;
+        if shank && !self.samples.accounts.is_empty() {
+            self.push(
+                Severity::Note,
+                Check::Discriminator,
+                "accounts",
+                format!(
+                    "Shank IDLs give no account discriminators, so {} sampled {} not checked",
+                    self.samples.accounts.len(),
+                    plural(self.samples.accounts.len(), "account is", "accounts are")
+                ),
+                Some("a Shank program tells its account types apart by a field, such as a `key` enum, that the IDL does not map to each type".to_string()),
+                None,
+            );
+        }
+        let to_classify = if shank {
+            &[][..]
+        } else {
+            &self.samples.accounts[..]
+        };
+        for (i, sample) in to_classify.iter().enumerate() {
             if let Some(t) = self.classifier.account(&sample.data) {
                 groups[t].push(i);
                 continue;
@@ -57,7 +77,8 @@ impl Verifier<'_> {
 
         let nothing_to_match = self.classifier.accounts.is_empty()
             && self.classifier.sized.is_empty()
-            && !idl.accounts.is_empty();
+            && !idl.accounts.is_empty()
+            && !shank;
         let hint = unknown_account_hint(idl, &self.classifier.sized, by_size);
         self.report_unclassified(
             "account",
@@ -79,7 +100,7 @@ impl Verifier<'_> {
         }
         let coverage = Coverage {
             sampled: self.samples.accounts.len(),
-            classified: self.samples.accounts.len() - sample_count(&unknown) - empty.len(),
+            classified: groups.iter().map(Vec::len).sum(),
             not_sampled,
         };
         (coverage, summaries)
@@ -525,6 +546,23 @@ mod tests {
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"s","type":"string"}]}}"#;
     const U32_TYPE: &str =
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
+
+    #[test]
+    fn shank_accounts_are_a_note_not_an_error() {
+        let shank = Idl::from_json(
+            r#"{"version":"1","name":"t","metadata":{"origin":"shank","address":"P"},"instructions":[],
+            "accounts":[{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}]}"#,
+        )
+        .unwrap();
+        // 4 bytes is the size of `A`; a size guess would classify one and fail the other.
+        let report = verify(&shank, &accounts(&[&[1, 2], &[9, 9, 9, 9, 9]]), None);
+        let f = only(&report);
+        assert_eq!(
+            (f.severity, f.check),
+            (Severity::Note, Check::Discriminator)
+        );
+        assert_eq!(report.account_coverage.classified, 0);
+    }
 
     #[test]
     fn zeros_after_a_variable_size_type_are_spare_allocation() {

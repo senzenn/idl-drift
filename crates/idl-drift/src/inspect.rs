@@ -2,8 +2,8 @@
 //! every zero-copy type field by field, and find padded zero-copy types Borsh also reads.
 
 use crate::layout::{LayoutError, Padding, Reading, StructLayout, TypeIndex};
-use crate::model::{EnumFields, Idl, Repr, Type, TypeDef, TypeDefTy};
-use crate::reach::{push_defined, reachable, reachable_types};
+use crate::model::{EnumFields, GenericParam, Idl, Repr, Type, TypeDef, TypeDefTy};
+use crate::reach::{push_defined, reachable, reachable_types, undefined_types};
 
 /// A field or instruction arg whose type is or contains `Type::Generic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,13 +22,15 @@ pub struct CoverageReport {
     pub events: usize,
     pub types: usize,
     pub unmapped: Vec<UnmappedField>,
+    /// Names that a `defined` type uses but `types` does not hold.
+    pub undefined: Vec<String>,
 }
 
 impl CoverageReport {
-    /// `true` when every reachable field has a concrete layout.
+    /// `true` when every reachable field has a concrete layout and every used type exists.
     #[must_use]
     pub fn fully_mapped(&self) -> bool {
-        self.unmapped.is_empty()
+        self.unmapped.is_empty() && self.undefined.is_empty()
     }
 }
 
@@ -43,6 +45,7 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
             collect_generic(
                 &format!("ix:{}.{}", ix.name, arg.name),
                 &arg.ty,
+                &[],
                 &mut unmapped,
             );
         }
@@ -55,12 +58,22 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
         match &td.ty {
             TypeDefTy::Struct { fields } => {
                 for f in fields {
-                    collect_generic(&format!("{}.{}", td.name, f.name), &f.ty, &mut unmapped);
+                    collect_generic(
+                        &format!("{}.{}", td.name, f.name),
+                        &f.ty,
+                        &td.generics,
+                        &mut unmapped,
+                    );
                 }
             }
             TypeDefTy::Enum { variants, tag } => {
                 if let Some(tag) = tag {
-                    collect_generic(&format!("{}.<tag>", td.name), tag, &mut unmapped);
+                    collect_generic(
+                        &format!("{}.<tag>", td.name),
+                        tag,
+                        &td.generics,
+                        &mut unmapped,
+                    );
                 }
                 for v in variants {
                     match &v.fields {
@@ -69,6 +82,7 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
                                 collect_generic(
                                     &format!("{}.{}.{}", td.name, v.name, f.name),
                                     &f.ty,
+                                    &td.generics,
                                     &mut unmapped,
                                 );
                             }
@@ -78,6 +92,7 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
                                 collect_generic(
                                     &format!("{}.{}.{}", td.name, v.name, i),
                                     ty,
+                                    &td.generics,
                                     &mut unmapped,
                                 );
                             }
@@ -86,7 +101,7 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
                 }
             }
             TypeDefTy::Type { alias } => {
-                collect_generic(&td.name, alias, &mut unmapped);
+                collect_generic(&td.name, alias, &td.generics, &mut unmapped);
             }
         }
     }
@@ -97,18 +112,23 @@ pub fn coverage(idl: &Idl) -> CoverageReport {
         events: idl.events.len(),
         types: idl.types.len(),
         unmapped,
+        undefined: undefined_types(idl).into_iter().collect(),
     }
 }
 
-fn collect_generic(path: &str, ty: &Type, out: &mut Vec<UnmappedField>) {
+fn collect_generic(path: &str, ty: &Type, params: &[GenericParam], out: &mut Vec<UnmappedField>) {
+    // Each use of the type fills in its own parameters, so they are not unread fields.
     if let Type::Generic(kind) = ty {
+        if params.iter().any(|p| p.name() == kind.as_str()) {
+            return;
+        }
         out.push(UnmappedField {
             path: path.to_string(),
             kind: Type::generic_kind(kind).to_string(),
         });
     }
     for child in ty.children() {
-        collect_generic(path, child, out);
+        collect_generic(path, child, params, out);
     }
 }
 
@@ -261,5 +281,26 @@ mod tests {
         assert_eq!(found, [("Cfg", "7 bytes before `epoch`".to_string())]);
         // Only the zero-copy account reads it.
         assert!(shared_types(&idl("[]")).is_empty());
+    }
+
+    #[test]
+    fn declared_type_parameter_is_not_unmapped() {
+        let idl = Idl::from_json(
+            r#"{"address":"A","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+            "accounts":[{"name":"Pool","discriminator":[1]}],
+            "types":[
+              {"name":"Pool","type":{"kind":"struct","fields":[
+                {"name":"fees","type":{"defined":{"name":"Fees","generics":[{"kind":"type","type":"u64"}]}}}]}},
+              {"name":"Fees","generics":[{"kind":"type","name":"T"}],"type":{"kind":"struct","fields":[
+                {"name":"amount","type":{"generic":"T"}},{"name":"other","type":{"generic":"U"}}]}}]}"#,
+        )
+        .unwrap();
+        let paths: Vec<String> = coverage(&idl)
+            .unmapped
+            .into_iter()
+            .map(|u| u.path)
+            .collect();
+        // `U` is not declared on `Fees`, so it stays unmapped.
+        assert_eq!(paths, ["Fees.other"]);
     }
 }

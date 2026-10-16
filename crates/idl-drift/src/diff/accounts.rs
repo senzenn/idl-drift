@@ -4,9 +4,14 @@ use std::collections::BTreeMap;
 
 use super::text::{disc_changed, extra_discs_text, size_text};
 use super::{ChangeKind, Report, Severity};
-use crate::model::NamedDisc;
+use crate::model::{NamedDisc, TypeDef};
 
-pub(super) fn diff_account_types(old: &[NamedDisc], new: &[NamedDisc], r: &mut Report) {
+pub(super) fn diff_account_types(
+    old: &[NamedDisc],
+    new: &[NamedDisc],
+    new_types: &[TypeDef],
+    r: &mut Report,
+) {
     let om: BTreeMap<_, _> = old.iter().map(|a| (&a.name, a)).collect();
     let nm: BTreeMap<_, _> = new.iter().map(|a| (&a.name, a)).collect();
     for (name, na) in &nm {
@@ -62,7 +67,20 @@ pub(super) fn diff_account_types(old: &[NamedDisc], new: &[NamedDisc], r: &mut R
         }
     }
     for name in om.keys() {
-        if !nm.contains_key(name) {
+        if nm.contains_key(name) {
+            continue;
+        }
+        // Anchor 1.x lists only the accounts that the program owns, but keeps their types.
+        if new_types.iter().any(|t| &t.name == *name) {
+            r.push(
+                Severity::Dangerous,
+                ChangeKind::AccountTypeRemoved,
+                *name,
+                format!(
+                    "account type removed, its type kept: {name}: Anchor 1.x lists only the accounts that the program owns, so a parser built from the new IDL does not decode it"
+                ),
+            );
+        } else {
             r.push(
                 Severity::Breaking,
                 ChangeKind::AccountTypeRemoved,

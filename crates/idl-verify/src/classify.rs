@@ -3,7 +3,7 @@
 use std::fmt;
 
 use idl_drift::model::{
-    Account, AccountItem, Discriminator, Event, Idl, Instruction, NamedDisc, Type,
+    Account, AccountItem, Discriminator, Event, Format, Idl, Instruction, NamedDisc, Type,
 };
 
 use crate::layout::{Reading, TypeIndex};
@@ -107,6 +107,10 @@ pub(crate) fn longest_match(table: &[(Discs<'_>, usize)], data: &[u8]) -> Option
 /// Account types with no discriminator and a known size: the IDL's declared `size`, else
 /// the type's fixed size. Codama's size discriminator tells such accounts apart by length.
 fn sized_account_types(idl: &Idl) -> Vec<(usize, usize)> {
+    // Shank programs tell account types apart by a field, not by size.
+    if idl.format == Format::Shank {
+        return Vec::new();
+    }
     let index = TypeIndex::new(idl);
     idl.accounts
         .iter()

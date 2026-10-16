@@ -221,12 +221,16 @@ ignores other keys, such as a `type` label: it classifies samples by discriminat
 ## Live sampling
 
 `--rpc <URL>` (or `IDL_VERIFY_RPC_URL`) samples the program over JSON-RPC. The RPC must
-serve `getSignaturesForAddress`, `getTransaction` and `getMultipleAccounts`, and with
-`--upgrade-impact` also `getMinimumBalanceForRentExemption`.
+serve `getAccountInfo`, `getSignaturesForAddress`, `getTransaction` and
+`getMultipleAccounts`, and with `--upgrade-impact` also `getMinimumBalanceForRentExemption`.
+
+- **Last deploy.** For a loader-v3 or loader-v4 program, idl-verify reads the slot of the
+  last deploy. A transaction in that slot or earlier ran the old code, so sampling stops
+  there.
 
 - **Signatures.** From `getSignaturesForAddress`, 1000 at a time, back through history.
   idl-verify skips failed transactions, because they can hold data that the program
-  rejected.
+  rejected. It also skips a transaction that the RPC no longer keeps (`null`).
 - **Transactions.** From each transaction (`getTransaction`, versions 0 and 1):
   - each instruction that calls the program, top level and CPI, with keys resolved through
     address lookup tables, and the signer and writable flag of each key;
@@ -238,15 +242,19 @@ serve `getSignaturesForAddress`, `getTransaction` and `getMultipleAccounts`, and
   each event kind.
 - **Stop.** Sampling stops when each IDL instruction has 5 samples, when `--stall`
   transactions in a row bring no new instruction or event kind, after `--max-tx` successful
-  transactions, or when the program has no older transactions. The report gives the number
-  of transactions read and the reason it stopped.
+  transactions, at the last deploy, or when the program has no older transactions. The
+  report gives the number of transactions read and the reason it stopped.
 - **Accounts.** The accounts that those instructions pass and the program owns, from
-  `getMultipleAccounts`, at most 5 for each account type. idl-verify keeps accounts with an
-  unknown discriminator, so the `discriminator` check can report them.
+  `getMultipleAccounts`, at most 5 for each account type. idl-verify first reads only the
+  owner of each account, then the data of the accounts that the program owns. So a large
+  account of another program, such as program code, is never downloaded. idl-verify keeps
+  accounts with an unknown discriminator, so the `discriminator` check can report them.
 
 A run exits 2 when it finds nothing of the program, the URL is empty, the program address
 is not base58, or a request fails. So a typo does not look like a quiet program. idl-verify
-tries each request up to 5 times when the server rate-limits it or returns a server error.
+tries each request up to 5 times after a rate limit (HTTP 429), a server error, a lost
+connection or a cut-off answer. After a 429 it waits for the `Retry-After` time, up to 60 s,
+else 10 s. `idl-drift diff --onchain` uses the same rules.
 
 idl-verify never prints the URL, because providers put the API key in it.
 
@@ -461,6 +469,11 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
 
 ## Limitations
 
+- **Shank IDLs: instructions only.** A Shank IDL (`metadata.origin: "shank"`, for example
+  from Metaplex or Phoenix) keeps each instruction tag in `discriminant`, and idl-verify
+  reads it. A Shank program tells its account types apart by a field, such as a `key` enum,
+  that the IDL does not map to each type. So idl-verify does not check Shank accounts, and
+  gives one note. A Shank `vec` with a `size` does not load (exit 2).
 - **Live sampling sees recent activity only.** idl-verify does not check instructions and
   events that the sampled transactions do not use. The report lists them under "not
   sampled". Increase `--max-tx` and `--stall` to look further back. Set `--min-coverage` to

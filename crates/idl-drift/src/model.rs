@@ -39,6 +39,9 @@ pub enum Format {
     LegacyAnchor,
     /// Codama: `camelCase` everything.
     Codama,
+    /// Shank: the legacy Anchor shape, a number tag on each instruction, and no account
+    /// discriminators.
+    Shank,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -673,9 +676,15 @@ impl Idl {
                     )));
                 }
             }
-            let legacy = normalize_legacy_anchor(&mut value);
+            let shank = value.pointer("/metadata/origin").and_then(|o| o.as_str()) == Some("shank");
+            if shank {
+                shank_discriminators(&mut value)?;
+            }
+            let legacy = normalize_legacy_anchor(&mut value, shank);
             let mut idl: Self = serde_json::from_value(value)?;
-            if legacy {
+            if shank {
+                idl.format = Format::Shank;
+            } else if legacy {
                 idl.format = Format::LegacyAnchor;
             }
             Ok(idl)
@@ -802,7 +811,7 @@ fn camel_accounts(items: &mut [AccountItem]) {
 
 /// Rewrite pre-0.30 Anchor JSON into the 0.30 spec shape: metadata, key names and inline
 /// types. Returns whether the IDL was in the legacy shape.
-fn normalize_legacy_anchor(value: &mut serde_json::Value) -> bool {
+fn normalize_legacy_anchor(value: &mut serde_json::Value, shank: bool) -> bool {
     let Some(obj) = value.as_object_mut() else {
         return false;
     };
@@ -833,16 +842,51 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value) -> bool {
             serde_json::json!({
                 "name": name,
                 "version": version,
-                "spec": "legacy-anchor",
+                "spec": if shank { "shank" } else { "legacy-anchor" },
             }),
         );
         obj.entry("address".to_string()).or_insert(address);
-        add_legacy_discriminators(obj);
+        add_legacy_discriminators(obj, shank);
     }
     move_inline_types(obj);
     rewrite_legacy_keys(value);
     normalize_type_defs(value);
     legacy
+}
+
+/// Shank tags each instruction with `discriminant`, a number of a given width. Hashing the
+/// name the Anchor way would give a tag the program does not read.
+fn shank_discriminators(value: &mut serde_json::Value) -> Result<(), serde_json::Error> {
+    let Some(ixs) = value.get_mut("instructions").and_then(|v| v.as_array_mut()) else {
+        return Ok(());
+    };
+    for ix in ixs {
+        let Some(map) = ix.as_object_mut() else {
+            continue;
+        };
+        let name = map.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let tag = map.get("discriminant");
+        let width = match tag.and_then(|t| t.get("type")).and_then(|t| t.as_str()) {
+            Some("u8") => 1,
+            Some("u16") => 2,
+            Some("u32") => 4,
+            Some("u64") => 8,
+            _ => 0,
+        };
+        let value = tag
+            .and_then(|t| t.get("value"))
+            .and_then(serde_json::Value::as_u64);
+        let Some(value) = value.filter(|v| width > 0 && (width == 8 || v >> (8 * width) == 0))
+        else {
+            return Err(serde::de::Error::custom(format!(
+                "Shank instruction {name}: `discriminant` must be a u8, u16, u32 or u64 that fits its type"
+            )));
+        };
+        let bytes = value.to_le_bytes();
+        let disc = serde_json::json!(bytes.get(..width).unwrap_or_default());
+        map.insert("discriminator".to_string(), disc);
+    }
+    Ok(())
 }
 
 /// Legacy accounts carry their layout in `type` and legacy events in `fields`; the spec keeps
@@ -919,7 +963,8 @@ fn move_inline_types(obj: &mut serde_json::Map<String, serde_json::Value>) {
 
 /// Fill in the discriminators legacy IDLs leave out, the way Anchor derives them: the first
 /// 8 bytes of `sha256("global:<snake_case name>")`, `"account:<Name>"` or `"event:<Name>"`.
-fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value>) {
+/// Shank accounts and events have no discriminator, so they get none.
+fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value>, shank: bool) {
     use heck::ToSnakeCase;
     use sha2::{Digest, Sha256};
 
@@ -928,6 +973,9 @@ fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value
         ("accounts", "account"),
         ("events", "event"),
     ] {
+        if shank && namespace != "global" {
+            continue;
+        }
         let Some(items) = obj.get_mut(list).and_then(|v| v.as_array_mut()) else {
             continue;
         };
@@ -1006,6 +1054,17 @@ fn rewrite_legacy_keys(value: &mut serde_json::Value) {
             }
             if let Some(v) = map.remove("isOptional") {
                 map.entry("optional".to_string()).or_insert(v);
+            }
+            // Shank names the Rust collection; Borsh writes each map and set the same way.
+            for (from, to) in [
+                ("hashMap", "map"),
+                ("bTreeMap", "map"),
+                ("hashSet", "set"),
+                ("bTreeSet", "set"),
+            ] {
+                if let Some(v) = map.remove(from) {
+                    map.entry(to.to_string()).or_insert(v);
+                }
             }
             // Old shorthand: `{"defined": "Foo"}` for `{"defined": {"name": "Foo"}}`.
             if let Some(serde_json::Value::String(name)) = map.get("defined").cloned() {

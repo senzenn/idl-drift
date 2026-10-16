@@ -24,8 +24,13 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   change inside a Codama node that idl-drift cannot read is reported, not hidden.
 - `--fail-on <tier>`, and `--json` with a stable rule name (`kind`) and `subject` for each
   change.
-- `idl-drift inspect IDL` lists unresolved fields and padded zero-copy types that Borsh also
-  reads. `--layout` prints each zero-copy type field by field.
+- `idl-drift inspect IDL` lists unresolved fields, types that the IDL uses but does not
+  define, and padded zero-copy types that Borsh also reads. `--layout` prints each zero-copy
+  type field by field. A generic parameter that its type declares is not unresolved.
+- Shank IDLs: instruction tags come from `discriminant`. Shank maps and sets load.
+- `type_undefined` (Breaking): the new IDL uses a type that it does not define.
+- An account that leaves `accounts` while its type stays in `types` is Dangerous, not
+  Breaking. Anchor 1.x lists only the accounts that the program owns.
 - `idl-drift diff --onchain PROGRAM NEW` uses the IDL that the program publishes on chain
   (Program Metadata or Anchor IDL account) as the old IDL.
 - A removed or renumbered error, or an error code with a new name, is Dangerous.
@@ -38,6 +43,9 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
   instruction and event data.
 - Live sampling with `--rpc` or `IDL_VERIFY_RPC_URL`, controlled by `--program`, `--max-tx`
   and `--stall`. `--save-samples` saves a live run to run again offline.
+- Live sampling stops at the program's last deploy, skips a transaction that the RPC no
+  longer keeps, and downloads only the accounts that the program owns.
+- Shank accounts give one note, not errors: a Shank IDL does not map its accounts to types.
 - `--upgrade-impact` puts each sampled account in a class under a new IDL: ok, shorter,
   needs a realloc (with the extra rent) or broken. The `upgrade_impact` check reports them.
 - Checks for discriminators, missing types, decode failures, unused bytes, zero-copy
@@ -54,6 +62,8 @@ The first release of `idl-drift` and `idl-verify`, planned as 0.1.0.
 
 #### Both tools
 
+- RPC requests are tried again after a lost connection or a cut-off answer. After a 429
+  they wait for `Retry-After`, else 10 s.
 - One exit code contract: 0 when clean, 1 on a finding at or above `--fail-on`, 2 when the
   tool cannot run. With `--json`, an exit 2 prints `{"error": "...", "exit_code": 2}`.
 - GitHub Actions examples: `idl-drift` on pull requests and a nightly `idl-verify` run.

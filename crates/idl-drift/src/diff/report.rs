@@ -56,6 +56,7 @@ pub enum ChangeKind {
     AliasChanged,
     TypeKindChanged,
     TypeRemoved,
+    TypeUndefined,
     LayoutChanged,
     FieldChanged,
     FieldMoved,

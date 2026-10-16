@@ -102,15 +102,35 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
             _ => {}
         }
     }
-    // A type dropped from `types` while a parser still reaches it leaves a dangling
-    // reference: no parser can be generated. A reference dangling in both IDLs is not a change.
-    for name in reached {
-        if om.contains_key(name) && !nm.contains_key(name) {
+    diff_dangling(old, new, reached, r);
+}
+
+/// References with no definition: no parser can be generated from the new IDL.
+fn diff_dangling(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
+    let om = old.type_map();
+    let nm = new.type_map();
+    // A type dropped from `types` while a parser still reaches it.
+    let removed: BTreeSet<&String> = reached
+        .iter()
+        .filter(|name| om.contains_key(*name) && !nm.contains_key(*name))
+        .collect();
+    for name in &removed {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::TypeRemoved,
+            name.as_str(),
+            format!("type removed while still referenced ({name}): dangling reference"),
+        );
+    }
+    // A reference that dangles in both IDLs is not a change, but the new IDL still cannot
+    // give a parser.
+    for name in crate::reach::undefined_types(new) {
+        if !removed.contains(&name) {
             r.push(
                 Severity::Breaking,
-                ChangeKind::TypeRemoved,
-                name,
-                format!("type removed while still referenced ({name}): dangling reference"),
+                ChangeKind::TypeUndefined,
+                name.as_str(),
+                format!("type used but not defined ({name}): no parser can be generated"),
             );
         }
     }

@@ -56,6 +56,8 @@ pub enum StopReason {
     MaxTransactions,
     /// The program has no older signatures.
     History,
+    /// Older transactions ran the code from before the program's last deploy, in this slot.
+    Upgrade(u64),
 }
 
 impl std::fmt::Display for StopReason {
@@ -65,6 +67,12 @@ impl std::fmt::Display for StopReason {
             Self::Stall => "the last --stall transactions brought no new kind",
             Self::MaxTransactions => "--max-tx transactions were read",
             Self::History => "the program has no older transactions",
+            Self::Upgrade(slot) => {
+                return write!(
+                    f,
+                    "older transactions ran the program before its last deploy, in slot {slot}"
+                );
+            }
         })
     }
 }
@@ -93,6 +101,8 @@ pub fn sample(
 ) -> Result<Sampled, Error> {
     let mut quota = Quota::new(idl, limits.per_instruction);
     let cpi = cpi_envelopes(idl);
+    // Transactions from before the last deploy ran other code, so they give false findings.
+    let deployed = deploy_slot(&mut rpc, program_id)?;
     let mut instructions = Vec::new();
     let mut events = Vec::new();
     // Accounts of instructions over quota are still sampled.
@@ -123,11 +133,21 @@ pub fn sample(
 
         // Failed transactions can carry data the program rejected, which is not a fault of the IDL.
         for info in page.iter().filter(|s| s.err.is_none()) {
+            // Agave runs new code from the slot after its deploy.
+            if let (Some(slot), Some(deployed)) = (info.slot, deployed) {
+                if slot <= deployed {
+                    break 'pages StopReason::Upgrade(deployed);
+                }
+            }
             // The highest version this parser reads; the RPC refuses newer ones with an error.
             let tx = rpc(
                 "getTransaction",
                 json!([info.signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
             )?;
+            // A node that no longer keeps the transaction returns null.
+            if tx.is_null() {
+                continue;
+            }
             read += 1;
             let found = samples_from_transaction(idl, program_id, &tx)?;
             let mut new = false;
@@ -169,17 +189,7 @@ pub fn sample(
         }
     };
 
-    let mut values = Vec::new();
-    for chunk in keys.chunks(MAX_ACCOUNTS_PER_REQUEST) {
-        let page = rpc(
-            "getMultipleAccounts",
-            json!([chunk, { "encoding": "base64" }]),
-        )?;
-        let page = AccountsPage::deserialize(&page)
-            .map_err(|e| Error::RpcResponse(format!("getMultipleAccounts: {e}")))?;
-        values.extend(page.value);
-    }
-    let accounts = accounts_from_rpc(idl, program_id, &keys, &values, limits.per_type)?;
+    let accounts = fetch_accounts(&mut rpc, idl, program_id, &keys, limits.per_type)?;
 
     Ok(Sampled {
         samples: Samples {
@@ -322,6 +332,98 @@ fn kind(matched: Option<&[usize]>, data: &[u8]) -> (Option<usize>, String) {
     }
 }
 
+/// The accounts among `keys` that `program_id` owns, as [`accounts_from_rpc`] keeps them.
+/// Owners come first, with no data: an account of another program, such as a program's
+/// code, can hold 10 MiB, and only the program's own accounts are checked.
+fn fetch_accounts(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
+    idl: &Idl,
+    program_id: &str,
+    keys: &[String],
+    per_type: usize,
+) -> Result<Vec<AccountSample>, Error> {
+    let mut owned = Vec::new();
+    for (key, value) in keys.iter().zip(multiple_accounts(rpc, keys, Some(0))?) {
+        let account = Option::<RpcAccount>::deserialize(&value)
+            .map_err(|e| Error::RpcResponse(format!("account {key}: {e}")))?;
+        if account.is_some_and(|a| a.owner == program_id) {
+            owned.push(key.clone());
+        }
+    }
+    let values = multiple_accounts(rpc, &owned, None)?;
+    accounts_from_rpc(idl, program_id, &owned, &values, per_type)
+}
+
+/// `getMultipleAccounts` values of `keys`, in order. With `data_len`, each holds only that
+/// many bytes of data.
+fn multiple_accounts(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
+    keys: &[String],
+    data_len: Option<usize>,
+) -> Result<Vec<Value>, Error> {
+    let mut config = json!({ "encoding": "base64" });
+    if let Some(length) = data_len {
+        config["dataSlice"] = json!({ "offset": 0, "length": length });
+    }
+    let mut values = Vec::new();
+    for chunk in keys.chunks(MAX_ACCOUNTS_PER_REQUEST) {
+        let page = rpc("getMultipleAccounts", json!([chunk, config]))?;
+        let page = AccountsPage::deserialize(&page)
+            .map_err(|e| Error::RpcResponse(format!("getMultipleAccounts: {e}")))?;
+        values.extend(page.value);
+    }
+    Ok(values)
+}
+
+const LOADER_V3: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
+const LOADER_V4: &str = "LoaderV411111111111111111111111111111111111";
+
+/// The slot of the program's last deploy. `None` for a loader that keeps no slot, or a
+/// program the RPC does not have.
+fn deploy_slot(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
+    program_id: &str,
+) -> Result<Option<u64>, Error> {
+    let mut first_bytes =
+        |address: &str, length: usize| -> Result<Option<(String, Vec<u8>)>, Error> {
+            let config =
+                json!({ "encoding": "base64", "dataSlice": { "offset": 0, "length": length } });
+            let reply = rpc("getAccountInfo", json!([address, config]))?;
+            let Some(account) = Option::<RpcAccount>::deserialize(&reply["value"])
+                .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: {e}")))?
+            else {
+                return Ok(None);
+            };
+            let data = STANDARD
+                .decode(&account.data.0)
+                .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: data: {e}")))?;
+            Ok(Some((account.owner, data)))
+        };
+    let slot_at = |data: &[u8], at: usize| {
+        data.get(at..at + 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let Some((owner, data)) = first_bytes(program_id, 36)? else {
+        return Ok(None);
+    };
+    match owner.as_str() {
+        // `LoaderV4State` starts with the slot.
+        LOADER_V4 => Ok(slot_at(&data, 0)),
+        // `UpgradeableLoaderState::Program` (tag 2) names its ProgramData account, which
+        // (tag 3) holds the slot after the tag.
+        LOADER_V3 if data.get(..4) == Some(&[2, 0, 0, 0]) => {
+            let Some(address) = data.get(4..36).map(|k| bs58::encode(k).into_string()) else {
+                return Ok(None);
+            };
+            Ok(first_bytes(&address, 12)?
+                .filter(|(_, d)| d.get(..4) == Some(&[3, 0, 0, 0]))
+                .and_then(|(_, d)| slot_at(&d, 4)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The `getSignaturesForAddress` maximum per request.
 const SIGNATURES_PER_PAGE: usize = 1000;
 
@@ -331,6 +433,8 @@ struct SignatureInfo {
     signature: String,
     #[serde(default)]
     err: Option<Value>,
+    #[serde(default)]
+    slot: Option<u64>,
 }
 
 /// The `getMultipleAccounts` limit on keys per request.
@@ -356,6 +460,16 @@ mod tests {
     /// One account type, `Vault`, with discriminator [9, 9].
     fn idl() -> Idl {
         crate::testing::idl(r#""accounts":[{"name":"Vault","discriminator":[9,9]}]"#)
+    }
+
+    /// `rpc` with no program account, so that a run has no deploy slot.
+    fn no_program(
+        mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    ) -> impl FnMut(&str, Value) -> Result<Value, Error> {
+        move |method, params| match method {
+            "getAccountInfo" => Ok(json!({ "value": null })),
+            _ => rpc(method, params),
+        }
     }
 
     fn account(owner: &str, data: &[u8]) -> Value {
@@ -403,7 +517,7 @@ mod tests {
                 "{method}: 429 Too Many Requests"
             ))),
         };
-        let err = sample(rpc, &idl(), "Prog", &Limits::default()).unwrap_err();
+        let err = sample(no_program(rpc), &idl(), "Prog", &Limits::default()).unwrap_err();
         assert!(err.to_string().contains("getTransaction: 429"), "{err}");
     }
 
@@ -447,6 +561,55 @@ mod tests {
             .map(|a| (a.address.as_str(), a.data.as_slice()))
             .collect();
         assert_eq!(accounts, [("Vault", &[9u8, 9, 1][..])]);
+        // Owners first with no data, then data only for the program's own accounts.
+        let account_requests: Vec<&Value> = calls
+            .iter()
+            .filter(|(m, _)| m == "getMultipleAccounts")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            account_requests,
+            [
+                &json!([["Vault", "Payer"], { "encoding": "base64", "dataSlice": { "offset": 0, "length": 0 } }]),
+                &json!([["Vault"], { "encoding": "base64" }]),
+            ]
+        );
+    }
+
+    #[test]
+    fn stops_at_the_last_deploy_and_skips_a_pruned_transaction() {
+        let programdata = bs58::encode([7u8; 32]).into_string();
+        let mut fetched = Vec::new();
+        let rpc = |method: &str, params: Value| {
+            Ok(match method {
+                "getAccountInfo" if params[0] == "Prog" => json!({ "value":
+                    account(LOADER_V3, &[&[2, 0, 0, 0][..], &[7; 32]].concat()) }),
+                "getAccountInfo" if params[0] == programdata.as_str() => json!({ "value":
+                    account(LOADER_V3, &[&[3, 0, 0, 0][..], &100u64.to_le_bytes()].concat()) }),
+                "getSignaturesForAddress" => json!([
+                    { "signature": "S1", "err": null, "slot": 102 },
+                    { "signature": "S2", "err": null, "slot": 101 },
+                    { "signature": "S3", "err": null, "slot": 100 },
+                ]),
+                "getTransaction" => {
+                    fetched.push(params[0].clone());
+                    if params[0] == "S1" {
+                        Value::Null
+                    } else {
+                        tx(
+                            &["Payer", "Prog"],
+                            &json!([{ "programIdIndex": 1, "accounts": [0], "data": "2" }]),
+                        )
+                    }
+                }
+                _ => json!({ "value": [] }),
+            })
+        };
+        let sampled = sample(rpc, &idl(), "Prog", &Limits::default()).unwrap();
+        // S3 is in the deploy slot, so it ran the old code.
+        assert_eq!(fetched, ["S1", "S2"]);
+        assert_eq!(sampled.transactions, 1);
+        assert_eq!(sampled.stop_reason, StopReason::Upgrade(100));
     }
 
     #[test]
@@ -476,7 +639,9 @@ mod tests {
             per_instruction: 1,
             ..Limits::default()
         };
-        let samples = sample(rpc, &idl, "Prog", &limits).unwrap().samples;
+        let samples = sample(no_program(rpc), &idl, "Prog", &limits)
+            .unwrap()
+            .samples;
         let events: Vec<(EventSource, &[u8])> = samples
             .events
             .iter()
@@ -512,7 +677,9 @@ mod tests {
             per_instruction: 1,
             ..Limits::default()
         };
-        let samples = sample(rpc, &idl(), "Prog", &limits).unwrap().samples;
+        let samples = sample(no_program(rpc), &idl(), "Prog", &limits)
+            .unwrap()
+            .samples;
         assert_eq!(samples.instructions.len(), 1);
         let addresses: Vec<&str> = samples
             .accounts
@@ -543,7 +710,7 @@ mod tests {
             }
             _ => Ok(json!({ "value": [Value::Null] })),
         };
-        let samples = sample(rpc, &idl(), "Prog", &Limits::default())
+        let samples = sample(no_program(rpc), &idl(), "Prog", &Limits::default())
             .unwrap()
             .samples;
         assert_eq!(samples.instructions.len(), 1);
@@ -579,6 +746,7 @@ mod tests {
                         &json!([{ "programIdIndex": 1, "accounts": [0], "data": data }]),
                     )
                 }
+                "getAccountInfo" => json!({ "value": null }),
                 _ => json!({ "value": params[0].as_array().unwrap().iter()
                     .map(|_| Value::Null).collect::<Vec<_>>() }),
             })
