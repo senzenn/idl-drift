@@ -66,7 +66,7 @@ pub struct Instruction {
     /// Shipstern dispatches on `discriminator` alone.
     #[serde(default)]
     pub extra_discriminators: Vec<(usize, Discriminator)>,
-    /// Codama `sizeDiscriminatorNode`: the parser selects the instruction by its data length.
+    /// Codama `sizeDiscriminatorNode` at any position: the data length must match too.
     #[serde(default)]
     pub size_discriminator: Option<usize>,
     #[serde(default)]

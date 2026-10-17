@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use idl_drift::model::Idl;
 
 use crate::classify::{
-    account_table, cpi_envelopes, event_body, event_table, instruction_table, longest_match,
-    DiscTable,
+    account_table, cpi_envelopes, event_body, event_table, instruction_match, instruction_table,
+    longest_match, DiscTable,
 };
 use crate::error::Error;
 use crate::samples::{AccountSample, EventSource, Samples};
@@ -213,6 +213,7 @@ enum Group {
 /// Caps the samples of each kind: an IDL discriminator, or the first bytes of data that
 /// match none.
 struct Quota<'a> {
+    idl: &'a Idl,
     instructions: DiscTable<'a>,
     events: DiscTable<'a>,
     per_kind: usize,
@@ -224,6 +225,7 @@ struct Quota<'a> {
 impl<'a> Quota<'a> {
     fn new(idl: &'a Idl, per_kind: usize) -> Self {
         Self {
+            idl,
             instructions: instruction_table(idl),
             events: event_table(idl),
             per_kind,
@@ -234,11 +236,10 @@ impl<'a> Quota<'a> {
 
     /// Whether to keep a sample of `data`, and whether its kind is new.
     fn take(&mut self, group: Group, data: &[u8]) -> (bool, bool) {
-        let table = match group {
-            Group::Instruction => &self.instructions,
-            Group::LogEvent | Group::CpiEvent => &self.events,
+        let matched = match group {
+            Group::Instruction => instruction_match(self.idl, &self.instructions, data),
+            Group::LogEvent | Group::CpiEvent => longest_match(&self.events, data),
         };
-        let matched = longest_match(table, data);
         let (index, prefix) = kind(matched.as_deref(), data);
         let mut new = false;
         let count = self.taken.entry((group, index, prefix)).or_insert_with(|| {

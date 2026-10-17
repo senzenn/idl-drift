@@ -135,6 +135,24 @@ fn sized_account_types(idl: &Idl) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Like [`longest_match`] for instructions, but a Codama size discriminator must match too.
+pub(crate) fn instruction_match(
+    idl: &Idl,
+    table: &[(Discs<'_>, usize)],
+    data: &[u8],
+) -> Option<Vec<usize>> {
+    let sized: DiscTable<'_> = table
+        .iter()
+        .filter(|(_, i)| {
+            idl.instructions[*i]
+                .size_discriminator
+                .is_none_or(|size| size == data.len())
+        })
+        .cloned()
+        .collect();
+    longest_match(&sized, data)
+}
+
 /// Among instructions sharing a discriminator, prefer an exact account count, then the
 /// largest count the sample satisfies (Shipstern's dispatch order).
 fn pick_by_account_count(
@@ -288,7 +306,7 @@ impl<'a> Classifier<'a> {
     }
 
     pub(crate) fn instruction(&self, sample: &InstructionSample) -> Option<usize> {
-        let candidates = longest_match(&self.instructions, &sample.data)?;
+        let candidates = instruction_match(self.idl, &self.instructions, &sample.data)?;
         Some(pick_by_account_count(
             &self.idl.instructions,
             &candidates,

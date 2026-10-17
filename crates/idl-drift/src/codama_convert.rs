@@ -130,7 +130,7 @@ fn convert_instruction(ix: &InstructionNode, pdas: &[PdaNode]) -> Instruction {
         discriminator: discs.first,
         discriminator_offset: discs.offset,
         extra_discriminators: discs.extra,
-        size_discriminator: size_discriminator(&ix.discriminators),
+        size_discriminator: any_size_discriminator(&ix.discriminators),
         accounts,
         args,
         optional_accounts: match ix.optional_account_strategy.unwrap_or_default() {
@@ -140,12 +140,21 @@ fn convert_instruction(ix: &InstructionNode, pdas: &[PdaNode]) -> Instruction {
     }
 }
 
-/// Shipstern reads only the first discriminator of an account or instruction.
+/// Shipstern reads only the first discriminator of an account.
 fn size_discriminator(discs: &[DiscriminatorNode]) -> Option<usize> {
     match discs.first() {
         Some(DiscriminatorNode::Size(d)) => usize::try_from(d.size).ok(),
         _ => None,
     }
+}
+
+/// Codama requires every discriminator of an instruction to match, so a size node counts at
+/// any position. A program can take one tag at two data lengths.
+fn any_size_discriminator(discs: &[DiscriminatorNode]) -> Option<usize> {
+    discs.iter().find_map(|d| match d {
+        DiscriminatorNode::Size(d) => usize::try_from(d.size).ok(),
+        _ => None,
+    })
 }
 
 fn convert_ix_account(

@@ -5,6 +5,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- idl-verify: an instruction matches only when its Codama size discriminator matches too, at
+  any position. A program that takes one tag at two data lengths no longer gives a false
+  "bytes after the arguments" error.
+
 ## [0.1.0] - 2026-10-16
 
 The first release of `idl-drift` and `idl-verify`.
