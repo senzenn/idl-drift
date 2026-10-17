@@ -15,7 +15,7 @@ use crate::model::{Idl, Instruction, NamedDisc};
 
 /// What a generated parser selects an instruction by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum DispatchKey<'a> {
+pub(crate) enum DispatchKey<'a> {
     /// The discriminator bytes.
     Bytes(&'a [u8]),
     /// The data length (Codama `sizeDiscriminatorNode`).
@@ -51,7 +51,7 @@ impl fmt::Display for DispatchKey<'_> {
 }
 
 /// `(dispatch key, account count)` to instruction names.
-type Classes<'a> = BTreeMap<(DispatchKey<'a>, usize), BTreeSet<String>>;
+pub(crate) type Classes<'a> = BTreeMap<(DispatchKey<'a>, usize), BTreeSet<String>>;
 
 pub(super) fn diff_discriminator_collisions(old: &Idl, new: &Idl, r: &mut Report) {
     let old_classes = collision_classes(&old.instructions);
@@ -107,7 +107,7 @@ pub(super) fn diff_discriminator_collisions(old: &Idl, new: &Idl, r: &mut Report
     diff_account_size_collisions(&old.accounts, &new.accounts, r);
 }
 
-fn collision_classes(instructions: &[Instruction]) -> Classes<'_> {
+pub(crate) fn collision_classes(instructions: &[Instruction]) -> Classes<'_> {
     let mut map = Classes::new();
     for ix in instructions {
         let Some(key) = DispatchKey::of(ix) else {

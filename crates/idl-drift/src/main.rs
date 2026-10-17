@@ -9,6 +9,7 @@ use idl_drift::inspect::{shared_types, SharedType};
 use idl_drift::markdown::escape;
 use idl_drift::model::Idl;
 use idl_drift::onchain::{self, OnchainIdl, Source};
+use idl_drift::shipstern;
 use idl_drift::{
     coverage, diff, layouts, Change, ChangeKind, CoverageReport, Report, Severity, TypeLayout,
 };
@@ -231,9 +232,16 @@ fn written(result: io::Result<()>) -> Result<(), Failure> {
 }
 
 fn load(path: &Path) -> Result<Idl, Failure> {
+    load_with_text(path).map(|(_, idl)| idl)
+}
+
+/// The IDL and its text. The Shipstern checks read the Codama nodes, which `Idl` does not keep.
+fn load_with_text(path: &Path) -> Result<(String, Idl), Failure> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| Failure::Input(format!("read {}: {e}", path.display())))?;
-    Idl::from_json(&src).map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))
+    let idl = Idl::from_json(&src)
+        .map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))?;
+    Ok((src, idl))
 }
 
 fn load_allow(path: &Path) -> Result<AllowList<ChangeKind>, Failure> {
@@ -321,14 +329,38 @@ struct View<'a> {
 }
 
 fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
-    let idl = load(path)?;
+    let (src, idl) = load_with_text(path)?;
     let report = coverage(&idl);
     let shared = shared_types(&idl);
+    let skipped = shipstern::skipped_accounts(&src)
+        .map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))?;
     written(print_coverage(&report, &shared))?;
+    written(print_shipstern(
+        &shipstern::ambiguous_instructions(&idl),
+        &skipped,
+    ))?;
     if layout {
         written(print_layouts(&layouts(&idl)))?;
     }
+    // Shipstern warnings leave the exit code as it is: other parsers read these IDLs.
     Ok(u8::from(!report.fully_mapped() || !shared.is_empty()))
+}
+
+fn print_shipstern(ambiguous: &[String], skipped: &[(String, &str)]) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "instructions that Shipstern cannot tell apart: {}",
+        ambiguous.len()
+    )?;
+    for group in ambiguous {
+        writeln!(out, "SHIPSTERN: {group}")?;
+    }
+    writeln!(out, "account types that Shipstern skips: {}", skipped.len())?;
+    for (name, why) in skipped {
+        writeln!(out, "SHIPSTERN: {name}: {why}")?;
+    }
+    Ok(())
 }
 
 fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {

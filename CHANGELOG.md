@@ -5,6 +5,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
+  apart and account types that Shipstern skips. The exit code does not change.
+
 ### Fixed
 
 - idl-verify: an instruction matches only when its Codama size discriminator matches too, at

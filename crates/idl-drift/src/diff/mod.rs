@@ -6,7 +6,7 @@
 //! and enum variants by tag index.
 
 mod accounts;
-mod collisions;
+pub(crate) mod collisions;
 mod errors;
 mod events;
 mod instructions;

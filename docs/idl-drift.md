@@ -333,6 +333,8 @@ unmapped (Generic) fields: 1
 UNMAPPED: ix:ping.n -> Generic("hiddenPrefixTypeNode")
 undefined types: 0
 padded zero-copy types also read as Borsh: 0
+instructions that Shipstern cannot tell apart: 0
+account types that Shipstern skips: 0
 ```
 
 ### Padded zero-copy types that Borsh also reads
@@ -342,6 +344,19 @@ reads. A type inside a `bytemuckunsafe` account sits at `repr(C)` offsets, with 
 padding. When an instruction argument, an event or a Borsh account reaches the same type,
 Borsh reads it without the padding. One type definition cannot describe both reads.
 Shipstern's converter rejects this case as `PaddedBorshType`.
+
+### Shipstern warnings
+
+`inspect` also lists, on `SHIPSTERN:` lines, what Shipstern's generated parser cannot use.
+Shipstern selects an instruction or an account type by its first discriminator only.
+
+- Instructions that share the first discriminator and the account count. Codama can tell them
+  apart by a later discriminator, but Shipstern rejects each of them as ambiguous.
+- Codama account types whose first discriminator Shipstern cannot read, so it skips them: a
+  field discriminator that is not fixed-size bytes with a bytes default value, or a constant
+  that is not an unsigned number or bytes.
+
+These lines do not change the exit code, because other parsers read these IDLs.
 
 ### --layout
 
@@ -359,6 +374,8 @@ instructions: 28  accounts: 6  events: 26  types: 44
 unmapped (Generic) fields: 0
 undefined types: 0
 padded zero-copy types also read as Borsh: 0
+instructions that Shipstern cannot tell apart: 0
+account types that Shipstern skips: 0
 zero-copy types: 13
 
 AdaptorAddReceipt (bytemuckunsafe repr(C)): repr(C) size 144, Borsh size 137, padding 7
