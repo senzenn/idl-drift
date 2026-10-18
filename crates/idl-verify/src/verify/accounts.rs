@@ -357,10 +357,15 @@ impl Verifier<'_> {
                         .is_some_and(|rest| rest.iter().all(|b| *b == 0))
                 });
             let (severity, message, hint) = if let Some(layout) = padded {
-                let shifted = layout
-                    .padding
-                    .iter()
-                    .find_map(|p| p.before.as_deref())
+                // Name the field after the first gap, unless an earlier field has a gap inside.
+                let first = layout.padding.first().filter(|p| {
+                    !layout
+                        .fields
+                        .iter()
+                        .any(|f| f.padding > 0 && f.offset < p.offset)
+                });
+                let shifted = first
+                    .and_then(|p| p.before.as_deref())
                     .map_or_else(String::new, |f| {
                         format!(" A decoder built from it reads `{f}` and every later field at the wrong offset.")
                     });
@@ -520,7 +525,20 @@ fn unknown_account_hint(idl: &Idl, sized: &[(usize, usize)], by_size: bool) -> S
 }
 
 fn padding_list(layout: &StructLayout) -> String {
-    let parts: Vec<String> = layout.padding.iter().map(ToString::to_string).collect();
+    let mut parts: Vec<(usize, String)> = layout
+        .padding
+        .iter()
+        .map(|p| (p.offset, p.to_string()))
+        .collect();
+    // A nested struct keeps its own gaps, so name the field that holds them.
+    for f in layout.fields.iter().filter(|f| f.padding > 0) {
+        parts.push((
+            f.offset,
+            format!("{} inside `{}`", bytes(f.padding), f.name),
+        ));
+    }
+    parts.sort_by_key(|(offset, _)| *offset);
+    let parts: Vec<String> = parts.into_iter().map(|(_, part)| part).collect();
     parts.join(", ")
 }
 

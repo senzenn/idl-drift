@@ -375,8 +375,9 @@ These lines do not change the exit code, because other parsers read these IDLs.
 
 `--layout` prints each `bytemuck` and `bytemuckunsafe` type field by field: the offset, size
 and alignment of each field under SBF `repr(C)` rules, each implicit gap, and the zero-copy
-size next to the Borsh size. The alignment rules are in
-[idl-verify.md](idl-verify.md#zero-copy-layout).
+size next to the Borsh size. The `padding` total also counts the gaps inside nested structs,
+once for each array item, and a `padding inside` line names each field that holds them. The
+alignment rules are in [idl-verify.md](idl-verify.md#zero-copy-layout).
 
 ```bash
 idl-drift inspect --layout fixtures/live/voltr_vault/idl.json

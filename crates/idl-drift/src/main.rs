@@ -394,6 +394,9 @@ fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
                 for gap in &layout.padding {
                     writeln!(out, "  gap at {}: {gap}", gap.offset)?;
                 }
+                for f in layout.fields.iter().filter(|f| f.padding > 0) {
+                    writeln!(out, "  padding inside `{}`: {}", f.name, f.padding)?;
+                }
             }
             Err(e) => writeln!(
                 out,

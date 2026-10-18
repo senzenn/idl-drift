@@ -10,6 +10,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
   apart and account types that Shipstern skips. The exit code does not change.
 
+### Changed
+
+- Library: `idl_drift::layout::FieldLayout` has a new `padding` field, and
+  `idl_verify::decode::DecodeErrorKind` has a new `NaN` variant. Both types are now
+  `#[non_exhaustive]`, so code that builds `FieldLayout` or matches every variant must change.
+
 ### Fixed
 
 - idl-verify: an instruction matches only when its Codama size discriminator matches too, at
@@ -27,6 +33,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-drift: a layout change on a type that only the new IDL reaches is Cosmetic.
 - idl-drift: a legacy Anchor field or seed named `publicKey` keeps its name.
 - idl-verify: value compares find a wrong enum variant with capitalized names.
+- idl-verify: a NaN in a Borsh type is a `decode` error.
+- idl-verify: padding inside a nested zero-copy struct counts.
 
 ## [0.1.0] - 2026-10-16
 

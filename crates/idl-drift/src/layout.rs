@@ -237,8 +237,8 @@ impl<'a> TypeIndex<'a> {
         let mut offset = 0usize;
         let mut align = 1usize;
         for field in fields {
-            let (size, natural) = self
-                .size_align_at(&field.ty, depth + 1)
+            let (size, natural, padding) = self
+                .field_shape(&field.ty, depth + 1)
                 .map_err(|e| e.within(&field.name))?;
             let field_align = if repr.packed { 1 } else { natural };
             let start = round_up(offset, field_align)?;
@@ -254,6 +254,7 @@ impl<'a> TypeIndex<'a> {
                 offset: start,
                 size,
                 align: field_align,
+                padding,
             });
             offset = start.checked_add(size).ok_or(LayoutError::Overflow)?;
             align = align.max(field_align);
@@ -275,6 +276,35 @@ impl<'a> TypeIndex<'a> {
         layout.size = size;
         layout.align = align;
         Ok(layout)
+    }
+
+    /// Size, alignment and implicit padding of a field. A nested struct keeps its padding in
+    /// zero-copy memory, so an array of it has that padding in each item.
+    fn field_shape(&self, ty: &Type, depth: usize) -> Result<(usize, usize, usize), LayoutError> {
+        if depth > MAX_DEPTH {
+            return Err(LayoutError::TooDeep);
+        }
+        match ty {
+            Type::Array(item, ArrayLen::Value(len)) => {
+                let (size, align, padding) = self.field_shape(item, depth + 1)?;
+                let times = |n: usize| n.checked_mul(*len).ok_or(LayoutError::Overflow);
+                return Ok((times(size)?, align, times(padding)?));
+            }
+            Type::Defined { name, generics } if generics.is_empty() => {
+                let td = self.lookup(name)?;
+                match &td.ty {
+                    TypeDefTy::Struct { .. } => {
+                        let layout = self.struct_layout_at(td, depth + 1)?;
+                        return Ok((layout.size, layout.align, layout.padding_len()));
+                    }
+                    TypeDefTy::Type { alias } => return self.field_shape(alias, depth + 1),
+                    TypeDefTy::Enum { .. } => {}
+                }
+            }
+            _ => {}
+        }
+        let (size, align) = self.size_align_at(ty, depth)?;
+        Ok((size, align, 0))
     }
 
     /// `true` when `ty` holds a bool at any depth. Types without a zero-copy layout give
@@ -501,24 +531,28 @@ pub struct StructLayout {
     pub size: usize,
     pub align: usize,
     pub fields: Vec<FieldLayout>,
-    /// Implicit padding, in offset order.
+    /// Implicit padding between and after this struct's own fields, in offset order.
     pub padding: Vec<Padding>,
 }
 
 impl StructLayout {
-    /// Total implicit padding in bytes.
+    /// Total implicit padding in bytes, with the padding inside the fields.
     #[must_use]
     pub fn padding_len(&self) -> usize {
-        self.padding.iter().map(|p| p.len).sum()
+        let own: usize = self.padding.iter().map(|p| p.len).sum();
+        own + self.fields.iter().map(|f| f.padding).sum::<usize>()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FieldLayout {
     pub name: String,
     pub offset: usize,
     pub size: usize,
     pub align: usize,
+    /// Implicit padding inside the field: in nested structs, and in each array item.
+    pub padding: usize,
 }
 
 /// Bytes the compiler inserts to align the next field (or the struct size, when `before` is
@@ -693,6 +727,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!((l.fields[1].offset, l.size), (1, 9));
+    }
+
+    #[test]
+    fn padding_counts_gaps_in_nested_structs_once_per_array_item() {
+        let l = layout(
+            r#"[{"name":"Outer","type":{"kind":"struct","fields":[
+                  {"name":"inner","type":{"defined":{"name":"Inner"}}},
+                  {"name":"items","type":{"array":[{"defined":{"name":"Inner"}},2]}}]}},
+                {"name":"Inner","type":{"kind":"struct","fields":[
+                  {"name":"a","type":"u8"},{"name":"b","type":"u64"}]}}]"#,
+            "Outer",
+        )
+        .unwrap();
+        assert_eq!((l.size, l.padding.len(), l.padding_len()), (48, 0, 21));
     }
 
     #[test]

@@ -111,6 +111,13 @@ impl Decoder<'_> {
                 }
                 Ok(Value::List(out))
             }
+            // bytemuck casts any bit pattern, so a NaN that Borsh refuses is valid here.
+            Type::F32 => Reader { data, pos: at }
+                .array()
+                .map(|b| Value::F32(f32::from_le_bytes(b))),
+            Type::F64 => Reader { data, pos: at }
+                .array()
+                .map(|b| Value::F64(f64::from_le_bytes(b))),
             // Scalars and pubkeys read the same bytes as Borsh, just at a fixed offset.
             _ => {
                 let mut r = Reader { data, pos: at };
