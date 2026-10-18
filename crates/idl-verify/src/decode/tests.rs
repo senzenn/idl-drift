@@ -47,6 +47,25 @@ fn zero_copy_reads_past_padding() {
 }
 
 #[test]
+fn borsh_refuses_nan_but_zero_copy_reads_it() {
+    let idl = idl(
+        r#"[{"name":"B","type":{"kind":"struct","fields":[{"name":"x","type":"f64"}]}},
+            {"name":"Z","serialization":"bytemuck","type":{"kind":"struct","fields":[{"name":"x","type":"f64"}]}}]"#,
+    );
+    let nan = f64::NAN.to_le_bytes();
+    assert_eq!(
+        decode(&idl, "B", &nan).unwrap_err().to_string(),
+        "`x` at offset 0: float is NaN, which borsh refuses"
+    );
+    let decoder = Decoder::new(TypeIndex::new(&idl));
+    assert!(decoder.borsh(&Type::F32, &f32::NAN.to_le_bytes()).is_err());
+    let Value::Struct(z) = decode(&idl, "Z", &nan).unwrap().value else {
+        panic!()
+    };
+    assert!(matches!(z[0].1, Value::F64(v) if v.is_nan()));
+}
+
+#[test]
 fn short_data_names_the_field() {
     let idl = idl(r#"[{"name":"S","type":{"kind":"struct","fields":[
             {"name":"inner","type":{"defined":{"name":"I"}}}]}},

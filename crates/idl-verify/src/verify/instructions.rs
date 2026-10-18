@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use idl_drift::model::{Account, Instruction, OptionalAccounts};
 
-use super::{missing_field_hint, sample_count, Groups, Outcomes, Verifier, LEGACY_DISCRIMINATORS};
-use crate::classify::flatten;
+use super::{missing_field_hint, Groups, Outcomes, Verifier, LEGACY_DISCRIMINATORS};
+use crate::classify::{flatten, IDL_IX_TAG};
 use crate::report::{Check, Coverage, InstructionSummary, Range, Severity};
 use crate::samples::KeyFlags;
 use crate::text::{byte_range, of_samples, prefix_hex};
@@ -15,9 +15,11 @@ impl Verifier<'_> {
         let idl = self.idl;
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); idl.instructions.len()];
         let mut unknown = Groups::new();
+        let mut idl_ix = Vec::new();
         for (i, sample) in self.samples.instructions.iter().enumerate() {
             match self.classifier.instruction(sample) {
                 Some(t) => groups[t].push(i),
+                None if self.is_anchor_builtin(&sample.data, &IDL_IX_TAG) => idl_ix.push(i),
                 None => unknown
                     .entry(format!(
                         "{} matches no instruction discriminator in the IDL",
@@ -37,6 +39,13 @@ impl Verifier<'_> {
             "the program has an instruction the IDL does not declare",
             |v, i| v.samples.instructions[i].signature.clone(),
         );
+        self.report_anchor_builtin(
+            "instruction",
+            "IDL instruction",
+            &IDL_IX_TAG,
+            &idl_ix,
+            |v, i| v.samples.instructions[i].signature.clone(),
+        );
 
         let mut summaries = Vec::new();
         let mut not_sampled = Vec::new();
@@ -49,7 +58,7 @@ impl Verifier<'_> {
         }
         let coverage = Coverage {
             sampled: self.samples.instructions.len(),
-            classified: self.samples.instructions.len() - sample_count(&unknown),
+            classified: groups.iter().map(Vec::len).sum(),
             not_sampled,
         };
         (coverage, summaries)
@@ -454,8 +463,9 @@ fn omitted_places(flat: &[&Account], passed: usize) -> Vec<Option<usize>> {
 mod tests {
     use idl_drift::model::{AccountItem, Idl};
 
+    use crate::classify::{IDL_ACCOUNT_DISCRIMINATOR, IDL_IX_TAG};
     use crate::report::{Check, Report, Severity};
-    use crate::samples::{InstructionSample, KeyFlags, Samples};
+    use crate::samples::{AccountSample, InstructionSample, KeyFlags, Samples};
     use crate::testing::{idl, only};
     use crate::verify;
 
@@ -518,6 +528,45 @@ mod tests {
         let report = verify(&idl, &instructions(&[(&[1, 9], &["k1", "k2"])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
         assert_eq!(report.instructions[0].name, "two");
+    }
+
+    #[test]
+    fn anchor_idl_instruction_and_account_are_a_note_not_an_error() {
+        // Anchor adds both to each program built without `no-idl`, and its IDL lists neither.
+        let data = [&IDL_IX_TAG[..], &[2]].concat();
+        let mut samples = instructions(&[(&data, &["Idl", "Auth"])]);
+        samples.accounts.push(AccountSample {
+            address: "Idl".into(),
+            data: [&IDL_ACCOUNT_DISCRIMINATOR[..], &[0; 36]].concat(),
+        });
+        let report = verify(&ix_idl("[]"), &samples, None);
+        let found: Vec<(Severity, Check, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.severity, f.check, f.message.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    Severity::Note,
+                    Check::Discriminator,
+                    "1 account is Anchor's IdlAccount (0x184662bf3a907b9e); not checked"
+                ),
+                (
+                    Severity::Note,
+                    Check::Discriminator,
+                    "1 instruction is Anchor's IDL instruction (0x40f4bc78a7e9690a); not checked"
+                ),
+            ]
+        );
+        assert_eq!(
+            (
+                report.account_coverage.classified,
+                report.instruction_coverage.classified
+            ),
+            (0, 0)
+        );
     }
 
     /// Token-2022's transfer-fee instructions: a `u8` tag, then a `u8` sub-tag.
@@ -707,37 +756,73 @@ mod tests {
     #[test]
     fn a_codama_size_discriminator_must_match_too() {
         // A native program can take one tag at two data lengths, when callers pad the struct.
-        let ix = |name: &str, size: usize, extra: &str| {
+        // The Codama spec lets the size discriminator come first or last.
+        for size_first in [false, true] {
+            let ix = |name: &str, size: usize, extra: &str| {
+                let field =
+                    r#"{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}"#;
+                let sized = format!(r#"{{"kind":"sizeDiscriminatorNode","size":{size}}}"#);
+                let discs = if size_first {
+                    format!("{sized},{field}")
+                } else {
+                    format!("{field},{sized}")
+                };
+                format!(
+                    r#"{{"kind":"instructionNode","name":"{name}","accounts":[],"arguments":[
+                    {{"kind":"instructionArgumentNode","name":"discriminator","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+                    "defaultValue":{{"kind":"numberValueNode","number":7}},"defaultValueStrategy":"omitted"}},
+                    {{"kind":"instructionArgumentNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}{extra}],
+                    "discriminators":[{discs}]}}"#
+                )
+            };
+            let pad = r#",{"kind":"instructionArgumentNode","name":"pad","type":{"kind":"fixedSizeTypeNode","size":7,"type":{"kind":"bytesTypeNode"}}}"#;
+            let idl = Idl::from_json(&format!(
+                r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
+                "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
+                "errors":[],"definedTypes":[],"pdas":[],"instructions":[{},{}]}}}}"#,
+                ix("short", 9, ""),
+                ix("padded", 16, pad)
+            ))
+            .unwrap();
+            let mut short = vec![7];
+            short.extend(5u64.to_le_bytes());
+            let mut padded = short.clone();
+            padded.extend([0; 7]);
+            let report = verify(&idl, &instructions(&[(&short, &[]), (&padded, &[])]), None);
+            assert!(
+                report.findings.is_empty(),
+                "{size_first}: {:#?}",
+                report.findings
+            );
+            // The tag matches, but no instruction has this size.
+            let report = verify(&idl, &instructions(&[(&short[..6], &[])]), None);
+            assert_eq!(
+                (only(&report).severity, only(&report).check),
+                (Severity::Error, Check::Discriminator)
+            );
+        }
+    }
+
+    #[test]
+    fn a_size_discriminator_alone_selects_an_instruction() {
+        let ix = |name: &str, size: usize, format: &str| {
             format!(
                 r#"{{"kind":"instructionNode","name":"{name}","accounts":[],"arguments":[
-                {{"kind":"instructionArgumentNode","name":"discriminator","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
-                "defaultValue":{{"kind":"numberValueNode","number":7}},"defaultValueStrategy":"omitted"}},
-                {{"kind":"instructionArgumentNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}{extra}],
-                "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}},
-                {{"kind":"sizeDiscriminatorNode","size":{size}}}]}}"#
+                {{"kind":"instructionArgumentNode","name":"v","type":{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}}}],
+                "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{size}}}]}}"#
             )
         };
-        let pad = r#",{"kind":"instructionArgumentNode","name":"pad","type":{"kind":"fixedSizeTypeNode","size":7,"type":{"kind":"bytesTypeNode"}}}"#;
         let idl = Idl::from_json(&format!(
             r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
             "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
             "errors":[],"definedTypes":[],"pdas":[],"instructions":[{},{}]}}}}"#,
-            ix("short", 9, ""),
-            ix("padded", 16, pad)
+            ix("big", 8, "u64"),
+            ix("small", 1, "u8")
         ))
         .unwrap();
-        let mut short = vec![7];
-        short.extend(5u64.to_le_bytes());
-        let mut padded = short.clone();
-        padded.extend([0; 7]);
-        let report = verify(&idl, &instructions(&[(&short, &[]), (&padded, &[])]), None);
+        let report = verify(&idl, &instructions(&[(&[5; 8], &[]), (&[5], &[])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
-        // The tag matches, but no instruction has this size.
-        let report = verify(&idl, &instructions(&[(&short[..6], &[])]), None);
-        assert_eq!(
-            (only(&report).severity, only(&report).check),
-            (Severity::Error, Check::Discriminator)
-        );
+        assert_eq!(report.instruction_coverage.classified, 2);
     }
 
     #[test]

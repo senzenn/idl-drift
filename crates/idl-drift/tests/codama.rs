@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{fixture, fixture_text, max_sev, parse};
+use common::{fixture, fixture_text, kinds, max_sev, parse};
 use idl_drift::codama_convert::decode_encoded_bytes;
 use idl_drift::model::{ArrayLen, Idl, Type, TypeDefTy};
 use idl_drift::{coverage, diff, ChangeKind, Severity};
@@ -165,13 +165,103 @@ fn codama_enum_tag_width_and_variant_values_are_breaking() {
 
 /// A Codama program whose one instruction takes an arg of type `arg`.
 fn codama_arg(arg: &str, defined_types: &str) -> String {
+    codama_args(
+        &format!(r#"{{"kind":"instructionArgumentNode","name":"x","type":{arg}}}"#),
+        defined_types,
+    )
+}
+
+/// A Codama program whose one instruction takes the `arguments` nodes `args`.
+fn codama_args(args: &str, defined_types: &str) -> String {
+    codama_root(
+        &format!(
+            r#"{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],"arguments":[{args}]}}"#
+        ),
+        "",
+        defined_types,
+    )
+}
+
+/// A Codama program with these `instructions`, `accounts` and `definedTypes` nodes.
+fn codama_root(instructions: &str, accounts: &str, defined_types: &str) -> String {
     format!(
         r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
   "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111","version":"0",
-    "accounts":[],"pdas":[],"errors":[],"definedTypes":[{defined_types}],
-    "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],
-      "arguments":[{{"kind":"instructionArgumentNode","name":"x","type":{arg}}}]}}]}}}}"#
+    "accounts":[{accounts}],"pdas":[],"errors":[],"definedTypes":[{defined_types}],
+    "instructions":[{instructions}]}}}}"#
     )
+}
+
+#[test]
+fn bytes_and_a_u8_vec_are_the_same_bytes() {
+    // Anchor and Shank write `Vec<u8>` as bytes, codama-rs as a u8 array with a u32 prefix.
+    let bytes = codama_arg(
+        r#"{"kind":"sizePrefixTypeNode","type":{"kind":"bytesTypeNode"},
+        "prefix":{"kind":"numberTypeNode","format":"u32","endian":"le"}}"#,
+        "",
+    );
+    let array = |prefix: &str| {
+        codama_arg(
+            &format!(
+                r#"{{"kind":"arrayTypeNode","item":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+                "count":{{"kind":"prefixedCountNode","prefix":{{"kind":"numberTypeNode","format":"{prefix}","endian":"le"}}}}}}"#
+            ),
+            "",
+        )
+    };
+    assert_eq!(kinds(&bytes, &array("u32")), []);
+    assert_eq!(
+        kinds(&bytes, &array("u16")),
+        [(Severity::Breaking, ChangeKind::ArgChanged)]
+    );
+}
+
+#[test]
+fn args_that_nest_a_struct_differently_are_the_same_bytes() {
+    let arg = |name: &str, ty: &str| {
+        format!(r#"{{"kind":"instructionArgumentNode","name":"{name}","type":{ty}}}"#)
+    };
+    let num =
+        |format: &str| format!(r#"{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}"#);
+    let st = |amount: &str, bump: &str| {
+        let field = |name: &str, format: &str| {
+            format!(
+                r#"{{"kind":"structFieldTypeNode","name":"{name}","type":{}}}"#,
+                num(format)
+            )
+        };
+        format!(
+            r#"{{"kind":"structTypeNode","fields":[{},{}]}}"#,
+            field(amount, "u64"),
+            field("bump", bump)
+        )
+    };
+    let flat = codama_args(
+        &format!("{},{}", arg("amount", &num("u64")), arg("bump", &num("u8"))),
+        "",
+    );
+    let inline = |amount: &str| codama_args(&arg("params", &st(amount, "u8")), "");
+    // Codama inlines a type that one instruction uses, and links it once a second use exists.
+    let linked = |bump: &str| {
+        codama_args(
+            &arg(
+                "params",
+                r#"{"kind":"definedTypeLinkNode","name":"depositParams"}"#,
+            ),
+            &format!(
+                r#"{{"kind":"definedTypeNode","name":"depositParams","type":{}}}"#,
+                st("amount", bump)
+            ),
+        )
+    };
+    assert_eq!(kinds(&flat, &linked("u8")), []);
+    assert_eq!(kinds(&inline("amount"), &linked("u8")), []);
+    assert_eq!(
+        kinds(&flat, &inline("amt")),
+        [(Severity::Dangerous, ChangeKind::ArgRenamed)]
+    );
+    // A real layout change keeps the args as written.
+    assert_eq!(max_sev(&flat, &linked("u16")), Some(Severity::Breaking));
 }
 
 /// A Codama program with one defined type `ext` passed as an instruction arg.
@@ -353,6 +443,73 @@ fn size_discriminators_and_event_chains_are_compared() {
     assert_eq!(
         kinds(&lone(0), &lone(8)),
         [ChangeKind::EventDiscriminatorChanged]
+    );
+}
+
+#[test]
+fn a_discriminator_after_a_size_discriminator_is_compared() {
+    let root = |tag: &str| {
+        let bytes = format!(r#"{{"kind":"bytesValueNode","data":"{tag}","encoding":"base16"}}"#);
+        let ix = format!(
+            r#"{{"kind":"instructionNode","name":"ping","accounts":[],"arguments":[
+            {{"kind":"instructionArgumentNode","name":"discriminator","defaultValueStrategy":"omitted",
+            "type":{{"kind":"fixedSizeTypeNode","size":1,"type":{{"kind":"bytesTypeNode"}}}},"defaultValue":{bytes}}}],
+            "discriminators":[{{"kind":"sizeDiscriminatorNode","size":1}},
+            {{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}]}}"#
+        );
+        let account = format!(
+            r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[]}},
+            "discriminators":[{{"kind":"sizeDiscriminatorNode","size":1}},
+            {{"kind":"constantDiscriminatorNode","offset":0,"constant":{{"kind":"constantValueNode",
+            "type":{{"kind":"bytesTypeNode"}},"value":{bytes}}}}}]}}"#
+        );
+        codama_root(&ix, &account, "")
+    };
+    assert_eq!(
+        kinds(&root("01"), &root("02")),
+        [
+            (Severity::Breaking, ChangeKind::DiscriminatorChanged),
+            (Severity::Breaking, ChangeKind::AccountDiscriminatorChanged)
+        ]
+    );
+}
+
+#[test]
+fn a_number_to_bytes_account_discriminator_moves_the_body() {
+    // Shipstern reads a number constant as the first field, but starts after a bytes one.
+    let field = |name: &str, format: &str| {
+        format!(
+            r#"{{"kind":"structFieldTypeNode","name":"{name}","type":{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}}}"#
+        )
+    };
+    let root = |constant: &str, fields: &str| {
+        codama_root(
+            "",
+            &format!(
+                r#"{{"kind":"accountNode","name":"pool","data":{{"kind":"structTypeNode","fields":[{fields}]}},
+                "discriminators":[{{"kind":"constantDiscriminatorNode","offset":0,"constant":{constant}}}]}}"#
+            ),
+            "",
+        )
+    };
+    let number = r#"{"kind":"constantValueNode","type":{"kind":"numberTypeNode","format":"u8","endian":"le"},"value":{"kind":"numberValueNode","number":3}}"#;
+    let bytes = r#"{"kind":"constantValueNode","type":{"kind":"fixedSizeTypeNode","size":1,"type":{"kind":"bytesTypeNode"}},"value":{"kind":"bytesValueNode","data":"03","encoding":"base16"}}"#;
+    let both = format!("{},{}", field("accountType", "u8"), field("amount", "u64"));
+    assert_eq!(
+        kinds(&root(number, &both), &root(bytes, &both)),
+        [(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged
+        )]
+    );
+    // Without the accountType field, `amount` stays at byte 1, so the body start is no change.
+    let moved = kinds(&root(number, &both), &root(bytes, &field("amount", "u64")));
+    assert!(
+        !moved.contains(&(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged
+        )),
+        "{moved:?}"
     );
 }
 

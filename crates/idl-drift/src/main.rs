@@ -6,7 +6,7 @@ use clap::parser::ValueSource;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use idl_drift::allow::{json_name, AllowEntry, AllowList};
 use idl_drift::inspect::{shared_types, SharedType};
-use idl_drift::markdown::escape;
+use idl_drift::markdown::{escape, escape_control};
 use idl_drift::model::Idl;
 use idl_drift::onchain::{self, OnchainIdl, Source};
 use idl_drift::shipstern;
@@ -169,7 +169,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            let _ = writeln!(io::stderr(), "error: {e}");
+            let _ = writeln!(io::stderr(), "error: {}", escape_control(&e.to_string()));
             // A failed report write can leave part of a report; do not add to it.
             if !matches!(e, Failure::Write(_)) {
                 match format {
@@ -354,11 +354,11 @@ fn print_shipstern(ambiguous: &[String], skipped: &[(String, &str)]) -> io::Resu
         ambiguous.len()
     )?;
     for group in ambiguous {
-        writeln!(out, "SHIPSTERN: {group}")?;
+        writeln!(out, "SHIPSTERN: {}", escape_control(group))?;
     }
     writeln!(out, "account types that Shipstern skips: {}", skipped.len())?;
     for (name, why) in skipped {
-        writeln!(out, "SHIPSTERN: {name}: {why}")?;
+        writeln!(out, "SHIPSTERN: {}: {why}", escape_control(name))?;
     }
     Ok(())
 }
@@ -378,7 +378,7 @@ fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
                 writeln!(
                     out,
                     "\n{} ({} {repr}): repr(C) size {}, Borsh size {borsh}, padding {}",
-                    t.name,
+                    escape_control(&t.name),
                     t.serialization,
                     layout.size,
                     layout.padding_len()
@@ -388,17 +388,27 @@ fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
                     writeln!(
                         out,
                         "  {:>6}  {:>4}  {:>5}  {}",
-                        f.offset, f.size, f.align, f.name
+                        f.offset,
+                        f.size,
+                        f.align,
+                        escape_control(&f.name)
                     )?;
                 }
                 for gap in &layout.padding {
-                    writeln!(out, "  gap at {}: {gap}", gap.offset)?;
+                    let gap_text = escape_control(&gap.to_string());
+                    writeln!(out, "  gap at {}: {gap_text}", gap.offset)?;
+                }
+                for f in layout.fields.iter().filter(|f| f.padding > 0) {
+                    let name = escape_control(&f.name);
+                    writeln!(out, "  padding inside `{name}`: {}", f.padding)?;
                 }
             }
             Err(e) => writeln!(
                 out,
-                "\n{} ({} {repr}): cannot compute the zero-copy layout: {e}",
-                t.name, t.serialization
+                "\n{} ({} {repr}): cannot compute the zero-copy layout: {}",
+                escape_control(&t.name),
+                t.serialization,
+                escape_control(&e.to_string())
             )?,
         }
     }
@@ -414,11 +424,12 @@ fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<
     )?;
     writeln!(out, "unmapped (Generic) fields: {}", report.unmapped.len())?;
     for u in &report.unmapped {
-        writeln!(out, "UNMAPPED: {} -> Generic(\"{}\")", u.path, u.kind)?;
+        let (path, kind) = (escape_control(&u.path), escape_control(&u.kind));
+        writeln!(out, "UNMAPPED: {path} -> Generic(\"{kind}\")")?;
     }
     writeln!(out, "undefined types: {}", report.undefined.len())?;
     for name in &report.undefined {
-        writeln!(out, "UNDEFINED: {name}")?;
+        writeln!(out, "UNDEFINED: {}", escape_control(name))?;
     }
     writeln!(
         out,
@@ -430,8 +441,8 @@ fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<
         writeln!(
             out,
             "SHARED: {} -> padding {}; Borsh reads it without the padding",
-            t.name,
-            gaps.join(", ")
+            escape_control(&t.name),
+            escape_control(&gaps.join(", "))
         )?;
     }
     Ok(())
@@ -459,7 +470,12 @@ fn print_human(report: &Report, view: &View) -> io::Result<()> {
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = io::stdout().lock();
     if let Some(o) = view.onchain {
-        writeln!(out, "on-chain IDL: {} {}", o.source, o.account)?;
+        writeln!(
+            out,
+            "on-chain IDL: {} {}",
+            o.source,
+            escape_control(&o.account)
+        )?;
     }
     for (change, tag, _) in by_tier(report) {
         let allowed = if change.allowed { "[ALLOWED] " } else { "" };
@@ -467,7 +483,7 @@ fn print_human(report: &Report, view: &View) -> io::Result<()> {
             out,
             "  {allowed}[{}] {}",
             paint(tag, change.severity, color),
-            change.message
+            escape_control(&change.message)
         )?;
     }
     let (b, d, a, c) = report.counts();

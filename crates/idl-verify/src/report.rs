@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use idl_drift::allow::{json_name, AllowEntry, AllowList};
-use idl_drift::markdown::escape;
+use idl_drift::markdown::{escape, escape_control};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
@@ -418,7 +418,8 @@ impl Report {
     /// When writing to `out` fails.
     pub fn write_human(&self, out: &mut impl Write, color: bool) -> io::Result<()> {
         let p = &self.program;
-        writeln!(out, "{} {}  {}", p.name, p.version, p.address)?;
+        let (name, version) = (escape_control(&p.name), escape_control(&p.version));
+        writeln!(out, "{name} {version}  {}", escape_control(&p.address))?;
         if let Some(s) = &self.sampling {
             writeln!(
                 out,
@@ -677,12 +678,14 @@ impl Report {
                 Severity::Warning => paint("warning", color, |s| s.yellow().bold().to_string()),
                 Severity::Note => paint("note", color, |s| s.cyan().to_string()),
             };
-            writeln!(out, "{label}: {}: {}", f.subject, f.message)?;
+            // Messages hold chain data and decoder output, which must not drive the terminal.
+            let (subject, message) = (escape_control(&f.subject), escape_control(&f.message));
+            writeln!(out, "{label}: {subject}: {message}")?;
             if let Some(hint) = &f.hint {
-                writeln!(out, "  hint: {hint}")?;
+                writeln!(out, "  hint: {}", escape_control(hint))?;
             }
             if let Some(example) = &f.example {
-                writeln!(out, "  example: {example}")?;
+                writeln!(out, "  example: {}", escape_control(example))?;
             }
         }
         Ok(())
@@ -859,8 +862,13 @@ fn write_table<const N: usize>(
     header: [&str; N],
     rows: &[[String; N]],
 ) -> io::Result<()> {
+    // Type names come from the IDL. Escape before the widths, so the columns line up.
+    let rows: Vec<[String; N]> = rows
+        .iter()
+        .map(|row| row.each_ref().map(|cell| escape_control(cell)))
+        .collect();
     let mut widths = header.map(str::len);
-    for row in rows {
+    for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.len());
         }
@@ -881,7 +889,7 @@ fn write_table<const N: usize>(
         s
     };
     writeln!(out, "{}", line(header))?;
-    for row in rows {
+    for row in &rows {
         writeln!(out, "{}", line(row.each_ref().map(String::as_str)))?;
     }
     Ok(())
@@ -890,8 +898,35 @@ fn write_table<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::samples::{InstructionSample, Samples};
+    use crate::reference::{Outcome, Reference};
+    use crate::samples::{AccountSample, InstructionSample, Samples};
     use crate::testing::idl;
+
+    #[test]
+    fn control_characters_in_the_report_are_escaped() {
+        // IDL names and a decoder's error text are untrusted. U+009B starts a terminal sequence.
+        let idl = idl(
+            r#""accounts":[{"name":"A\u009b1m","discriminator":[7]}],"instructions":[],
+            "types":[{"name":"A\u009b1m","type":{"kind":"struct","fields":[{"name":"v","type":"u8"}]}}]"#,
+        );
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "a".into(),
+                data: vec![7, 1],
+            }],
+            ..Samples::default()
+        };
+        let reference =
+            Reference::from_decoder(vec![Outcome::Failed("\u{9b}2J".into())], vec![], vec![]);
+        let report = crate::verify(&idl, &samples, Some(&reference));
+        let mut out = Vec::new();
+        report.write_human(&mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\\u{9b}2J") && text.contains("A\\u{9b}1m") && !text.contains('\u{9b}'),
+            "{text}"
+        );
+    }
 
     #[test]
     fn low_coverage_is_an_error_only_below_the_minimum() {

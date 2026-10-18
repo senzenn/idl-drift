@@ -29,6 +29,9 @@ idl-verify splits the command on whitespace. The first word is the program, and 
 words are its arguments. There is no shell, so quotes and pipes have no special meaning.
 `--decoder` works with `--samples` and with live sampling.
 
+After the last reply, idl-verify stops the decoder process. It stops only that process, so a
+wrapper such as `sh -c` must start the decoder with `exec`.
+
 ## Requests
 
 idl-verify writes one line for each sample to the decoder's stdin: first all accounts, then
@@ -84,6 +87,7 @@ Write values in serde's plain JSON shapes. idl-verify accepts these forms:
 |---|---|
 | Integer, up to 32 bits | A JSON number. |
 | Integer, 64 bits or wider | A JSON number, a decimal string, or `{"bn":"<decimal>"}`. Use a string or `{"bn":...}` for a value that does not fit in a `u64`. |
+| Float | A JSON number, widened to `f64` for an `f32`. NaN can be `null`, as serde writes it. |
 | Pubkey | A base58 string, or an array of its 32 bytes, as serde writes a `Pubkey`. |
 | Bytes | An array of numbers. |
 | Option | `null` for `None`, else the inner value. |

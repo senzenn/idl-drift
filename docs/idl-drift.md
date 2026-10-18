@@ -78,7 +78,8 @@ compares the two IDLs the same way:
   of one format, `sourceOwner` (as Codama writes it) across formats.
 - A layout change counts only on a **reachable** type: an account type, an event type, a
   type that an instruction argument names, and each type that these reach through fields,
-  variant payloads and aliases. A layout change on any other type is Cosmetic.
+  variant payloads and aliases. Both IDLs must reach the type, because an old parser reads
+  only what the old IDL reaches. A layout change on any other type is Cosmetic.
 
 When the two files use different formats, idl-drift first does these steps:
 
@@ -91,6 +92,15 @@ When the two files use different formats, idl-drift first does these steps:
 - It writes each use of a generic struct or alias as its body with the arguments filled in,
   as Codama converters do.
 - It compares a tuple struct and a tuple alias as the same type.
+
+For every pair of files, idl-drift also does these steps, because the bytes are the same:
+
+- It compares `Vec<u8>` and `bytes` as the same type. Anchor and Shank write a Rust
+  `Vec<u8>` as `bytes`, and codama-rs writes it as a u8 array with a u32 prefix.
+- When the two files of one format nest the arguments of an instruction differently, but
+  hold the same field types in the same order, it compares the arguments field by field.
+  For example, Codama links a params type after it gets a second use. Other arguments stay
+  as written, so a change inside a params type keeps its type and field name.
 
 ### Zero-copy types
 
@@ -139,6 +149,9 @@ Two rules follow Shipstern's dispatch:
 - An instruction, account or event discriminator changed. This includes a change in its
   length (for example an Anchor to Quasar port), a Codama size discriminator, an event
   discriminator offset, and a later constant in an event discriminator chain.
+- The start of an account's fields moved. A Codama number constant discriminator is also
+  the first field, and a bytes constant comes before the fields, so a change from one to
+  the other moves each field (`account_discriminator_offset_changed`).
 - An instruction account moved, or an account was removed from the middle of the list.
 - An instruction argument was added, removed, retyped or moved.
 - Two instructions have the same discriminator, or the same Codama size discriminator, and
@@ -362,8 +375,9 @@ These lines do not change the exit code, because other parsers read these IDLs.
 
 `--layout` prints each `bytemuck` and `bytemuckunsafe` type field by field: the offset, size
 and alignment of each field under SBF `repr(C)` rules, each implicit gap, and the zero-copy
-size next to the Borsh size. The alignment rules are in
-[idl-verify.md](idl-verify.md#zero-copy-layout).
+size next to the Borsh size. The `padding` total also counts the gaps inside nested structs,
+once for each array item, and a `padding inside` line names each field that holds them. The
+alignment rules are in [idl-verify.md](idl-verify.md#zero-copy-layout).
 
 ```bash
 idl-drift inspect --layout fixtures/live/voltr_vault/idl.json

@@ -81,8 +81,8 @@ impl<'a> Decoder<'a> {
     ///
     /// # Errors
     ///
-    /// When the bytes don't fit the type: too short, an invalid tag, bool or UTF-8 string,
-    /// or a type the IDL does not define well enough to decode.
+    /// When the bytes don't fit the type: too short, an invalid tag, bool or UTF-8 string, a
+    /// NaN float in Borsh, or a type the IDL does not define well enough to decode.
     pub fn type_def(&self, td: &TypeDef, data: &[u8]) -> Result<Decoded, DecodeError> {
         if td.is_zero_copy() {
             self.zero_copy(td, data)
@@ -397,8 +397,23 @@ impl<'a> Decoder<'a> {
             Type::I128 => Value::I128(i128::from_le_bytes(r.array()?)),
             Type::U256 => Value::U256(r.array()?),
             Type::I256 => Value::I256(r.array()?),
-            Type::F32 => Value::F32(f32::from_le_bytes(r.array()?)),
-            Type::F64 => Value::F64(f64::from_le_bytes(r.array()?)),
+            // Borsh refuses NaN. Zero-copy reads it.
+            Type::F32 => {
+                let at = r.pos;
+                let v = f32::from_le_bytes(r.array()?);
+                if v.is_nan() {
+                    return Err(DecodeError::new(at, DecodeErrorKind::NaN));
+                }
+                Value::F32(v)
+            }
+            Type::F64 => {
+                let at = r.pos;
+                let v = f64::from_le_bytes(r.array()?);
+                if v.is_nan() {
+                    return Err(DecodeError::new(at, DecodeErrorKind::NaN));
+                }
+                Value::F64(v)
+            }
             Type::Pubkey => Value::Pubkey(r.array()?),
             Type::Bytes => {
                 let len = r.len_prefix(1)?;

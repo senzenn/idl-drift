@@ -151,6 +151,64 @@ fn generic_arg_change_is_breaking() {
 }
 
 #[test]
+fn a_type_that_only_the_new_idl_reaches_is_not_breaking() {
+    // No old parser reads `Leg`, so its change cannot break one. The new event is Additive.
+    let idl = |qty: &str, event: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"1","spec":"0.1.0"}},
+  "events":[{event}],
+  "types":[{{"name":"Leg","type":{{"kind":"struct","fields":[{{"name":"qty","type":"{qty}"}}]}}}},
+    {{"name":"Swapped","type":{{"kind":"struct","fields":[{{"name":"leg","type":{{"defined":{{"name":"Leg"}}}}}}]}}}}]}}"#
+        )
+    };
+    let event = r#"{"name":"Swapped","discriminator":[9,9,9,9,9,9,9,9]}"#;
+    assert_eq!(
+        kinds(&idl("u32", ""), &idl("u64", event)),
+        [
+            (Severity::Additive, ChangeKind::EventAdded),
+            (Severity::Cosmetic, ChangeKind::FieldChanged)
+        ]
+    );
+}
+
+#[test]
+fn generic_params_bind_by_position() {
+    let idl = |params: &str, a: &str, b: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"g","version":"1","spec":"0.1.0"}},
+  "instructions":[{{"name":"f","discriminator":[1],"accounts":[],
+    "args":[{{"name":"w","type":{{"defined":{{"name":"Pair","generics":[{{"kind":"type","type":"u8"}},{{"kind":"type","type":"u64"}}]}}}}}}]}}],
+  "types":[{{"name":"Pair","generics":[{params}],"type":{{"kind":"struct","fields":[
+    {{"name":"a","type":{{"generic":"{a}"}}}},{{"name":"b","type":{{"generic":"{b}"}}}}]}}}}]}}"#
+        )
+    };
+    let old = idl(
+        r#"{"kind":"type","name":"T"},{"kind":"type","name":"U"}"#,
+        "T",
+        "U",
+    );
+    let renamed = idl(
+        r#"{"kind":"type","name":"X"},{"kind":"type","name":"Y"}"#,
+        "X",
+        "Y",
+    );
+    assert_eq!(kinds(&old, &renamed), []);
+    // `a` now takes the second arg, a u64.
+    let reordered = idl(
+        r#"{"kind":"type","name":"U"},{"kind":"type","name":"T"}"#,
+        "T",
+        "U",
+    );
+    assert_eq!(
+        kinds(&old, &reordered),
+        [
+            (Severity::Breaking, ChangeKind::FieldChanged),
+            (Severity::Breaking, ChangeKind::FieldChanged)
+        ]
+    );
+}
+
+#[test]
 fn alias_target_change_is_breaking() {
     // `Amount = u64` to `u32` changes the width everywhere `Amount` is used.
     let idl = |target: &str| {
@@ -192,6 +250,12 @@ fn enum_variant_rename_is_dangerous() {
     assert_eq!(
         kinds(&mode_enum(FAST_SLOW), &renamed),
         [(Severity::Dangerous, ChangeKind::VariantRenamed)]
+    );
+    // Old bytes with tag 1 select no variant now.
+    let retagged = mode_enum(r#"{"name":"Fast"},{"name":"Lazy","discriminator":2}"#);
+    assert_eq!(
+        kinds(&mode_enum(FAST_SLOW), &retagged),
+        [(Severity::Breaking, ChangeKind::VariantMoved)]
     );
 }
 

@@ -218,7 +218,8 @@ pub fn shared_types(idl: &Idl) -> Vec<SharedType> {
         .filter(|t| in_zero_copy.contains(t.name.as_str()) && borsh.contains(t.name.as_str()))
         .filter_map(|t| {
             let layout = index.struct_layout(t).ok()?;
-            (layout.padding_len() > 0).then(|| SharedType {
+            // Shipstern pads each struct on its own, so a nested struct's gaps are its own entry.
+            (!layout.padding.is_empty()).then(|| SharedType {
                 name: t.name.clone(),
                 padding: layout.padding,
             })

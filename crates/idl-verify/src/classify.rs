@@ -13,14 +13,22 @@ use crate::text::{bytes, prefix_hex};
 /// Anchor's `EVENT_IX_TAG` in little-endian: the envelope `emit_cpi!` puts before an event.
 pub(crate) const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
+/// Anchor's `IDL_IX_TAG` in little-endian: the instruction that writes the on-chain IDL.
+pub(crate) const IDL_IX_TAG: [u8; 8] = [0x40, 0xf4, 0xbc, 0x78, 0xa7, 0xe9, 0x69, 0x0a];
+
+/// The discriminator of Anchor's `IdlAccount`. `#[account("internal")]` makes it
+/// `sha256("internal:IdlAccount")[..8]`, not the usual `account:` hash.
+pub(crate) const IDL_ACCOUNT_DISCRIMINATOR: [u8; 8] =
+    [0x18, 0x46, 0x62, 0xbf, 0x3a, 0x90, 0x7b, 0x9e];
+
 /// A discriminator: where it starts in the data, and its bytes.
 pub(crate) type Disc<'a> = (usize, &'a [u8]);
 
 /// Every discriminator of one entry, the first one first. Codama requires all to match.
 pub(crate) type Discs<'a> = Vec<Disc<'a>>;
 
-/// `(discriminators, index)` pairs, most discriminator bytes first. An entry whose first
-/// discriminator is empty is dropped.
+/// `(discriminators, index)` pairs, most discriminator bytes first. An entry with no
+/// discriminator bytes is dropped, except an instruction with a size discriminator.
 pub(crate) type DiscTable<'a> = Vec<(Discs<'a>, usize)>;
 
 /// An IDL entry that a sample is matched to by its discriminators.
@@ -66,10 +74,13 @@ impl Discriminated for Event {
     }
 }
 
-fn disc_table<'a>(entries: impl Iterator<Item = Discs<'a>>) -> DiscTable<'a> {
+fn disc_table<'a>(
+    entries: impl Iterator<Item = Discs<'a>>,
+    keep_without_bytes: impl Fn(usize) -> bool,
+) -> DiscTable<'a> {
     let mut table: DiscTable<'a> = entries
         .enumerate()
-        .filter(|(_, d)| d.first().is_some_and(|(_, first)| !first.is_empty()))
+        .filter(|(i, d)| d.iter().any(|(_, bytes)| !bytes.is_empty()) || keep_without_bytes(*i))
         .map(|(i, d)| (d, i))
         .collect();
     table.sort_by_key(|(d, i)| {
@@ -80,15 +91,18 @@ fn disc_table<'a>(entries: impl Iterator<Item = Discs<'a>>) -> DiscTable<'a> {
 }
 
 pub(crate) fn account_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(idl.accounts.iter().map(Discriminated::discs))
+    disc_table(idl.accounts.iter().map(Discriminated::discs), |_| false)
 }
 
+/// [`instruction_match`] checks the data length, so a size discriminator alone can select.
 pub(crate) fn instruction_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(idl.instructions.iter().map(Discriminated::discs))
+    disc_table(idl.instructions.iter().map(Discriminated::discs), |i| {
+        idl.instructions[i].size_discriminator.is_some()
+    })
 }
 
 pub(crate) fn event_table(idl: &Idl) -> DiscTable<'_> {
-    disc_table(idl.events.iter().map(Discriminated::discs))
+    disc_table(idl.events.iter().map(Discriminated::discs), |_| false)
 }
 
 /// Every entry whose discriminators all match `data` and hold the most bytes.
@@ -115,7 +129,7 @@ fn sized_account_types(idl: &Idl) -> Vec<(usize, usize)> {
     idl.accounts
         .iter()
         .enumerate()
-        .filter(|(_, nd)| nd.discriminator.is_empty())
+        .filter(|(_, nd)| !has_byte_discriminator(nd))
         .filter_map(|(i, nd)| {
             let computed = || {
                 let td = index.get(&nd.name)?;
@@ -135,19 +149,42 @@ fn sized_account_types(idl: &Idl) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Whether any discriminator of the account type gives bytes to match.
+pub(crate) fn has_byte_discriminator(nd: &NamedDisc) -> bool {
+    !nd.discriminator.is_empty() || !nd.extra_discriminators.is_empty()
+}
+
 /// Like [`longest_match`] for instructions, but a Codama size discriminator must match too.
 pub(crate) fn instruction_match(
     idl: &Idl,
     table: &[(Discs<'_>, usize)],
     data: &[u8],
 ) -> Option<Vec<usize>> {
+    sized_match(table, data, data.len(), |i| {
+        idl.instructions[i].size_discriminator
+    })
+}
+
+/// Like [`instruction_match`] for accounts. `len` is the full data length, which a sampled
+/// slice of the data can hide.
+pub(crate) fn account_match(
+    idl: &Idl,
+    table: &[(Discs<'_>, usize)],
+    data: &[u8],
+    len: usize,
+) -> Option<Vec<usize>> {
+    sized_match(table, data, len, |i| idl.accounts[i].size_discriminator)
+}
+
+fn sized_match(
+    table: &[(Discs<'_>, usize)],
+    data: &[u8],
+    len: usize,
+    size_of: impl Fn(usize) -> Option<usize>,
+) -> Option<Vec<usize>> {
     let sized: DiscTable<'_> = table
         .iter()
-        .filter(|(_, i)| {
-            idl.instructions[*i]
-                .size_discriminator
-                .is_none_or(|size| size == data.len())
-        })
+        .filter(|(_, i)| size_of(*i).is_none_or(|size| size == len))
         .cloned()
         .collect();
     longest_match(&sized, data)
@@ -287,7 +324,7 @@ impl<'a> Classifier<'a> {
     }
 
     pub(crate) fn account(&self, data: &[u8]) -> Option<usize> {
-        if let Some(found) = longest_match(&self.accounts, data) {
+        if let Some(found) = account_match(self.idl, &self.accounts, data, data.len()) {
             return found.first().copied();
         }
         match self.fits(data.len()).as_slice() {

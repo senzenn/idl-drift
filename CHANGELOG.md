@@ -9,12 +9,40 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
   apart and account types that Shipstern skips. The exit code does not change.
+- Library: `idl_drift::markdown::escape_control` writes each control character as an escape.
+
+### Changed
+
+- Library: `idl_drift::layout::FieldLayout` has a new `padding` field, and
+  `idl_verify::decode::DecodeErrorKind` has a new `NaN` variant. Both types are now
+  `#[non_exhaustive]`, so code that builds `FieldLayout` or matches every variant must change.
 
 ### Fixed
 
 - idl-verify: an instruction matches only when its Codama size discriminator matches too, at
   any position. A program that takes one tag at two data lengths no longer gives a false
   "bytes after the arguments" error.
+- A Codama discriminator after a size discriminator now counts in both tools.
+- idl-verify: an instruction with only a Codama size discriminator matches by data length.
+- idl-drift: a change from a number to a bytes account discriminator is Breaking.
+- idl-drift: generic params match by position. A reorder is Breaking, and a rename is no
+  change.
+- idl-drift: a renamed enum variant with a new tag is Breaking.
+- idl-drift: an account rename no longer hides a flag change.
+- idl-drift: `Vec<u8>` and `bytes` are the same type.
+- idl-drift: args that nest the same fields in another way are no change.
+- idl-drift: a layout change on a type that only the new IDL reaches is Cosmetic.
+- idl-drift: a legacy Anchor field or seed named `publicKey` keeps its name.
+- idl-verify: value compares find a wrong enum variant with capitalized names.
+- idl-verify: a NaN in a Borsh type is a `decode` error.
+- idl-verify: padding inside a nested zero-copy struct counts.
+- idl-verify: Anchor's IDL instruction and `IdlAccount` give a note, not an error.
+- idl-verify: `--decoder` accepts the `null` that serde writes for NaN.
+- idl-verify: a decoder that keeps running after its last reply is stopped.
+- idl-verify: live sampling reads all the data of only the accounts that it keeps.
+- RPC: an answer over 32 MiB is not retried, and `"error": null` is not an error.
+- RPC: an answer that is not a JSON object is an error, not a panic.
+- Control characters in findings, changes, IDL names and errors are escaped on the terminal.
 
 ## [0.1.0] - 2026-10-16
 

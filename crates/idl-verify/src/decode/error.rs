@@ -16,6 +16,7 @@ pub struct DecodeError {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DecodeErrorKind {
     UnexpectedEnd {
         needed: usize,
@@ -34,6 +35,7 @@ pub enum DecodeErrorKind {
         variants: usize,
     },
     InvalidUtf8,
+    NaN,
     InvalidShortU16,
     UndefinedType(String),
     UnresolvedGeneric(String),
@@ -107,6 +109,7 @@ impl fmt::Display for DecodeErrorKind {
                 write!(f, "enum tag {tag} is out of range ({variants} variants)")
             }
             Self::InvalidUtf8 => f.write_str("string is not valid UTF-8"),
+            Self::NaN => f.write_str("float is NaN, which borsh refuses"),
             Self::InvalidShortU16 => f.write_str("shortU16 is not in its shortest form"),
             Self::UndefinedType(name) => write!(f, "type `{name}` is not defined in the IDL"),
             Self::UnresolvedGeneric(name) => write!(

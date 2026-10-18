@@ -644,9 +644,10 @@ fn arg_default_bytes(arg: &InstructionArgumentNode) -> Option<Vec<u8>> {
 
 /// A numeric constant discriminator is a check on a byte the body re-reads as its first
 /// field, so Shipstern's account parser decodes from offset 0 (SPL Governance's `accountType`).
+/// A size discriminator before the constant does not change where the body starts.
 fn numeric_constant_discriminator(a: &AccountNode) -> bool {
     matches!(
-        a.discriminators.first(),
+        a.discriminators.iter().find(|d| !matches!(d, DiscriminatorNode::Size(_))),
         Some(DiscriminatorNode::Constant(c)) if matches!(c.constant.value.as_ref(), ValueNode::Number(_))
     )
 }
@@ -753,8 +754,8 @@ impl Discs {
     }
 }
 
-/// Later discriminators count only after a first one that has bytes. A size discriminator,
-/// or one whose bytes are unknown (such as an enum value), cannot be checked, so it is left out.
+/// A later discriminator with unknown bytes (such as an enum value) is left out. A size
+/// discriminator first leaves `first` empty, because Shipstern then dispatches on the length.
 fn extract_discriminators(
     discs: &[DiscriminatorNode],
     resolve_field: impl Fn(&str) -> Option<Vec<u8>>,
@@ -778,16 +779,12 @@ fn extract_discriminators(
             extra: Vec::new(),
         };
     };
-    let extra = if first.is_empty() {
-        Vec::new()
-    } else {
-        discs
-            .iter()
-            .skip(1)
-            .map(bytes)
-            .filter(|(_, d)| !d.is_empty())
-            .collect()
-    };
+    let extra = discs
+        .iter()
+        .skip(1)
+        .map(bytes)
+        .filter(|(_, d)| !d.is_empty())
+        .collect();
     Discs {
         first,
         offset,

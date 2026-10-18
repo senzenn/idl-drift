@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use idl_drift::model::{Format, Idl, NamedDisc, Type, TypeDef};
 
 use super::{bytes_used, missing_field_hint, size_counts, Groups, Outcomes, Verifier};
+use crate::classify::{has_byte_discriminator, IDL_ACCOUNT_DISCRIMINATOR};
 use crate::decode::Value;
 use crate::layout::StructLayout;
 use crate::reference::Outcome;
@@ -25,6 +26,7 @@ impl Verifier<'_> {
         let by_size = self.classifier.accounts.is_empty() && !self.classifier.sized.is_empty();
         let mut unknown = Groups::new();
         let mut empty = Vec::new();
+        let mut idl_accounts = Vec::new();
         // The IDL is not wrong here: Shank programs tell account types apart by a field
         // that the IDL does not map to a type, so no sample can be classified.
         let shank = idl.format == Format::Shank;
@@ -50,6 +52,10 @@ impl Verifier<'_> {
         for (i, sample) in to_classify.iter().enumerate() {
             if let Some(t) = self.classifier.account(&sample.data) {
                 groups[t].push(i);
+                continue;
+            }
+            if self.is_anchor_builtin(&sample.data, &IDL_ACCOUNT_DISCRIMINATOR) {
+                idl_accounts.push(i);
                 continue;
             }
             let len = sample.data.len();
@@ -88,6 +94,7 @@ impl Verifier<'_> {
             |v, i| v.samples.accounts[i].address.clone(),
         );
         self.report_empty_accounts(&empty);
+        self.report_idl_accounts(&idl_accounts);
 
         let mut summaries = Vec::new();
         let mut not_sampled = Vec::new();
@@ -97,7 +104,7 @@ impl Verifier<'_> {
             } else {
                 // Only a size guess picked this type. Shipstern's parser, for one, selects
                 // accounts only by a discriminator, so it rejects these accounts.
-                if nd.discriminator.is_empty() && nd.size_discriminator.is_none() {
+                if !has_byte_discriminator(nd) && nd.size_discriminator.is_none() {
                     self.push(
                         Severity::Note,
                         Check::Discriminator,
@@ -139,6 +146,17 @@ impl Verifier<'_> {
             ),
             Some("an account with no data has no discriminator, so no IDL can describe it; a generated parser such as Shipstern's reports it as an unknown account".into()),
             Some(&example),
+        );
+    }
+
+    /// Anchor's `IdlAccount` is not an IDL fault, so it is a note.
+    fn report_idl_accounts(&mut self, idxs: &[usize]) {
+        self.report_anchor_builtin(
+            "account",
+            "IdlAccount",
+            &IDL_ACCOUNT_DISCRIMINATOR,
+            idxs,
+            |v, i| v.samples.accounts[i].address.clone(),
         );
     }
 
@@ -356,10 +374,15 @@ impl Verifier<'_> {
                         .is_some_and(|rest| rest.iter().all(|b| *b == 0))
                 });
             let (severity, message, hint) = if let Some(layout) = padded {
-                let shifted = layout
-                    .padding
-                    .iter()
-                    .find_map(|p| p.before.as_deref())
+                // Name the field after the first gap, unless an earlier field has a gap inside.
+                let first = layout.padding.first().filter(|p| {
+                    !layout
+                        .fields
+                        .iter()
+                        .any(|f| f.padding > 0 && f.offset < p.offset)
+                });
+                let shifted = first
+                    .and_then(|p| p.before.as_deref())
                     .map_or_else(String::new, |f| {
                         format!(" A decoder built from it reads `{f}` and every later field at the wrong offset.")
                     });
@@ -519,7 +542,20 @@ fn unknown_account_hint(idl: &Idl, sized: &[(usize, usize)], by_size: bool) -> S
 }
 
 fn padding_list(layout: &StructLayout) -> String {
-    let parts: Vec<String> = layout.padding.iter().map(ToString::to_string).collect();
+    let mut parts: Vec<(usize, String)> = layout
+        .padding
+        .iter()
+        .map(|p| (p.offset, p.to_string()))
+        .collect();
+    // A nested struct keeps its own gaps, so name the field that holds them.
+    for f in layout.fields.iter().filter(|f| f.padding > 0) {
+        parts.push((
+            f.offset,
+            format!("{} inside `{}`", bytes(f.padding), f.name),
+        ));
+    }
+    parts.sort_by_key(|(offset, _)| *offset);
+    let parts: Vec<String> = parts.into_iter().map(|(_, part)| part).collect();
     parts.join(", ")
 }
 
@@ -562,6 +598,79 @@ mod tests {
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"s","type":"string"}]}}"#;
     const U32_TYPE: &str =
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
+
+    #[test]
+    fn a_size_discriminator_first_splits_types_that_share_a_constant() {
+        // The number constant is also the first field, so the body starts at byte 0.
+        let account = |name: &str, size: usize, second: &str| {
+            format!(
+                r#"{{"kind":"accountNode","name":"{name}","data":{{"kind":"structTypeNode","fields":[
+                {{"kind":"structFieldTypeNode","name":"accountType","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}}}},
+                {{"kind":"structFieldTypeNode","name":"rest","type":{second}}}]}},
+                "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{size}}},
+                {{"kind":"constantDiscriminatorNode","offset":0,"constant":{{"kind":"constantValueNode",
+                "type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},"value":{{"kind":"numberValueNode","number":3}}}}}}]}}"#
+            )
+        };
+        let idl = Idl::from_json(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","instructions":[],
+            "errors":[],"definedTypes":[],"pdas":[],"accounts":[{},{}]}}}}"#,
+            account(
+                "pool",
+                9,
+                r#"{"kind":"numberTypeNode","format":"u64","endian":"le"}"#
+            ),
+            account("vault", 33, r#"{"kind":"publicKeyTypeNode"}"#)
+        ))
+        .unwrap();
+        let sample = |data: Vec<u8>| AccountSample {
+            address: format!("a{}", data.len()),
+            data,
+        };
+        let samples = Samples {
+            accounts: vec![
+                sample([3, 5, 0, 0, 0, 0, 0, 0, 0].into()),
+                sample([3; 33].into()),
+            ],
+            ..Samples::default()
+        };
+        let report = verify(&idl, &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn a_later_discriminator_is_not_a_pick_by_size() {
+        // The first discriminator is a field with no default, so only the constant has bytes.
+        let idl = Idl::from_json(
+            r#"{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","instructions":[],
+            "errors":[],"definedTypes":[],"pdas":[],"accounts":[{"kind":"accountNode","name":"pool",
+            "data":{"kind":"structTypeNode","fields":[
+            {"kind":"structFieldTypeNode","name":"kind","type":{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+            {"kind":"structFieldTypeNode","name":"tag","type":{"kind":"numberTypeNode","format":"u8","endian":"le"}}]},
+            "discriminators":[{"kind":"fieldDiscriminatorNode","name":"kind","offset":0},
+            {"kind":"constantDiscriminatorNode","offset":1,"constant":{"kind":"constantValueNode",
+            "type":{"kind":"bytesTypeNode"},"value":{"kind":"bytesValueNode","data":"07","encoding":"base16"}}}]}]}}"#,
+        )
+        .unwrap();
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "a".into(),
+                data: vec![1, 7],
+            }],
+            ..Samples::default()
+        };
+        let report = verify(&idl, &samples, None);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.message.contains("by size")),
+            "{:#?}",
+            report.findings
+        );
+    }
 
     #[test]
     fn account_picked_only_by_size_is_a_note() {

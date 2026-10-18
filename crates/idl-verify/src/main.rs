@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use idl_drift::allow::AllowList;
-use idl_drift::markdown::escape;
+use idl_drift::markdown::{escape, escape_control};
 use idl_drift::model::Idl;
 use idl_verify::report::Check;
 use idl_verify::rpc::{rent_exempt_minimum, sample, Limits, StopReason};
@@ -136,7 +136,7 @@ fn main() -> ExitCode {
     match run(&cli, &matches) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            let _ = writeln!(io::stderr(), "error: {e}");
+            let _ = writeln!(io::stderr(), "error: {}", escape_control(&e.to_string()));
             // A failed report write can leave part of a report; do not add to it.
             if !matches!(e, Error::Write(_)) {
                 if cli.json {

@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 
 use super::text::{disc_changed, extra_discs_text, size_text};
 use super::{ChangeKind, Report, Severity};
-use crate::model::{NamedDisc, TypeDef};
+use crate::model::{NamedDisc, TypeDef, TypeDefTy};
 
 pub(super) fn diff_account_types(
     old: &[NamedDisc],
     new: &[NamedDisc],
+    old_types: &[TypeDef],
     new_types: &[TypeDef],
     r: &mut Report,
 ) {
@@ -63,6 +64,23 @@ pub(super) fn diff_account_types(
                     size_text(na.size_discriminator)
                 ),
             ),
+            // A number constant is also the first field. A bytes constant comes before the fields.
+            // When the fields change too, the type diff reports them, and the bytes can line up.
+            Some(oa)
+                if oa.payload_start() != na.payload_start()
+                    && field_names(old_types, name) == field_names(new_types, name) =>
+            {
+                r.push(
+                    Severity::Breaking,
+                    ChangeKind::AccountDiscriminatorOffsetChanged,
+                    *name,
+                    format!(
+                        "account body start changed ({name}): byte {} -> {}: each field moves",
+                        oa.payload_start(),
+                        na.payload_start()
+                    ),
+                );
+            }
             _ => {}
         }
     }
@@ -88,5 +106,13 @@ pub(super) fn diff_account_types(
                 format!("account type removed: {name}"),
             );
         }
+    }
+}
+
+/// The field names of the struct that holds an account's data.
+fn field_names<'a>(types: &'a [TypeDef], name: &str) -> Option<Vec<&'a str>> {
+    match &types.iter().find(|t| t.name == name)?.ty {
+        TypeDefTy::Struct { fields } => Some(fields.iter().map(|f| f.name.as_str()).collect()),
+        _ => None,
     }
 }
