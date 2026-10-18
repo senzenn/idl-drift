@@ -122,7 +122,10 @@ pub fn run_decoder(
             }
         }
     }
-    // Every reply is in, so a write error here means only that the child closed stdin early.
+    // The protocol does not require the child to exit after its last reply, so stop it. Stop it
+    // first: a child that no longer reads stdin can block the writer.
+    let _ = child.kill();
+    // Every reply is in, so a write error here means only that the child stopped reading.
     let _ = writer.join();
     let _ = child.wait();
     let mut instructions = outcomes.split_off(samples.accounts.len());
@@ -207,6 +210,15 @@ mod tests {
         );
         let garbage = run("read a; echo 'not json'");
         assert!(garbage.contains("bad reply line `not json`"), "{garbage}");
+    }
+
+    #[test]
+    fn a_decoder_that_runs_on_after_its_last_reply_is_stopped() {
+        let script = r#"read a; echo '{"status":"ok","value":1}'; read b; echo '{"status":"ok","value":2}'; exec sleep 30"#;
+        let command = ["sh".to_string(), "-c".to_string(), script.to_string()];
+        let start = std::time::Instant::now();
+        run_decoder(&command, &samples(), "P", &idl()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

@@ -13,6 +13,14 @@ use crate::text::{bytes, prefix_hex};
 /// Anchor's `EVENT_IX_TAG` in little-endian: the envelope `emit_cpi!` puts before an event.
 pub(crate) const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
 
+/// Anchor's `IDL_IX_TAG` in little-endian: the instruction that writes the on-chain IDL.
+pub(crate) const IDL_IX_TAG: [u8; 8] = [0x40, 0xf4, 0xbc, 0x78, 0xa7, 0xe9, 0x69, 0x0a];
+
+/// The discriminator of Anchor's `IdlAccount`. `#[account("internal")]` makes it
+/// `sha256("internal:IdlAccount")[..8]`, not the usual `account:` hash.
+pub(crate) const IDL_ACCOUNT_DISCRIMINATOR: [u8; 8] =
+    [0x18, 0x46, 0x62, 0xbf, 0x3a, 0x90, 0x7b, 0x9e];
+
 /// A discriminator: where it starts in the data, and its bytes.
 pub(crate) type Disc<'a> = (usize, &'a [u8]);
 

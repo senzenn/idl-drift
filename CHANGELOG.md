@@ -35,6 +35,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-verify: value compares find a wrong enum variant with capitalized names.
 - idl-verify: a NaN in a Borsh type is a `decode` error.
 - idl-verify: padding inside a nested zero-copy struct counts.
+- idl-verify: Anchor's IDL instruction and `IdlAccount` give a note, not an error.
+- idl-verify: `--decoder` accepts the `null` that serde writes for NaN.
+- idl-verify: a decoder that keeps running after its last reply is stopped.
 
 ## [0.1.0] - 2026-10-16
 

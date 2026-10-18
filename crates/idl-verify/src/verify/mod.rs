@@ -10,7 +10,7 @@ mod upgrade;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use idl_drift::model::Idl;
+use idl_drift::model::{Format, Idl};
 
 use crate::classify::Classifier;
 use crate::decode::{DecodeError, Decoder, Value};
@@ -21,7 +21,7 @@ use crate::report::{
     ReferenceSummary, Report, Severity, SizeCount,
 };
 use crate::samples::Samples;
-use crate::text::{bytes, of_samples, plural};
+use crate::text::{bytes, of_samples, plural, prefix_hex};
 
 pub use upgrade::{offline_rent_minimum, verify_upgrade, OFFLINE_LAMPORTS_PER_BYTE};
 
@@ -187,6 +187,40 @@ impl Verifier<'_> {
                 Some(&example),
             );
         }
+    }
+
+    /// Whether `data` starts with `tag` and the IDL is an Anchor IDL. Only then is the program
+    /// surely built by Anchor, which adds the IDL instruction and `IdlAccount`.
+    fn is_anchor_builtin(&self, data: &[u8], tag: &[u8]) -> bool {
+        matches!(self.idl.format, Format::Anchor | Format::LegacyAnchor) && data.starts_with(tag)
+    }
+
+    /// One note for `idxs`, the samples of Anchor's `name` entry, which are not checked.
+    fn report_anchor_builtin(
+        &mut self,
+        kind: &str,
+        name: &str,
+        tag: &[u8],
+        idxs: &[usize],
+        id: impl Fn(&Self, usize) -> String,
+    ) {
+        let Some(&first) = idxs.first() else {
+            return;
+        };
+        let example = id(self, first);
+        let n = idxs.len();
+        self.push(
+            Severity::Note,
+            Check::Discriminator,
+            &format!("{kind}s"),
+            format!(
+                "{n} {kind}{} Anchor's {name} ({}); not checked",
+                plural(n, " is", "s are"),
+                prefix_hex(tag)
+            ),
+            Some("each Anchor program built without the `no-idl` feature has an instruction that writes its on-chain IDL and an IdlAccount that holds it; an Anchor IDL lists neither".into()),
+            Some(&example),
+        );
     }
 
     fn report_decode_failures(

@@ -103,6 +103,12 @@ fn shape_rule(ours: &Json, theirs: &Json, path: &mut Vec<String>) -> Shape {
         (Json::Object(a), _) | (_, Json::Object(a)) if is_big_int(a) => (big_int_text(peel(ours))
             != big_int_text(peel(theirs)))
         .then(|| difference(path, ours, theirs)),
+        // serde writes NaN as null.
+        (Json::Object(a), Json::Null)
+            if a.len() == 1 && a.get("nan") == Some(&Json::Bool(true)) =>
+        {
+            None
+        }
         // Shipstern wraps every enum in a struct with one `kind` field. Unwrap it when the
         // other side has no such wrapper.
         (Json::Object(a), other) | (other, Json::Object(a))
@@ -442,6 +448,15 @@ mod tests {
             first_difference(&ours, &wrong).map(|d| d.path),
             Some("amount".to_string())
         );
+    }
+
+    #[test]
+    fn a_nan_matches_the_null_that_serde_writes() {
+        assert_eq!(
+            first_difference(&json!({"n": {"nan": true}}), &json!({"n": null})),
+            None
+        );
+        assert!(first_difference(&json!({"n": 1.0}), &json!({"n": null})).is_some());
     }
 
     #[test]

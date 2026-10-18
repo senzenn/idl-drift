@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use idl_drift::model::{Format, Idl, NamedDisc, Type, TypeDef};
 
 use super::{bytes_used, missing_field_hint, size_counts, Groups, Outcomes, Verifier};
-use crate::classify::has_byte_discriminator;
+use crate::classify::{has_byte_discriminator, IDL_ACCOUNT_DISCRIMINATOR};
 use crate::decode::Value;
 use crate::layout::StructLayout;
 use crate::reference::Outcome;
@@ -26,6 +26,7 @@ impl Verifier<'_> {
         let by_size = self.classifier.accounts.is_empty() && !self.classifier.sized.is_empty();
         let mut unknown = Groups::new();
         let mut empty = Vec::new();
+        let mut idl_accounts = Vec::new();
         // The IDL is not wrong here: Shank programs tell account types apart by a field
         // that the IDL does not map to a type, so no sample can be classified.
         let shank = idl.format == Format::Shank;
@@ -51,6 +52,10 @@ impl Verifier<'_> {
         for (i, sample) in to_classify.iter().enumerate() {
             if let Some(t) = self.classifier.account(&sample.data) {
                 groups[t].push(i);
+                continue;
+            }
+            if self.is_anchor_builtin(&sample.data, &IDL_ACCOUNT_DISCRIMINATOR) {
+                idl_accounts.push(i);
                 continue;
             }
             let len = sample.data.len();
@@ -89,6 +94,7 @@ impl Verifier<'_> {
             |v, i| v.samples.accounts[i].address.clone(),
         );
         self.report_empty_accounts(&empty);
+        self.report_idl_accounts(&idl_accounts);
 
         let mut summaries = Vec::new();
         let mut not_sampled = Vec::new();
@@ -140,6 +146,17 @@ impl Verifier<'_> {
             ),
             Some("an account with no data has no discriminator, so no IDL can describe it; a generated parser such as Shipstern's reports it as an unknown account".into()),
             Some(&example),
+        );
+    }
+
+    /// Anchor's `IdlAccount` is not an IDL fault, so it is a note.
+    fn report_idl_accounts(&mut self, idxs: &[usize]) {
+        self.report_anchor_builtin(
+            "account",
+            "IdlAccount",
+            &IDL_ACCOUNT_DISCRIMINATOR,
+            idxs,
+            |v, i| v.samples.accounts[i].address.clone(),
         );
     }
 
