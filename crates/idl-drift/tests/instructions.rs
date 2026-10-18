@@ -173,6 +173,16 @@ fn account_rename_at_same_position_is_dangerous_but_a_swap_is_breaking() {
         kinds(AMM_OLD, &renamed),
         [(Severity::Dangerous, ChangeKind::AccountRenamed)]
     );
+    // A rename must not hide a dropped signer at the same position.
+    let renamed_unsigned =
+        AMM_OLD.replace(r#"{"name":"user","signer":true}"#, r#"{"name":"payer"}"#);
+    assert_eq!(
+        kinds(AMM_OLD, &renamed_unsigned),
+        [
+            (Severity::Dangerous, ChangeKind::AccountRenamed),
+            (Severity::Dangerous, ChangeKind::AccountFlagsChanged)
+        ]
+    );
     let swapped = AMM_OLD.replace(
         r#"[{"name":"pool","writable":true},{"name":"user","signer":true}]"#,
         r#"[{"name":"user","signer":true},{"name":"pool","writable":true}]"#,

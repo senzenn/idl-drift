@@ -200,9 +200,19 @@ fn diff_accounts(ix: &str, ofa: &[Leaf], nfa: &[Leaf], r: &mut Report) {
                     r.push(
                         Severity::Dangerous,
                         ChangeKind::AccountRenamed,
-                        subject,
+                        subject.clone(),
                         format!("account renamed at fixed position ({ix}#{pos}): {o} -> {n} (same position, generated field name changes)"),
                     );
+                    // The same account, so a flag change still matters, and allowing the
+                    // rename must not hide it.
+                    if o.flags() != n.flags() {
+                        r.push(
+                            Severity::Dangerous,
+                            ChangeKind::AccountFlagsChanged,
+                            subject,
+                            format!("account flags changed ({ix}#{pos}): {o} -> {n} (position unchanged, parsers don't read flags)"),
+                        );
+                    }
                 }
             }
             (Some(o), Some(n)) if o.flags() != n.flags() => r.push(

@@ -42,6 +42,21 @@ pub(super) fn common_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
     (old_form, new_form)
 }
 
+/// The types that a type body holds directly: field, variant payload and alias types.
+pub(super) fn body_types(body: &mut TypeDefTy) -> Vec<&mut Type> {
+    match body {
+        TypeDefTy::Struct { fields } => fields.iter_mut().map(|f| &mut f.ty).collect(),
+        TypeDefTy::Enum { variants, .. } => variants
+            .iter_mut()
+            .flat_map(|v| match &mut v.fields {
+                EnumFields::Named(fields) => fields.iter_mut().map(|f| &mut f.ty).collect(),
+                EnumFields::Tuple(items) => items.iter_mut().collect::<Vec<_>>(),
+            })
+            .collect(),
+        TypeDefTy::Type { alias } => vec![alias],
+    }
+}
+
 /// A copy with each tuple alias written as a tuple struct, fields `_0`, `_1`, ..., as Anchor
 /// writes it (see `normalize_type_defs`). Codama writes a tuple struct as a tuple alias, and
 /// Borsh writes both the same way. A struct keeps the zero-copy layout computable.
@@ -145,18 +160,7 @@ fn expand_generic_uses(idl: &mut Idl) {
     }
     // The body of a generic type keeps its params; no parser reads it after expansion.
     for td in idl.types.iter_mut().filter(|td| td.generics.is_empty()) {
-        let types: Vec<&mut Type> = match &mut td.ty {
-            TypeDefTy::Struct { fields } => fields.iter_mut().map(|f| &mut f.ty).collect(),
-            TypeDefTy::Enum { variants, .. } => variants
-                .iter_mut()
-                .flat_map(|v| match &mut v.fields {
-                    EnumFields::Named(fields) => fields.iter_mut().map(|f| &mut f.ty).collect(),
-                    EnumFields::Tuple(items) => items.iter_mut().collect::<Vec<_>>(),
-                })
-                .collect(),
-            TypeDefTy::Type { alias } => vec![alias],
-        };
-        for ty in types {
+        for ty in body_types(&mut td.ty) {
             expand(ty);
         }
     }
@@ -283,6 +287,27 @@ fn substitute(ty: &mut Type, scope: &BTreeMap<&str, &GenericArg>) {
         _ => {}
     }
     each_child_mut(ty, &mut |child| substitute(child, scope));
+}
+
+/// Rename generic params in `ty`: `names` maps a param name to its new name.
+pub(super) fn rename_generics(ty: &mut Type, names: &BTreeMap<&str, &str>) {
+    let rename = |name: &mut String| {
+        if let Some(to) = names.get(name.as_str()) {
+            *name = (*to).to_string();
+        }
+    };
+    match ty {
+        Type::Generic(name) | Type::Array(_, ArrayLen::Generic(name)) => rename(name),
+        Type::Defined { generics, .. } => {
+            for arg in generics {
+                if let GenericArg::Const { value } = arg {
+                    rename(value);
+                }
+            }
+        }
+        _ => {}
+    }
+    each_child_mut(ty, &mut |child| rename_generics(child, names));
 }
 
 /// Call `f` on each type that `ty` holds, the same list as `Type::children`.

@@ -139,6 +139,9 @@ Two rules follow Shipstern's dispatch:
 - An instruction, account or event discriminator changed. This includes a change in its
   length (for example an Anchor to Quasar port), a Codama size discriminator, an event
   discriminator offset, and a later constant in an event discriminator chain.
+- The start of an account's fields moved. A Codama number constant discriminator is also
+  the first field, and a bytes constant comes before the fields, so a change from one to
+  the other moves each field (`account_discriminator_offset_changed`).
 - An instruction account moved, or an account was removed from the middle of the list.
 - An instruction argument was added, removed, retyped or moved.
 - Two instructions have the same discriminator, or the same Codama size discriminator, and

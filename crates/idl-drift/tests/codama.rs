@@ -403,6 +403,45 @@ fn a_discriminator_after_a_size_discriminator_is_compared() {
 }
 
 #[test]
+fn a_number_to_bytes_account_discriminator_moves_the_body() {
+    // Shipstern reads a number constant as the first field, but starts after a bytes one.
+    let field = |name: &str, format: &str| {
+        format!(
+            r#"{{"kind":"structFieldTypeNode","name":"{name}","type":{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}}}"#
+        )
+    };
+    let root = |constant: &str, fields: &str| {
+        codama_root(
+            "",
+            &format!(
+                r#"{{"kind":"accountNode","name":"pool","data":{{"kind":"structTypeNode","fields":[{fields}]}},
+                "discriminators":[{{"kind":"constantDiscriminatorNode","offset":0,"constant":{constant}}}]}}"#
+            ),
+            "",
+        )
+    };
+    let number = r#"{"kind":"constantValueNode","type":{"kind":"numberTypeNode","format":"u8","endian":"le"},"value":{"kind":"numberValueNode","number":3}}"#;
+    let bytes = r#"{"kind":"constantValueNode","type":{"kind":"fixedSizeTypeNode","size":1,"type":{"kind":"bytesTypeNode"}},"value":{"kind":"bytesValueNode","data":"03","encoding":"base16"}}"#;
+    let both = format!("{},{}", field("accountType", "u8"), field("amount", "u64"));
+    assert_eq!(
+        kinds(&root(number, &both), &root(bytes, &both)),
+        [(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged
+        )]
+    );
+    // Without the accountType field, `amount` stays at byte 1, so the body start is no change.
+    let moved = kinds(&root(number, &both), &root(bytes, &field("amount", "u64")));
+    assert!(
+        !moved.contains(&(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged
+        )),
+        "{moved:?}"
+    );
+}
+
+#[test]
 fn limit_order_v1_to_v2_is_breaking() {
     let report = diff(
         &fixture("shipstern/limit_order_v1.json"),

@@ -1,13 +1,14 @@
 //! Type definitions: struct fields, enum variants and aliases. A field, variant, tag or alias
 //! change on a type that no parser reads is Cosmetic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use super::normalize::{body_types, rename_generics};
 use super::text::{
     field_change, field_str, has_unreadable, payload_str, type_change, unreadable_change,
 };
 use super::{zero_copy, ChangeKind, FieldEdit, Report, Severity};
-use crate::model::{EnumFields, EnumVariant, Field, Idl, Type, TypeDef, TypeDefTy};
+use crate::model::{EnumFields, EnumVariant, Field, GenericParam, Idl, Type, TypeDef, TypeDefTy};
 
 pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
     let om = old.type_map();
@@ -31,7 +32,8 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
             zero_copy::diff_layout_attrs(name, ot, nt, reached, &roots, r);
         }
 
-        match (&ot.ty, &nt.ty) {
+        let renamed = with_old_generic_names(ot, nt);
+        match (&ot.ty, renamed.as_ref().unwrap_or(&nt.ty)) {
             (TypeDefTy::Struct { fields: of }, TypeDefTy::Struct { fields: nf }) => {
                 diff_fields(name, of, nf, is_reached, r);
             }
@@ -103,6 +105,29 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
         }
     }
     diff_dangling(old, new, reached, r);
+}
+
+/// The body of `nt` with each generic param named as the old param at its position. Args
+/// bind by position, so a renamed param is no change, and a reordered one changes the fields.
+fn with_old_generic_names(ot: &TypeDef, nt: &TypeDef) -> Option<TypeDefTy> {
+    if ot.generics.len() != nt.generics.len() {
+        return None;
+    }
+    let names: BTreeMap<&str, &str> = nt
+        .generics
+        .iter()
+        .map(GenericParam::name)
+        .zip(ot.generics.iter().map(GenericParam::name))
+        .filter(|(new, old)| new != old)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let mut ty = nt.ty.clone();
+    for field_ty in body_types(&mut ty) {
+        rename_generics(field_ty, &names);
+    }
+    Some(ty)
 }
 
 /// References with no definition: no parser can be generated from the new IDL.
@@ -203,10 +228,11 @@ fn diff_variants(ty: &str, ov: &[EnumVariant], nv: &[EnumVariant], reached: bool
                 ),
             ),
             // Either name at another index on the other side means the tag now selects a
-            // different variant. A fresh name with the same payload is a rename.
+            // different variant. A fresh name with the same tag and payload is a rename.
             (Some(o), Some(n)) if o.name != n.name => {
                 let moved = ov.iter().any(|v| v.name == n.name)
                     || nv.iter().any(|v| v.name == o.name)
+                    || o.tag(pos) != n.tag(pos)
                     || !same_payload(&o.fields, &n.fields);
                 if moved {
                     (

@@ -17,6 +17,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "bytes after the arguments" error.
 - A Codama discriminator after a size discriminator now counts in both tools.
 - idl-verify: an instruction with only a Codama size discriminator matches by data length.
+- idl-drift: a change from a number to a bytes account discriminator is Breaking.
+- idl-drift: generic params match by position. A reorder is Breaking, and a rename is no
+  change.
+- idl-drift: a renamed enum variant with a new tag is Breaking.
+- idl-drift: an account rename no longer hides a flag change.
 - idl-verify: value compares find a wrong enum variant with capitalized names.
 
 ## [0.1.0] - 2026-10-16

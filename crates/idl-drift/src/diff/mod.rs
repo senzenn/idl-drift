@@ -48,7 +48,7 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
     instructions::diff_instructions(old, new, &mut r);
     collisions::diff_discriminator_collisions(old, new, &mut r);
     // Account layouts live in `types`; here only the discriminators.
-    accounts::diff_account_types(&old.accounts, &new.accounts, &new.types, &mut r);
+    accounts::diff_account_types(&old.accounts, &new.accounts, &old.types, &new.types, &mut r);
     events::diff_events(&old.events, &new.events, &mut r);
     errors::diff_errors(&old.errors, &new.errors, &mut r);
     types::diff_types(old, new, &reached, &mut r);
