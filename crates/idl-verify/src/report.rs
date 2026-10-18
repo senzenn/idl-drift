@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use idl_drift::allow::{json_name, AllowEntry, AllowList};
-use idl_drift::markdown::escape;
+use idl_drift::markdown::{escape, escape_control};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
@@ -677,12 +677,14 @@ impl Report {
                 Severity::Warning => paint("warning", color, |s| s.yellow().bold().to_string()),
                 Severity::Note => paint("note", color, |s| s.cyan().to_string()),
             };
-            writeln!(out, "{label}: {}: {}", f.subject, f.message)?;
+            // Messages hold chain data and decoder output, which must not drive the terminal.
+            let (subject, message) = (escape_control(&f.subject), escape_control(&f.message));
+            writeln!(out, "{label}: {subject}: {message}")?;
             if let Some(hint) = &f.hint {
-                writeln!(out, "  hint: {hint}")?;
+                writeln!(out, "  hint: {}", escape_control(hint))?;
             }
             if let Some(example) = &f.example {
-                writeln!(out, "  example: {example}")?;
+                writeln!(out, "  example: {}", escape_control(example))?;
             }
         }
         Ok(())
@@ -890,8 +892,35 @@ fn write_table<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::samples::{InstructionSample, Samples};
+    use crate::reference::{Outcome, Reference};
+    use crate::samples::{AccountSample, InstructionSample, Samples};
     use crate::testing::idl;
+
+    #[test]
+    fn control_characters_in_a_finding_are_escaped() {
+        // A decoder's error text is untrusted, and U+009B starts a terminal control sequence.
+        let idl = idl(
+            r#""accounts":[{"name":"A","discriminator":[7]}],"instructions":[],
+            "types":[{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u8"}]}}]"#,
+        );
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "a".into(),
+                data: vec![7, 1],
+            }],
+            ..Samples::default()
+        };
+        let reference =
+            Reference::from_decoder(vec![Outcome::Failed("\u{9b}2J".into())], vec![], vec![]);
+        let report = crate::verify(&idl, &samples, Some(&reference));
+        let mut out = Vec::new();
+        report.write_human(&mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\\u{9b}2J") && !text.contains('\u{9b}'),
+            "{text}"
+        );
+    }
 
     #[test]
     fn low_coverage_is_an_error_only_below_the_minimum() {

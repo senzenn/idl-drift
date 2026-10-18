@@ -9,6 +9,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
   apart and account types that Shipstern skips. The exit code does not change.
+- Library: `idl_drift::markdown::escape_control` writes each control character as an escape.
 
 ### Changed
 
@@ -38,6 +39,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-verify: Anchor's IDL instruction and `IdlAccount` give a note, not an error.
 - idl-verify: `--decoder` accepts the `null` that serde writes for NaN.
 - idl-verify: a decoder that keeps running after its last reply is stopped.
+- idl-verify: live sampling reads all the data of only the accounts that it keeps.
+- RPC: an answer over 32 MiB is not retried, and `"error": null` is not an error.
+- RPC: an answer that is not a JSON object is an error, not a panic.
+- idl-verify: control characters in findings and errors are escaped.
 
 ## [0.1.0] - 2026-10-16
 

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::markdown::escape_control;
+
 /// Tries per request.
 const ATTEMPTS: u32 = 5;
 /// Triton asks a client to stop for 10 s after a 429; an earlier retry gets another 429.
@@ -59,18 +61,24 @@ pub fn call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
                     backoff(attempt)
                 }
                 200 => {
+                    // `read_json` reports the size limit as a JSON error, which is tried again.
                     let read = response
                         .body_mut()
                         .with_config()
                         .limit(MAX_RESPONSE_BYTES)
-                        .read_json::<Value>();
+                        .read_to_vec()
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<Value>(&bytes).map_err(ureq::Error::Json)
+                        });
                     match read {
                         Ok(mut reply) => {
-                            // `Value` prints strings JSON-escaped, so control characters stay inert.
-                            if let Some(error) = reply.get("error") {
-                                return Err(fail(error.to_string()));
+                            if let Some(error) = reply.get("error").filter(|e| !e.is_null()) {
+                                return Err(fail(escape_control(&error.to_string())));
                             }
-                            return Ok(reply["result"].take());
+                            return reply
+                                .as_object_mut()
+                                .map(|fields| fields.remove("result").unwrap_or(Value::Null))
+                                .ok_or_else(|| fail("the answer is not a JSON-RPC object".into()));
                         }
                         Err(e) if retryable(&e) => {
                             last = transport_text(&e);
@@ -134,7 +142,9 @@ fn error_message(response: &mut ureq::http::Response<ureq::Body>) -> String {
         .read_json::<Value>()
         .ok()
         .and_then(|v| v.pointer("/error/message").cloned())
-        .map_or_else(String::new, |m| format!(": {m}"))
+        .map_or_else(String::new, |m| {
+            format!(": {}", escape_control(&m.to_string()))
+        })
 }
 
 #[cfg(test)]
@@ -182,6 +192,54 @@ mod tests {
             ("HTTP/1.1 200 OK", r#"{"jsonrpc":"2.0","id":1,"result":7}"#),
         ]);
         assert_eq!(call(&agent(), &url, "getSlot", &json!([])), Ok(json!(7)));
+    }
+
+    #[test]
+    fn an_answer_over_the_size_limit_is_not_tried_again() {
+        let limit = usize::try_from(MAX_RESPONSE_BYTES).unwrap();
+        let big: &'static str = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#,
+            "a".repeat(limit)
+        )
+        .leak();
+        let url = serve(vec![
+            ("HTTP/1.1 200 OK", big),
+            ("HTTP/1.1 200 OK", r#"{"jsonrpc":"2.0","id":1,"result":7}"#),
+        ]);
+        assert_eq!(
+            call(&agent(), &url, "getSlot", &json!([])),
+            Err("getSlot: the response body is larger than request limit: 33554432".into())
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_not_an_object_is_an_error() {
+        let url = serve(vec![("HTTP/1.1 200 OK", "[1]")]);
+        assert_eq!(
+            call(&agent(), &url, "getSlot", &json!([])),
+            Err("getSlot: the answer is not a JSON-RPC object".into())
+        );
+    }
+
+    #[test]
+    fn a_null_error_is_no_error() {
+        let url = serve(vec![(
+            "HTTP/1.1 200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":7,"error":null}"#,
+        )]);
+        assert_eq!(call(&agent(), &url, "getSlot", &json!([])), Ok(json!(7)));
+    }
+
+    #[test]
+    fn control_characters_in_an_rpc_error_are_escaped() {
+        let url = serve(vec![(
+            "HTTP/1.1 200 OK",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"\u{9b}2J\u{7f}\"}}",
+        )]);
+        assert_eq!(
+            call(&agent(), &url, "getSlot", &json!([])).unwrap_err(),
+            r#"getSlot: {"message":"\u{9b}2J\u{7f}"}"#
+        );
     }
 
     #[test]

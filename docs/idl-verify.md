@@ -246,9 +246,10 @@ serve `getAccountInfo`, `getSignaturesForAddress`, `getTransaction` and
   report gives the number of transactions read and the reason it stopped.
 - **Accounts.** The accounts that those instructions pass and the program owns, from
   `getMultipleAccounts`, at most 5 for each account type. idl-verify first reads only the
-  owner of each account, then the data of the accounts that the program owns. So a large
-  account of another program, such as program code, is never downloaded. idl-verify keeps
-  accounts with an unknown discriminator, so the `discriminator` check can report them.
+  owner, the length and the first bytes of each account. Then it reads all the data of the
+  accounts it keeps, in requests under the 32 MiB answer limit. So a large account that it
+  does not keep, such as program code, is never downloaded. idl-verify keeps accounts with
+  an unknown discriminator, so the `discriminator` check can report them.
 
 A run exits 2 when it finds nothing of the program, the URL is empty, the program address
 is not base58, or a request fails. So a typo does not look like a quiet program. idl-verify

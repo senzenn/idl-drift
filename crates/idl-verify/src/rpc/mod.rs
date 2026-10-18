@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use idl_drift::model::Idl;
 
 use crate::classify::{
-    account_table, cpi_envelopes, event_body, event_table, instruction_match, instruction_table,
-    longest_match, DiscTable,
+    account_match, account_table, cpi_envelopes, event_body, event_table, instruction_match,
+    instruction_table, longest_match, DiscTable,
 };
 use crate::error::Error;
 use crate::samples::{AccountSample, EventSource, Samples};
@@ -291,8 +291,15 @@ pub fn accounts_from_rpc(
         let data = STANDARD
             .decode(&account.data.0)
             .map_err(|e| Error::RpcResponse(format!("account {key}: data: {e}")))?;
+        let len = account
+            .space
+            .and_then(|s| usize::try_from(s).ok())
+            .unwrap_or(data.len());
         let count = taken
-            .entry(kind(longest_match(&table, &data).as_deref(), &data))
+            .entry(kind(
+                account_match(idl, &table, &data, len).as_deref(),
+                &data,
+            ))
             .or_default();
         if *count >= per_type {
             continue;
@@ -334,8 +341,8 @@ fn kind(matched: Option<&[usize]>, data: &[u8]) -> (Option<usize>, String) {
 }
 
 /// The accounts among `keys` that `program_id` owns, as [`accounts_from_rpc`] keeps them.
-/// Owners come first, with no data: an account of another program, such as a program's
-/// code, can hold 10 MiB, and only the program's own accounts are checked.
+/// An account can hold 10 MiB, so read the owner and the first bytes of each one first.
+/// Then read all the data of only the accounts that are kept.
 fn fetch_accounts(
     rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
     idl: &Idl,
@@ -343,16 +350,46 @@ fn fetch_accounts(
     keys: &[String],
     per_type: usize,
 ) -> Result<Vec<AccountSample>, Error> {
-    let mut owned = Vec::new();
-    for (key, value) in keys.iter().zip(multiple_accounts(rpc, keys, Some(0))?) {
-        let account = Option::<RpcAccount>::deserialize(&value)
+    let heads = multiple_accounts(rpc, keys, Some(kind_len(idl)))?;
+    let mut lengths = HashMap::new();
+    for (key, value) in keys.iter().zip(&heads) {
+        let account = Option::<RpcAccount>::deserialize(value)
             .map_err(|e| Error::RpcResponse(format!("account {key}: {e}")))?;
-        if account.is_some_and(|a| a.owner == program_id) {
-            owned.push(key.clone());
-        }
+        // An RPC that does not give `space` could send the largest account.
+        let len = account.and_then(|a| a.space).unwrap_or(MAX_ACCOUNT_LEN);
+        lengths.insert(key.as_str(), len);
     }
-    let values = multiple_accounts(rpc, &owned, None)?;
-    accounts_from_rpc(idl, program_id, &owned, &values, per_type)
+    let kept: Vec<String> = accounts_from_rpc(idl, program_id, keys, &heads, per_type)?
+        .into_iter()
+        .map(|a| a.address)
+        .collect();
+
+    let mut values = Vec::new();
+    let (mut batch_start, mut batch_len) = (0, 0u64);
+    for (i, key) in kept.iter().enumerate() {
+        let len = lengths
+            .get(key.as_str())
+            .copied()
+            .unwrap_or(MAX_ACCOUNT_LEN);
+        if i > batch_start && batch_len.saturating_add(len) > MAX_DATA_PER_REQUEST {
+            values.extend(multiple_accounts(rpc, &kept[batch_start..i], None)?);
+            (batch_start, batch_len) = (i, 0);
+        }
+        batch_len = batch_len.saturating_add(len);
+    }
+    values.extend(multiple_accounts(rpc, &kept[batch_start..], None)?);
+    accounts_from_rpc(idl, program_id, &kept, &values, per_type)
+}
+
+/// The bytes of data that [`accounts_from_rpc`] reads to tell an account's kind: each
+/// account discriminator, and the 8 bytes of [`prefix_hex`] for an unknown one.
+fn kind_len(idl: &Idl) -> usize {
+    account_table(idl)
+        .iter()
+        .flat_map(|(discs, _)| discs)
+        .map(|(at, disc)| at.saturating_add(disc.len()))
+        .fold(8, usize::max)
+        .min(MAX_KIND_LEN)
 }
 
 /// `getMultipleAccounts` values of `keys`, in order. With `data_len`, each holds only that
@@ -441,16 +478,30 @@ struct SignatureInfo {
 /// The `getMultipleAccounts` limit on keys per request.
 const MAX_ACCOUNTS_PER_REQUEST: usize = 100;
 
+/// The IDL sets the first read, so a far discriminator offset must not make it large. Real
+/// discriminators end in the first bytes.
+const MAX_KIND_LEN: usize = 1024;
+
+/// Agave's `MAX_PERMITTED_DATA_LENGTH`: the most data an account can hold.
+const MAX_ACCOUNT_LEN: u64 = 10 << 20;
+
+/// Two accounts of the largest size: in base64 they fit the 32 MiB that `idl_drift::rpc`
+/// reads of one answer.
+const MAX_DATA_PER_REQUEST: u64 = 2 * MAX_ACCOUNT_LEN;
+
 #[derive(Deserialize)]
 struct AccountsPage {
     value: Vec<Value>,
 }
 
-/// An account from `getMultipleAccounts`; `data` is `[<base64>, "base64"]`.
+/// An account from `getMultipleAccounts`; `data` is `[<base64>, "base64"]`. `space` is the
+/// length of all the data, also when `dataSlice` sends only a part.
 #[derive(Deserialize)]
 struct RpcAccount {
     owner: String,
     data: (String, String),
+    #[serde(default)]
+    space: Option<u64>,
 }
 
 #[cfg(test)]
@@ -478,6 +529,20 @@ mod tests {
         json!({ "owner": owner, "data": [data, "base64"], "lamports": 1, "executable": false })
     }
 
+    #[test]
+    fn the_first_read_stays_small_for_a_far_discriminator() {
+        let idl = Idl::from_json(
+            r#"{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","instructions":[],
+            "errors":[],"definedTypes":[],"pdas":[],"accounts":[{"kind":"accountNode","name":"far",
+            "data":{"kind":"structTypeNode","fields":[]},
+            "discriminators":[{"kind":"constantDiscriminatorNode","offset":10000000,"constant":{
+            "kind":"constantValueNode","type":{"kind":"bytesTypeNode"},
+            "value":{"kind":"bytesValueNode","data":"07","encoding":"base16"}}}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(kind_len(&idl), MAX_KIND_LEN);
+    }
     #[test]
     fn keeps_only_accounts_the_program_owns() {
         let keys = ["A", "B", "C"].map(String::from);
@@ -562,7 +627,7 @@ mod tests {
             .map(|a| (a.address.as_str(), a.data.as_slice()))
             .collect();
         assert_eq!(accounts, [("Vault", &[9u8, 9, 1][..])]);
-        // Owners first with no data, then data only for the program's own accounts.
+        // The owner and 8 bytes of each account, then all the data of the kept account.
         let account_requests: Vec<&Value> = calls
             .iter()
             .filter(|(m, _)| m == "getMultipleAccounts")
@@ -571,9 +636,70 @@ mod tests {
         assert_eq!(
             account_requests,
             [
-                &json!([["Vault", "Payer"], { "encoding": "base64", "dataSlice": { "offset": 0, "length": 0 } }]),
+                &json!([["Vault", "Payer"], { "encoding": "base64", "dataSlice": { "offset": 0, "length": 8 } }]),
                 &json!([["Vault"], { "encoding": "base64" }]),
             ]
+        );
+    }
+
+    #[test]
+    fn reads_only_the_kept_accounts_in_full_in_requests_under_the_size_limit() {
+        // The fake sends 24 bytes of each account but gives 8 MiB in `space`. It refuses
+        // a request whose real answer would be over the 32 MiB limit of the transport.
+        let keys: Vec<String> = (0..8).map(|i| format!("K{i}")).collect();
+        let space: usize = 8 << 20;
+        let mut full = Vec::new();
+        let rpc = |method: &str, params: Value| {
+            Ok(match method {
+                "getSignaturesForAddress" => json!([{ "signature": "S1", "err": null }]),
+                "getTransaction" => {
+                    let mut all: Vec<&str> = keys.iter().map(String::as_str).collect();
+                    all.push("Prog");
+                    tx(
+                        &all,
+                        &json!([{ "programIdIndex": 8, "accounts": [0, 1, 2, 3, 4, 5, 6, 7], "data": "2" }]),
+                    )
+                }
+                "getMultipleAccounts" => {
+                    let asked = params[0].as_array().unwrap();
+                    let slice = params[1]["dataSlice"]["length"].as_u64();
+                    if slice.is_none() {
+                        if asked.len() * space / 3 * 4 > 32 << 20 {
+                            return Err(Error::Rpc("getMultipleAccounts: over the limit".into()));
+                        }
+                        full.push(params[0].clone());
+                    }
+                    let values: Vec<Value> = asked
+                        .iter()
+                        .map(|_| {
+                            let mut data = vec![9, 9];
+                            data.resize(24, 0);
+                            data.truncate(slice.map_or(24, |n| usize::try_from(n).unwrap()));
+                            let mut value = account("Prog", &data);
+                            value["space"] = json!(space);
+                            value
+                        })
+                        .collect();
+                    json!({ "value": values })
+                }
+                _ => Value::Null,
+            })
+        };
+        let samples = sample(no_program(rpc), &idl(), "Prog", &Limits::default())
+            .unwrap()
+            .samples;
+        let accounts: Vec<(&str, usize)> = samples
+            .accounts
+            .iter()
+            .map(|a| (a.address.as_str(), a.data.len()))
+            .collect();
+        assert_eq!(
+            accounts,
+            [("K0", 24), ("K1", 24), ("K2", 24), ("K3", 24), ("K4", 24)]
+        );
+        assert_eq!(
+            full,
+            [json!(["K0", "K1"]), json!(["K2", "K3"]), json!(["K4"])]
         );
     }
 
