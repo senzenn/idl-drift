@@ -707,37 +707,73 @@ mod tests {
     #[test]
     fn a_codama_size_discriminator_must_match_too() {
         // A native program can take one tag at two data lengths, when callers pad the struct.
-        let ix = |name: &str, size: usize, extra: &str| {
+        // The Codama spec lets the size discriminator come first or last.
+        for size_first in [false, true] {
+            let ix = |name: &str, size: usize, extra: &str| {
+                let field =
+                    r#"{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}"#;
+                let sized = format!(r#"{{"kind":"sizeDiscriminatorNode","size":{size}}}"#);
+                let discs = if size_first {
+                    format!("{sized},{field}")
+                } else {
+                    format!("{field},{sized}")
+                };
+                format!(
+                    r#"{{"kind":"instructionNode","name":"{name}","accounts":[],"arguments":[
+                    {{"kind":"instructionArgumentNode","name":"discriminator","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+                    "defaultValue":{{"kind":"numberValueNode","number":7}},"defaultValueStrategy":"omitted"}},
+                    {{"kind":"instructionArgumentNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}{extra}],
+                    "discriminators":[{discs}]}}"#
+                )
+            };
+            let pad = r#",{"kind":"instructionArgumentNode","name":"pad","type":{"kind":"fixedSizeTypeNode","size":7,"type":{"kind":"bytesTypeNode"}}}"#;
+            let idl = Idl::from_json(&format!(
+                r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
+                "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
+                "errors":[],"definedTypes":[],"pdas":[],"instructions":[{},{}]}}}}"#,
+                ix("short", 9, ""),
+                ix("padded", 16, pad)
+            ))
+            .unwrap();
+            let mut short = vec![7];
+            short.extend(5u64.to_le_bytes());
+            let mut padded = short.clone();
+            padded.extend([0; 7]);
+            let report = verify(&idl, &instructions(&[(&short, &[]), (&padded, &[])]), None);
+            assert!(
+                report.findings.is_empty(),
+                "{size_first}: {:#?}",
+                report.findings
+            );
+            // The tag matches, but no instruction has this size.
+            let report = verify(&idl, &instructions(&[(&short[..6], &[])]), None);
+            assert_eq!(
+                (only(&report).severity, only(&report).check),
+                (Severity::Error, Check::Discriminator)
+            );
+        }
+    }
+
+    #[test]
+    fn a_size_discriminator_alone_selects_an_instruction() {
+        let ix = |name: &str, size: usize, format: &str| {
             format!(
                 r#"{{"kind":"instructionNode","name":"{name}","accounts":[],"arguments":[
-                {{"kind":"instructionArgumentNode","name":"discriminator","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
-                "defaultValue":{{"kind":"numberValueNode","number":7}},"defaultValueStrategy":"omitted"}},
-                {{"kind":"instructionArgumentNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}{extra}],
-                "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}},
-                {{"kind":"sizeDiscriminatorNode","size":{size}}}]}}"#
+                {{"kind":"instructionArgumentNode","name":"v","type":{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}}}],
+                "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{size}}}]}}"#
             )
         };
-        let pad = r#",{"kind":"instructionArgumentNode","name":"pad","type":{"kind":"fixedSizeTypeNode","size":7,"type":{"kind":"bytesTypeNode"}}}"#;
         let idl = Idl::from_json(&format!(
             r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
             "kind":"programNode","name":"t","publicKey":"P","version":"0","accounts":[],
             "errors":[],"definedTypes":[],"pdas":[],"instructions":[{},{}]}}}}"#,
-            ix("short", 9, ""),
-            ix("padded", 16, pad)
+            ix("big", 8, "u64"),
+            ix("small", 1, "u8")
         ))
         .unwrap();
-        let mut short = vec![7];
-        short.extend(5u64.to_le_bytes());
-        let mut padded = short.clone();
-        padded.extend([0; 7]);
-        let report = verify(&idl, &instructions(&[(&short, &[]), (&padded, &[])]), None);
+        let report = verify(&idl, &instructions(&[(&[5; 8], &[]), (&[5], &[])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
-        // The tag matches, but no instruction has this size.
-        let report = verify(&idl, &instructions(&[(&short[..6], &[])]), None);
-        assert_eq!(
-            (only(&report).severity, only(&report).check),
-            (Severity::Error, Check::Discriminator)
-        );
+        assert_eq!(report.instruction_coverage.classified, 2);
     }
 
     #[test]

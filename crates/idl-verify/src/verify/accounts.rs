@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use idl_drift::model::{Format, Idl, NamedDisc, Type, TypeDef};
 
 use super::{bytes_used, missing_field_hint, size_counts, Groups, Outcomes, Verifier};
+use crate::classify::has_byte_discriminator;
 use crate::decode::Value;
 use crate::layout::StructLayout;
 use crate::reference::Outcome;
@@ -97,7 +98,7 @@ impl Verifier<'_> {
             } else {
                 // Only a size guess picked this type. Shipstern's parser, for one, selects
                 // accounts only by a discriminator, so it rejects these accounts.
-                if nd.discriminator.is_empty() && nd.size_discriminator.is_none() {
+                if !has_byte_discriminator(nd) && nd.size_discriminator.is_none() {
                     self.push(
                         Severity::Note,
                         Check::Discriminator,
@@ -562,6 +563,79 @@ mod tests {
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"s","type":"string"}]}}"#;
     const U32_TYPE: &str =
         r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
+
+    #[test]
+    fn a_size_discriminator_first_splits_types_that_share_a_constant() {
+        // The number constant is also the first field, so the body starts at byte 0.
+        let account = |name: &str, size: usize, second: &str| {
+            format!(
+                r#"{{"kind":"accountNode","name":"{name}","data":{{"kind":"structTypeNode","fields":[
+                {{"kind":"structFieldTypeNode","name":"accountType","type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}}}},
+                {{"kind":"structFieldTypeNode","name":"rest","type":{second}}}]}},
+                "discriminators":[{{"kind":"sizeDiscriminatorNode","size":{size}}},
+                {{"kind":"constantDiscriminatorNode","offset":0,"constant":{{"kind":"constantValueNode",
+                "type":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},"value":{{"kind":"numberValueNode","number":3}}}}}}]}}"#
+            )
+        };
+        let idl = Idl::from_json(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","instructions":[],
+            "errors":[],"definedTypes":[],"pdas":[],"accounts":[{},{}]}}}}"#,
+            account(
+                "pool",
+                9,
+                r#"{"kind":"numberTypeNode","format":"u64","endian":"le"}"#
+            ),
+            account("vault", 33, r#"{"kind":"publicKeyTypeNode"}"#)
+        ))
+        .unwrap();
+        let sample = |data: Vec<u8>| AccountSample {
+            address: format!("a{}", data.len()),
+            data,
+        };
+        let samples = Samples {
+            accounts: vec![
+                sample([3, 5, 0, 0, 0, 0, 0, 0, 0].into()),
+                sample([3; 33].into()),
+            ],
+            ..Samples::default()
+        };
+        let report = verify(&idl, &samples, None);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn a_later_discriminator_is_not_a_pick_by_size() {
+        // The first discriminator is a field with no default, so only the constant has bytes.
+        let idl = Idl::from_json(
+            r#"{"kind":"rootNode","standard":"codama","version":"1.0.0","program":{
+            "kind":"programNode","name":"t","publicKey":"P","version":"0","instructions":[],
+            "errors":[],"definedTypes":[],"pdas":[],"accounts":[{"kind":"accountNode","name":"pool",
+            "data":{"kind":"structTypeNode","fields":[
+            {"kind":"structFieldTypeNode","name":"kind","type":{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+            {"kind":"structFieldTypeNode","name":"tag","type":{"kind":"numberTypeNode","format":"u8","endian":"le"}}]},
+            "discriminators":[{"kind":"fieldDiscriminatorNode","name":"kind","offset":0},
+            {"kind":"constantDiscriminatorNode","offset":1,"constant":{"kind":"constantValueNode",
+            "type":{"kind":"bytesTypeNode"},"value":{"kind":"bytesValueNode","data":"07","encoding":"base16"}}}]}]}}"#,
+        )
+        .unwrap();
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "a".into(),
+                data: vec![1, 7],
+            }],
+            ..Samples::default()
+        };
+        let report = verify(&idl, &samples, None);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.message.contains("by size")),
+            "{:#?}",
+            report.findings
+        );
+    }
 
     #[test]
     fn account_picked_only_by_size_is_a_note() {

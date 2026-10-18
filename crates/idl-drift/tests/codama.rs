@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{fixture, fixture_text, max_sev, parse};
+use common::{fixture, fixture_text, kinds, max_sev, parse};
 use idl_drift::codama_convert::decode_encoded_bytes;
 use idl_drift::model::{ArrayLen, Idl, Type, TypeDefTy};
 use idl_drift::{coverage, diff, ChangeKind, Severity};
@@ -165,12 +165,30 @@ fn codama_enum_tag_width_and_variant_values_are_breaking() {
 
 /// A Codama program whose one instruction takes an arg of type `arg`.
 fn codama_arg(arg: &str, defined_types: &str) -> String {
+    codama_args(
+        &format!(r#"{{"kind":"instructionArgumentNode","name":"x","type":{arg}}}"#),
+        defined_types,
+    )
+}
+
+/// A Codama program whose one instruction takes the `arguments` nodes `args`.
+fn codama_args(args: &str, defined_types: &str) -> String {
+    codama_root(
+        &format!(
+            r#"{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],"arguments":[{args}]}}"#
+        ),
+        "",
+        defined_types,
+    )
+}
+
+/// A Codama program with these `instructions`, `accounts` and `definedTypes` nodes.
+fn codama_root(instructions: &str, accounts: &str, defined_types: &str) -> String {
     format!(
         r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
   "program":{{"kind":"programNode","name":"t","publicKey":"11111111111111111111111111111111","version":"0",
-    "accounts":[],"pdas":[],"errors":[],"definedTypes":[{defined_types}],
-    "instructions":[{{"kind":"instructionNode","name":"set","accounts":[],"discriminators":[],
-      "arguments":[{{"kind":"instructionArgumentNode","name":"x","type":{arg}}}]}}]}}}}"#
+    "accounts":[{accounts}],"pdas":[],"errors":[],"definedTypes":[{defined_types}],
+    "instructions":[{instructions}]}}}}"#
     )
 }
 
@@ -353,6 +371,34 @@ fn size_discriminators_and_event_chains_are_compared() {
     assert_eq!(
         kinds(&lone(0), &lone(8)),
         [ChangeKind::EventDiscriminatorChanged]
+    );
+}
+
+#[test]
+fn a_discriminator_after_a_size_discriminator_is_compared() {
+    let root = |tag: &str| {
+        let bytes = format!(r#"{{"kind":"bytesValueNode","data":"{tag}","encoding":"base16"}}"#);
+        let ix = format!(
+            r#"{{"kind":"instructionNode","name":"ping","accounts":[],"arguments":[
+            {{"kind":"instructionArgumentNode","name":"discriminator","defaultValueStrategy":"omitted",
+            "type":{{"kind":"fixedSizeTypeNode","size":1,"type":{{"kind":"bytesTypeNode"}}}},"defaultValue":{bytes}}}],
+            "discriminators":[{{"kind":"sizeDiscriminatorNode","size":1}},
+            {{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}]}}"#
+        );
+        let account = format!(
+            r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[]}},
+            "discriminators":[{{"kind":"sizeDiscriminatorNode","size":1}},
+            {{"kind":"constantDiscriminatorNode","offset":0,"constant":{{"kind":"constantValueNode",
+            "type":{{"kind":"bytesTypeNode"}},"value":{bytes}}}}}]}}"#
+        );
+        codama_root(&ix, &account, "")
+    };
+    assert_eq!(
+        kinds(&root("01"), &root("02")),
+        [
+            (Severity::Breaking, ChangeKind::DiscriminatorChanged),
+            (Severity::Breaking, ChangeKind::AccountDiscriminatorChanged)
+        ]
     );
 }
 
