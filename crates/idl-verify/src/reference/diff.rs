@@ -1,5 +1,7 @@
 //! Find where two JSON writings of a value differ, ignoring how each decoder wraps it.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value as Json};
 
 /// First place where `ours` and `theirs` differ: the path and both values.
@@ -229,12 +231,32 @@ fn is_unit_struct_tuple(obj: &Map<String, Json>) -> bool {
 
 fn type_wrapped<'a>(wrapped: &'a Map<String, Json>, other: &Map<String, Json>) -> Option<&'a Json> {
     let (name, inner) = wrapped.iter().next().filter(|_| wrapped.len() == 1)?;
-    let is_type = (normalize(name) == "0" || name.starts_with(|c: char| c.is_ascii_uppercase()))
-        && inner.is_object();
+    let is_type = is_type_key(name) && inner.is_object();
     // Only an enum, always one key, can carry the name as a key; a struct field cannot block.
     let enum_with_that_variant =
         other.len() == 1 && other.keys().any(|k| normalize(k) == normalize(name));
-    (is_type && !enum_with_that_variant).then_some(inner)
+    (is_type && !enum_with_that_variant && holds_fields_of(inner, other)).then_some(inner)
+}
+
+fn is_type_key(name: &str) -> bool {
+    normalize(name) == "0" || name.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// A type wrapper holds the other side's fields, maybe under more wrappers. If it does not,
+/// the key is an enum variant, and peeling it would hide a wrong variant.
+fn holds_fields_of(mut inner: &Json, other: &Map<String, Json>) -> bool {
+    let keys = |m: &Map<String, Json>| m.keys().map(|k| normalize(k)).collect::<BTreeSet<_>>();
+    let want = keys(other);
+    while let Json::Object(m) = inner {
+        if keys(m) == want {
+            return true;
+        }
+        match single_wrapper(m) {
+            Some(next) if m.keys().all(|k| is_type_key(k)) => inner = next,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// A one-field object around a value: a 1-tuple `{"0": x}`, Shipstern's `{"items": [..]}`,
@@ -394,6 +416,27 @@ mod tests {
         // A wrong variant is still a difference.
         let wrong = json!({"swap": {"Raydium": {"a_to_b": true}}});
         assert!(first_difference(&step, &wrong).is_some());
+        // Variant names that look like type names on both sides, as serde and Anchor write them.
+        for (ours, theirs) in [
+            (
+                json!({"s": {"Long": {"size": 5}}}),
+                json!({"s": {"Short": {"size": 5}}}),
+            ),
+            (json!({"s": {"Active": {}}}), json!({"s": {"Paused": {}}})),
+            (
+                json!({"a": {"Exact": {"0": {"bn": "5"}}}}),
+                json!({"a": {"Max": 5}}),
+            ),
+            (
+                json!({"a": {"Exact": {"0": {"bn": "5"}}}}),
+                json!({"a": {"max": {"0": {"bn": "5"}}}}),
+            ),
+        ] {
+            assert!(
+                first_difference(&ours, &theirs).is_some(),
+                "{ours} {theirs}"
+            );
+        }
         let wrong = json!({ "amount": 8, "kind": "Fixed", "pair": [1, 2] });
         assert_eq!(
             first_difference(&ours, &wrong).map(|d| d.path),

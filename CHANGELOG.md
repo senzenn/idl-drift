@@ -15,6 +15,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-verify: an instruction matches only when its Codama size discriminator matches too, at
   any position. A program that takes one tag at two data lengths no longer gives a false
   "bytes after the arguments" error.
+- idl-verify: value compares find a wrong enum variant with capitalized names.
 
 ## [0.1.0] - 2026-10-16
 
