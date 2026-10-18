@@ -42,7 +42,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-verify: live sampling reads all the data of only the accounts that it keeps.
 - RPC: an answer over 32 MiB is not retried, and `"error": null` is not an error.
 - RPC: an answer that is not a JSON object is an error, not a panic.
-- idl-verify: control characters in findings and errors are escaped.
+- Control characters in findings, changes, IDL names and errors are escaped on the terminal.
 
 ## [0.1.0] - 2026-10-16
 

@@ -226,3 +226,34 @@ fn markdown_report_counts_changes_and_keeps_allowed_ones_apart() {
         "{md}"
     );
 }
+
+#[test]
+fn control_characters_in_idl_names_are_escaped() {
+    // An IDL from another repo or from chain is untrusted; U+009B starts a terminal sequence.
+    let dir = std::env::temp_dir().join(format!("idl-drift-escape-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let idl = |ty: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"1","spec":"0.1.0"}},
+            "accounts":[{{"name":"Pool\u009b2J","discriminator":[1,1,1,1,1,1,1,1]}}],
+            "types":[{{"name":"Pool\u009b2J","serialization":"bytemuck","repr":{{"kind":"c"}},
+            "type":{{"kind":"struct","fields":[{{"name":"a\u009b2J","type":"{ty}"}}]}}}}]}}"#
+        )
+    };
+    let (old, new) = (dir.join("old.json"), dir.join("new.json"));
+    std::fs::write(&old, idl("u8")).unwrap();
+    std::fs::write(&new, idl("u64")).unwrap();
+    let out = |args: &[&std::ffi::OsStr]| {
+        let output = drift().args(args).output().unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let inspect = out(&["inspect".as_ref(), "--layout".as_ref(), new.as_os_str()]);
+    let changes = out(&["diff".as_ref(), old.as_os_str(), new.as_os_str()]);
+    for text in [inspect, changes] {
+        assert!(
+            text.contains(r"\u{9b}2J") && !text.contains('\u{9b}'),
+            "{text}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
