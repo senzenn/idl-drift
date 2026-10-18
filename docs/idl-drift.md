@@ -78,7 +78,8 @@ compares the two IDLs the same way:
   of one format, `sourceOwner` (as Codama writes it) across formats.
 - A layout change counts only on a **reachable** type: an account type, an event type, a
   type that an instruction argument names, and each type that these reach through fields,
-  variant payloads and aliases. A layout change on any other type is Cosmetic.
+  variant payloads and aliases. Both IDLs must reach the type, because an old parser reads
+  only what the old IDL reaches. A layout change on any other type is Cosmetic.
 
 When the two files use different formats, idl-drift first does these steps:
 
@@ -91,6 +92,15 @@ When the two files use different formats, idl-drift first does these steps:
 - It writes each use of a generic struct or alias as its body with the arguments filled in,
   as Codama converters do.
 - It compares a tuple struct and a tuple alias as the same type.
+
+For every pair of files, idl-drift also does these steps, because the bytes are the same:
+
+- It compares `Vec<u8>` and `bytes` as the same type. Anchor and Shank write a Rust
+  `Vec<u8>` as `bytes`, and codama-rs writes it as a u8 array with a u32 prefix.
+- When the two files of one format nest the arguments of an instruction differently, but
+  hold the same field types in the same order, it compares the arguments field by field.
+  For example, Codama links a params type after it gets a second use. Other arguments stay
+  as written, so a change inside a params type keeps its type and field name.
 
 ### Zero-copy types
 

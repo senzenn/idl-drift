@@ -22,6 +22,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   change.
 - idl-drift: a renamed enum variant with a new tag is Breaking.
 - idl-drift: an account rename no longer hides a flag change.
+- idl-drift: `Vec<u8>` and `bytes` are the same type.
+- idl-drift: args that nest the same fields in another way are no change.
+- idl-drift: a layout change on a type that only the new IDL reaches is Cosmetic.
+- idl-drift: a legacy Anchor field or seed named `publicKey` keeps its name.
 - idl-verify: value compares find a wrong enum variant with capitalized names.
 
 ## [0.1.0] - 2026-10-16

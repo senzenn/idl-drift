@@ -866,8 +866,9 @@ fn normalize_legacy_anchor(value: &mut serde_json::Value, shank: bool) -> bool {
         add_legacy_discriminators(obj, shank);
     }
     move_inline_types(obj);
-    rewrite_legacy_keys(value);
+    // A legacy alias moves to `alias` first, so the key walk sees it as a place for a type.
     normalize_type_defs(value);
+    rewrite_legacy_keys(value, false);
     legacy
 }
 
@@ -1060,7 +1061,9 @@ fn normalize_type_defs(value: &mut serde_json::Value) {
     }
 }
 
-fn rewrite_legacy_keys(value: &mut serde_json::Value) {
+/// `is_type` is true where a type goes. Only there is `"publicKey"` the legacy pubkey type: a
+/// name, a seed or a doc can hold the same text.
+fn rewrite_legacy_keys(value: &mut serde_json::Value, is_type: bool) {
     match value {
         serde_json::Value::Object(map) => {
             if let Some(v) = map.remove("isMut") {
@@ -1090,16 +1093,29 @@ fn rewrite_legacy_keys(value: &mut serde_json::Value) {
                     serde_json::json!({ "name": name, "generics": [] }),
                 );
             }
-            for v in map.values_mut() {
-                rewrite_legacy_keys(v);
+            for (key, v) in map.iter_mut() {
+                let holds_type = matches!(
+                    key.as_str(),
+                    "type"
+                        | "alias"
+                        | "fields"
+                        | "option"
+                        | "coption"
+                        | "vec"
+                        | "array"
+                        | "map"
+                        | "set"
+                        | "tuple"
+                );
+                rewrite_legacy_keys(v, holds_type);
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                rewrite_legacy_keys(v);
+                rewrite_legacy_keys(v, is_type);
             }
         }
-        serde_json::Value::String(s) if s == "publicKey" => {
+        serde_json::Value::String(s) if is_type && s == "publicKey" => {
             *s = "pubkey".into();
         }
         _ => {}

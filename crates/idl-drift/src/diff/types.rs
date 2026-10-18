@@ -13,6 +13,9 @@ use crate::model::{EnumFields, EnumVariant, Field, GenericParam, Idl, Type, Type
 pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
     let om = old.type_map();
     let nm = new.type_map();
+    // An old parser reads a type only when the old IDL reaches it too.
+    let old_reached = super::reachable_types(old);
+    let read_by_both: BTreeSet<String> = reached.intersection(&old_reached).cloned().collect();
     let attrs_changed =
         |ot: &TypeDef, nt: &TypeDef| ot.serialization != nt.serialization || ot.repr != nt.repr;
     let roots = if nm
@@ -26,10 +29,10 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
     for (name, nt) in &nm {
         // An added type shows up as a change to the field or arg that uses it.
         let Some(ot) = om.get(name) else { continue };
-        let is_reached = reached.contains(name);
+        let is_reached = read_by_both.contains(name);
 
         if attrs_changed(ot, nt) {
-            zero_copy::diff_layout_attrs(name, ot, nt, reached, &roots, r);
+            zero_copy::diff_layout_attrs(name, ot, nt, &read_by_both, &roots, r);
         }
 
         let renamed = with_old_generic_names(ot, nt);

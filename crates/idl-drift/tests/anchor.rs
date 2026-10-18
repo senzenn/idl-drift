@@ -3,7 +3,9 @@
 mod common;
 
 use common::{fixture, idl_kinds, kinds, messages, parse};
-use idl_drift::model::{AccountItem, ArrayLen, GenericParam, Idl, Repr, ReprKind, Type, TypeDefTy};
+use idl_drift::model::{
+    AccountItem, ArrayLen, EnumFields, GenericParam, Idl, Repr, ReprKind, Seed, Type, TypeDefTy,
+};
 use idl_drift::{coverage, ChangeKind, Severity};
 
 #[test]
@@ -179,6 +181,56 @@ fn legacy_alias_kind_parses_as_a_type_alias() {
                 name: "Inner".into(),
                 generics: vec![]
             }
+        }
+    );
+}
+
+#[test]
+fn legacy_public_key_is_renamed_only_where_a_type_goes() {
+    let idl = parse(
+        r#"{"version":"0.1.0","name":"t","metadata":{"address":"A"},
+            "instructions":[{"name":"go","accounts":[{"name":"publicKey","isMut":false,"isSigner":false,
+                "pda":{"seeds":[{"kind":"const","type":"string","value":"publicKey"}]}}],
+              "args":[{"name":"publicKey","type":"publicKey"},
+                {"name":"k","type":{"option":{"vec":{"array":["publicKey",2]}}}},
+                {"name":"t","type":{"coption":{"tuple":["publicKey",{"hashSet":"publicKey"}]}}}]}],
+            "types":[{"name":"Two","type":{"kind":"enum","variants":[{"name":"A","fields":["publicKey",{"hashMap":["publicKey","u8"]}]}]}},
+                     {"name":"Key","type":{"kind":"alias","value":"publicKey"}}]}"#,
+    );
+    let ix = &idl.instructions[0];
+    let AccountItem::Single(acct) = &ix.accounts[0] else {
+        panic!("expected a single account");
+    };
+    assert_eq!(acct.name, "publicKey");
+    let seeds = acct.pda.as_ref().map(|p| p.seeds.clone());
+    assert_eq!(seeds, Some(vec![Seed::Const(b"publicKey".to_vec())]));
+    assert_eq!(
+        (ix.args[0].name.as_str(), &ix.args[0].ty),
+        ("publicKey", &Type::Pubkey)
+    );
+    let pk = || Box::new(Type::Pubkey);
+    assert_eq!(
+        ix.args[1].ty,
+        Type::Option(Box::new(Type::Vec(Box::new(Type::Array(
+            pk(),
+            ArrayLen::Value(2)
+        )))))
+    );
+    assert_eq!(
+        ix.args[2].ty,
+        Type::COption(Box::new(Type::Tuple(vec![Type::Pubkey, Type::Set(pk())])))
+    );
+    let TypeDefTy::Enum { variants, .. } = &idl.types[0].ty else {
+        panic!("expected an enum");
+    };
+    assert_eq!(
+        variants[0].fields,
+        EnumFields::Tuple(vec![Type::Pubkey, Type::Map(pk(), Box::new(Type::U8))])
+    );
+    assert_eq!(
+        idl.types[1].ty,
+        TypeDefTy::Type {
+            alias: Type::Pubkey
         }
     );
 }

@@ -34,12 +34,63 @@ pub(super) fn common_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
     expand_generic_uses(&mut new_form);
     inline_struct_args(&mut old_form);
     inline_struct_args(&mut new_form);
+    u8_vecs_as_bytes(&mut old_form);
+    u8_vecs_as_bytes(&mut new_form);
     // Anchor IDLs can't describe an event envelope, so there is nothing to compare.
     if old.format != Format::Codama || new.format != Format::Codama {
         clear_envelopes(&mut old_form);
         clear_envelopes(&mut new_form);
     }
     (old_form, new_form)
+}
+
+/// Copies of two IDLs of one format, with `Vec<u8>` as bytes and struct args inlined where
+/// only the nesting differs. Other args keep their names, so a real change names them.
+pub(super) fn same_format_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
+    let (mut old_form, mut new_form) = (old.clone(), new.clone());
+    u8_vecs_as_bytes(&mut old_form);
+    u8_vecs_as_bytes(&mut new_form);
+    let (old_bodies, new_bodies) = (ArgBodies::of(&old_form), ArgBodies::of(&new_form));
+    for ni in &mut new_form.instructions {
+        let Some(oi) = old_form
+            .instructions
+            .iter_mut()
+            .find(|oi| oi.name == ni.name)
+        else {
+            continue;
+        };
+        if arg_shapes(&oi.args) == arg_shapes(&ni.args) {
+            continue;
+        }
+        let (mut old_args, mut new_args) = (oi.args.clone(), ni.args.clone());
+        old_bodies.inline(&mut old_args);
+        new_bodies.inline(&mut new_args);
+        if old_args
+            .iter()
+            .map(|a| &a.ty)
+            .eq(new_args.iter().map(|a| &a.ty))
+        {
+            (oi.args, ni.args) = (old_args, new_args);
+        }
+    }
+    (old_form, new_form)
+}
+
+/// `Vec<u8>` and bytes are the same Borsh bytes, a length and then the bytes. Anchor and Shank
+/// write a Rust `Vec<u8>` as bytes, and codama-rs as a u8 array with a u32 prefix.
+fn u8_vecs_as_bytes(idl: &mut Idl) {
+    fn visit(ty: &mut Type) {
+        if matches!(ty, Type::Vec(item) if **item == Type::U8) {
+            *ty = Type::Bytes;
+        }
+        each_child_mut(ty, &mut visit);
+    }
+    for arg in idl.instructions.iter_mut().flat_map(|ix| &mut ix.args) {
+        visit(&mut arg.ty);
+    }
+    for ty in idl.types.iter_mut().flat_map(|td| body_types(&mut td.ty)) {
+        visit(ty);
+    }
 }
 
 /// The types that a type body holds directly: field, variant payload and alias types.
@@ -88,17 +139,50 @@ fn with_tuple_structs(idl: &Idl) -> Idl {
 /// struct as its fields. Converters inline to different depths: Codama inlines only a type
 /// with one use, and Shipstern flattens only one level.
 fn inline_struct_args(idl: &mut Idl) {
-    let bodies: BTreeMap<String, TypeDefTy> = idl
-        .types
-        .iter()
-        .filter(|td| td.generics.is_empty())
-        .filter(|td| !matches!(td.ty, TypeDefTy::Enum { .. }))
-        .map(|td| (td.name.clone(), td.ty.clone()))
-        .collect();
-    let parts = |arg: &Field| -> Option<Vec<Field>> {
+    let bodies = ArgBodies::of(idl);
+    for ix in &mut idl.instructions {
+        bodies.inline(&mut ix.args);
+    }
+}
+
+/// The bodies of the types that an arg can be inlined to.
+struct ArgBodies(BTreeMap<String, TypeDefTy>);
+
+/// How an arg holds a struct: not at all, inline, or by a link to the named type.
+#[derive(PartialEq)]
+enum ArgShape<'a> {
+    Plain,
+    Inline,
+    Link(&'a str),
+}
+
+fn arg_shapes(args: &[Field]) -> Vec<ArgShape<'_>> {
+    args.iter()
+        .map(|arg| match &arg.ty {
+            Type::Struct(_) => ArgShape::Inline,
+            // A link with no body, such as a dangling one, still matches its name.
+            Type::Defined { name, .. } => ArgShape::Link(name),
+            _ => ArgShape::Plain,
+        })
+        .collect()
+}
+
+impl ArgBodies {
+    fn of(idl: &Idl) -> Self {
+        Self(
+            idl.types
+                .iter()
+                .filter(|td| td.generics.is_empty())
+                .filter(|td| !matches!(td.ty, TypeDefTy::Enum { .. }))
+                .map(|td| (td.name.clone(), td.ty.clone()))
+                .collect(),
+        )
+    }
+
+    fn parts(&self, arg: &Field) -> Option<Vec<Field>> {
         let body = match &arg.ty {
             Type::Struct(fields) => return Some(fields.clone()),
-            Type::Defined { name, generics } if generics.is_empty() => bodies.get(name)?,
+            Type::Defined { name, generics } if generics.is_empty() => self.0.get(name)?,
             _ => return None,
         };
         Some(match body {
@@ -114,10 +198,11 @@ fn inline_struct_args(idl: &mut Idl) {
             }],
             TypeDefTy::Enum { .. } => return None,
         })
-    };
-    for ix in &mut idl.instructions {
+    }
+
+    fn inline(&self, args: &mut Vec<Field>) {
         for _ in 0..MAX_INLINE_DEPTH {
-            let next: Vec<Option<Vec<Field>>> = ix.args.iter().map(parts).collect();
+            let next: Vec<Option<Vec<Field>>> = args.iter().map(|arg| self.parts(arg)).collect();
             if next.iter().all(Option::is_none) {
                 break;
             }
@@ -125,7 +210,7 @@ fn inline_struct_args(idl: &mut Idl) {
             if next_len > MAX_INLINED_ARGS {
                 break;
             }
-            ix.args = std::mem::take(&mut ix.args)
+            *args = std::mem::take(args)
                 .into_iter()
                 .zip(next)
                 .flat_map(|(arg, part)| part.unwrap_or_else(|| vec![arg]))

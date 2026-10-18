@@ -28,12 +28,12 @@ pub use report::{Change, ChangeKind, Report, Severity};
 /// compared in camelCase, so `deposit_vault` and `depositVault` are the same instruction.
 #[must_use]
 pub fn diff(old: &Idl, new: &Idl) -> Report {
-    let mut r = if old.format == new.format {
-        diff_names_as_given(old, new)
+    let (old_form, new_form) = if old.format == new.format {
+        normalize::same_format_form(old, new)
     } else {
-        let (old, new) = normalize::common_form(old, new);
-        diff_names_as_given(&old, &new)
+        normalize::common_form(old, new)
     };
+    let mut r = diff_names_as_given(&old_form, &new_form);
     // On the names as written: the camelCase step above can split names that collide.
     program::report_generated_name_collisions(&new.instructions, &mut r);
     program::diff_program(old, new, &mut r);

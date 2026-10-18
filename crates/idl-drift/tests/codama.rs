@@ -192,6 +192,78 @@ fn codama_root(instructions: &str, accounts: &str, defined_types: &str) -> Strin
     )
 }
 
+#[test]
+fn bytes_and_a_u8_vec_are_the_same_bytes() {
+    // Anchor and Shank write `Vec<u8>` as bytes, codama-rs as a u8 array with a u32 prefix.
+    let bytes = codama_arg(
+        r#"{"kind":"sizePrefixTypeNode","type":{"kind":"bytesTypeNode"},
+        "prefix":{"kind":"numberTypeNode","format":"u32","endian":"le"}}"#,
+        "",
+    );
+    let array = |prefix: &str| {
+        codama_arg(
+            &format!(
+                r#"{{"kind":"arrayTypeNode","item":{{"kind":"numberTypeNode","format":"u8","endian":"le"}},
+                "count":{{"kind":"prefixedCountNode","prefix":{{"kind":"numberTypeNode","format":"{prefix}","endian":"le"}}}}}}"#
+            ),
+            "",
+        )
+    };
+    assert_eq!(kinds(&bytes, &array("u32")), []);
+    assert_eq!(
+        kinds(&bytes, &array("u16")),
+        [(Severity::Breaking, ChangeKind::ArgChanged)]
+    );
+}
+
+#[test]
+fn args_that_nest_a_struct_differently_are_the_same_bytes() {
+    let arg = |name: &str, ty: &str| {
+        format!(r#"{{"kind":"instructionArgumentNode","name":"{name}","type":{ty}}}"#)
+    };
+    let num =
+        |format: &str| format!(r#"{{"kind":"numberTypeNode","format":"{format}","endian":"le"}}"#);
+    let st = |amount: &str, bump: &str| {
+        let field = |name: &str, format: &str| {
+            format!(
+                r#"{{"kind":"structFieldTypeNode","name":"{name}","type":{}}}"#,
+                num(format)
+            )
+        };
+        format!(
+            r#"{{"kind":"structTypeNode","fields":[{},{}]}}"#,
+            field(amount, "u64"),
+            field("bump", bump)
+        )
+    };
+    let flat = codama_args(
+        &format!("{},{}", arg("amount", &num("u64")), arg("bump", &num("u8"))),
+        "",
+    );
+    let inline = |amount: &str| codama_args(&arg("params", &st(amount, "u8")), "");
+    // Codama inlines a type that one instruction uses, and links it once a second use exists.
+    let linked = |bump: &str| {
+        codama_args(
+            &arg(
+                "params",
+                r#"{"kind":"definedTypeLinkNode","name":"depositParams"}"#,
+            ),
+            &format!(
+                r#"{{"kind":"definedTypeNode","name":"depositParams","type":{}}}"#,
+                st("amount", bump)
+            ),
+        )
+    };
+    assert_eq!(kinds(&flat, &linked("u8")), []);
+    assert_eq!(kinds(&inline("amount"), &linked("u8")), []);
+    assert_eq!(
+        kinds(&flat, &inline("amt")),
+        [(Severity::Dangerous, ChangeKind::ArgRenamed)]
+    );
+    // A real layout change keeps the args as written.
+    assert_eq!(max_sev(&flat, &linked("u16")), Some(Severity::Breaking));
+}
+
 /// A Codama program with one defined type `ext` passed as an instruction arg.
 fn codama_defined_arg(ext: &str) -> String {
     codama_arg(

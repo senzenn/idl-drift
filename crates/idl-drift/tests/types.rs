@@ -151,6 +151,27 @@ fn generic_arg_change_is_breaking() {
 }
 
 #[test]
+fn a_type_that_only_the_new_idl_reaches_is_not_breaking() {
+    // No old parser reads `Leg`, so its change cannot break one. The new event is Additive.
+    let idl = |qty: &str, event: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"1","spec":"0.1.0"}},
+  "events":[{event}],
+  "types":[{{"name":"Leg","type":{{"kind":"struct","fields":[{{"name":"qty","type":"{qty}"}}]}}}},
+    {{"name":"Swapped","type":{{"kind":"struct","fields":[{{"name":"leg","type":{{"defined":{{"name":"Leg"}}}}}}]}}}}]}}"#
+        )
+    };
+    let event = r#"{"name":"Swapped","discriminator":[9,9,9,9,9,9,9,9]}"#;
+    assert_eq!(
+        kinds(&idl("u32", ""), &idl("u64", event)),
+        [
+            (Severity::Additive, ChangeKind::EventAdded),
+            (Severity::Cosmetic, ChangeKind::FieldChanged)
+        ]
+    );
+}
+
+#[test]
 fn generic_params_bind_by_position() {
     let idl = |params: &str, a: &str, b: &str| {
         format!(
