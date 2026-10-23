@@ -443,10 +443,11 @@ places, the *legs*:
 with. Each other leg is compared with it. When a program has no `declare_id!`, its IDL
 address must match one of its Anchor.toml ids. Program names match in `snake_case`, so the
 Codama name `orderEngine` and the key `order-engine` are the crate `order_engine`. The crates
-`a_mm` and `am_m` stay two programs. Only a `declare_id!` at the crate root of `lib.rs`
-counts. One in a
-comment, a string or a module (such as `mod jupiter { declare_id!(..) }` for a CPI target)
-does not count.
+`a_mm` and `am_m` stay two programs. A `declare_id!` counts when it sets the crate's `ID`:
+at the crate root of `lib.rs`, in a macro block such as `cfg_if! { .. }`, or in a module that
+the crate root re-exports with `pub use <module>::*` or `pub use <module>::ID`. One in a
+comment, a string, a function or another module (such as `mod jupiter { declare_id!(..) }`
+for a CPI target) does not count.
 
 `source` reads only the program id from the source code. It does not build or parse the
 program. A missing file is not an error, because a CI job often has only some of the
