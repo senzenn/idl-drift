@@ -163,18 +163,22 @@ impl std::error::Error for SourceError {
     }
 }
 
-/// The string of each `declare_id!("...")` at the crate root of `rust`, in order. Comments
-/// and string literals are skipped, so an old id in a comment does not count. A
-/// `declare_id!` in a module, such as `mod jupiter { declare_id!(..) }`, names a CPI target.
+/// The string of each `declare_id!("...")` that sets the crate's `ID`, in order. That is one
+/// at the crate root, in a macro block such as `cfg_if! { .. }`, or in a module that the root
+/// re-exports with `pub use <module>::*` or `pub use <module>::ID`. Comments and strings are
+/// skipped. Another module, such as `mod jupiter { declare_id!(..) }`, names a CPI target.
 fn declare_ids(rust: &str) -> Vec<String> {
     let tokens = rust_tokens(rust);
-    let mut depth = 0usize;
+    let exported = root_reexports(&tokens);
+    let mut blocks: Vec<Block> = Vec::new();
     let mut ids = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
         match token {
-            Token::Punct(b'{') => depth += 1,
-            Token::Punct(b'}') => depth = depth.saturating_sub(1),
-            Token::Ident("declare_id") if depth == 0 => {
+            Token::Punct(b'{') => blocks.push(Block::of(&tokens[..i], blocks.last(), &exported)),
+            Token::Punct(b'}') => {
+                blocks.pop();
+            }
+            Token::Ident("declare_id") if blocks.iter().all(|b| *b != Block::Other) => {
                 if let [Token::Punct(b'!'), Token::Punct(b'(' | b'[' | b'{'), Token::Str(id), ..] =
                     &tokens[i + 1..]
                 {
@@ -185,6 +189,57 @@ fn declare_ids(rust: &str) -> Vec<String> {
         }
     }
     ids
+}
+
+/// What a `{` block is, for the crate root: a macro body and a re-exported module keep a
+/// `declare_id!` at the root, and any other block does not.
+#[derive(Debug, PartialEq)]
+enum Block {
+    Macro,
+    ExportedModule,
+    Other,
+}
+
+impl Block {
+    /// The kind of the block that opens after `before`, inside `parent`.
+    fn of(before: &[Token<'_>], parent: Option<&Block>, exported: &BTreeSet<&str>) -> Self {
+        // `cfg_if!` writes its branches as blocks inside the macro body.
+        if parent == Some(&Self::Macro) {
+            return Self::Macro;
+        }
+        match before {
+            [.., Token::Ident(_), Token::Punct(b'!')] => Self::Macro,
+            [.., Token::Ident("mod"), Token::Ident(name)] if exported.contains(name) => {
+                Self::ExportedModule
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The modules that a crate-root `use` re-exports as `<module>::*` or `<module>::ID`.
+fn root_reexports<'a>(tokens: &[Token<'a>]) -> BTreeSet<&'a str> {
+    let mut exported = BTreeSet::new();
+    let mut depth = 0usize;
+    let mut statement: Option<usize> = None;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Punct(b'{') => depth += 1,
+            Token::Punct(b'}') => depth = depth.saturating_sub(1),
+            Token::Ident("use") if depth == 0 => statement = Some(i),
+            Token::Punct(b';') if depth == 0 => {
+                if let Some(start) = statement.take() {
+                    if let [.., Token::Ident(name), Token::Punct(b':'), Token::Punct(b':'), Token::Punct(b'*') | Token::Ident("ID")] =
+                        &tokens[start..i]
+                    {
+                        exported.insert(*name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    exported
 }
 
 /// The `(cluster, program, id)` entries of the `[programs.<cluster>]` tables of an
@@ -1129,6 +1184,25 @@ mod jupiter {{ use anchor_lang::declare_id; declare_id!("Cpi111"); }}
 "#
         );
         assert_eq!(declare_ids(&src), [ID]);
+    }
+
+    #[test]
+    fn declare_ids_in_a_macro_block_or_a_re_exported_module_count() {
+        // Both are the program's own id: `cfg_if!` picks one, and `pub use` puts it at the root.
+        let cfg_if = r#"cfg_if::cfg_if! { if #[cfg(feature = "devnet")] { declare_id!("Dev111"); }
+            else { declare_id!("Main111"); } }"#;
+        assert_eq!(declare_ids(cfg_if), ["Dev111", "Main111"]);
+        let module = r#"mod program_id { use super::*; declare_id!("Mod111"); }
+            pub use program_id::*;"#;
+        assert_eq!(declare_ids(module), ["Mod111"]);
+        let by_id = r#"pub mod ids { declare_id!("Id111"); }
+            pub use ids::ID;"#;
+        assert_eq!(declare_ids(by_id), ["Id111"]);
+        // A module that the root does not re-export names another program, and a function
+        // body is not the crate root.
+        let other = r#"mod jupiter { declare_id!("Cpi111"); } pub use jupiter::Swap;
+            fn f() { declare_id!("Fn111"); }"#;
+        assert_eq!(declare_ids(other), Vec::<String>::new());
     }
 
     #[test]
