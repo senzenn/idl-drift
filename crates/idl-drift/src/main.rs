@@ -10,6 +10,7 @@ use idl_drift::markdown::{escape, escape_control};
 use idl_drift::model::Idl;
 use idl_drift::onchain::{self, OnchainIdl, Source};
 use idl_drift::shipstern;
+use idl_drift::source::{self, Finding, Leg, ProgramId, SourceReport};
 use idl_drift::{
     coverage, diff, layouts, Change, ChangeKind, CoverageReport, Report, Severity, TypeLayout,
 };
@@ -20,11 +21,13 @@ use serde::Serialize;
 #[derive(Parser)]
 #[command(name = "idl-drift", version, about)]
 #[command(after_help = "Exit codes:
-  0  diff: no change at or above --fail-on; inspect: every field resolved
-  1  diff: at least one change at or above --fail-on; inspect: unmapped fields, an undefined type,
-     or a padded zero-copy type that Borsh also reads
+  0  diff: no change at or above --fail-on; source: no finding at or above --fail-on;
+     inspect: every field resolved
+  1  diff: at least one change at or above --fail-on; source: at least one finding at or
+     above --fail-on; inspect: unmapped fields, an undefined type, or a padded zero-copy
+     type that Borsh also reads
   2  idl-drift could not run: a file could not be read or parsed, an option is
-     wrong, or the on-chain IDL could not be fetched or read")]
+     wrong, or the on-chain IDL or program account could not be fetched or read")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -43,6 +46,9 @@ enum Cmd {
         #[arg(long)]
         layout: bool,
     },
+    /// Check that an Anchor workspace gives one program id in `declare_id!`, Anchor.toml,
+    /// target/idl and, with --onchain, on chain.
+    Source(SourceCheckArgs),
 }
 
 #[derive(Args)]
@@ -83,7 +89,40 @@ struct DiffArgs {
     allow: Option<PathBuf>,
 }
 
-/// How `diff` prints its report.
+#[derive(Args)]
+struct SourceCheckArgs {
+    /// The Anchor workspace: the directory that holds Anchor.toml.
+    #[arg(default_value = ".")]
+    root: PathBuf,
+    /// One more IDL to check, such as a published copy outside target/idl. Repeat it for
+    /// more IDLs.
+    #[arg(long, value_name = "PATH")]
+    idl: Vec<PathBuf>,
+    /// Also check that a program is deployed at each `declare_id!`, and that the IDL it
+    /// publishes on chain gives the same address.
+    #[arg(long)]
+    onchain: bool,
+    /// JSON-RPC URL for --onchain. Prefer the env var: `ps` and shell history show a URL
+    /// given on the command line.
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "IDL_DRIFT_RPC_URL",
+        hide_env_values = true
+    )]
+    rpc: Option<String>,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Print the report as GitHub Markdown, for a job summary or a pull request comment.
+    #[arg(long, conflicts_with = "json")]
+    markdown: bool,
+    /// Lowest tier that sets exit code 1.
+    #[arg(long, value_enum, default_value_t = Tier::Breaking)]
+    fail_on: Tier,
+}
+
+/// How `diff` and `source` print their report.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Human,
@@ -151,20 +190,23 @@ fn main() -> ExitCode {
         }
     };
     let format = match &cli.cmd {
-        Cmd::Diff(DiffArgs { json: true, .. }) => Format::Json,
-        Cmd::Diff(DiffArgs { markdown: true, .. }) => Format::Markdown,
+        Cmd::Diff(DiffArgs { json: true, .. })
+        | Cmd::Source(SourceCheckArgs { json: true, .. }) => Format::Json,
+        Cmd::Diff(DiffArgs { markdown: true, .. })
+        | Cmd::Source(SourceCheckArgs { markdown: true, .. }) => Format::Markdown,
         _ => Format::Human,
     };
+    // A shell can keep the env var set for runs off chain, so only the flag needs --onchain.
+    let rpc_flag = |cmd: &str| {
+        matches
+            .subcommand_matches(cmd)
+            .and_then(|m| m.value_source("rpc"))
+            == Some(ValueSource::CommandLine)
+    };
     let result = match cli.cmd {
-        Cmd::Diff(args) => {
-            // A shell can keep the env var set for file diffs, so only the flag needs --onchain.
-            let rpc_flag = matches
-                .subcommand_matches("diff")
-                .and_then(|m| m.value_source("rpc"))
-                == Some(ValueSource::CommandLine);
-            run_diff(&args, rpc_flag, format)
-        }
+        Cmd::Diff(args) => run_diff(&args, rpc_flag("diff"), format),
         Cmd::Inspect { idl, layout } => run_inspect(&idl, layout),
+        Cmd::Source(args) => run_source(&args, rpc_flag("source"), format),
     };
     match result {
         Ok(code) => ExitCode::from(code),
@@ -189,7 +231,7 @@ enum Failure {
     Input(String),
     /// An option is wrong.
     Usage(String),
-    /// The on-chain IDL could not be fetched or read.
+    /// The on-chain IDL or program account could not be fetched or read.
     Onchain(onchain::Error),
     Write(io::Error),
 }
@@ -252,11 +294,7 @@ fn load_allow(path: &Path) -> Result<AllowList<ChangeKind>, Failure> {
 }
 
 fn run_diff(args: &DiffArgs, rpc_flag: bool, format: Format) -> Result<u8, Failure> {
-    if rpc_flag && !args.onchain {
-        return Err(Failure::Usage(
-            "--rpc is the URL that --onchain reads from; add --onchain or drop --rpc".into(),
-        ));
-    }
+    rpc_needs_onchain(rpc_flag, args.onchain)?;
     // Before any RPC request, so that a typo in the allow file costs nothing.
     let allow = args.allow.as_deref().map(load_allow).transpose()?;
     let (mut report, onchain) = if args.onchain {
@@ -298,17 +336,32 @@ fn run_diff(args: &DiffArgs, rpc_flag: bool, format: Format) -> Result<u8, Failu
     Ok(code)
 }
 
-fn fetch_onchain(
-    program: &str,
-    rpc: Option<&str>,
-    source: Option<Source>,
-) -> Result<OnchainIdl, Failure> {
+fn rpc_needs_onchain(rpc_flag: bool, onchain: bool) -> Result<(), Failure> {
+    if rpc_flag && !onchain {
+        return Err(Failure::Usage(
+            "--rpc is the URL that --onchain reads from; add --onchain or drop --rpc".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The URL for --onchain, from --rpc or `IDL_DRIFT_RPC_URL`.
+fn rpc_url(rpc: Option<&str>) -> Result<&str, Failure> {
     let url = rpc.unwrap_or_default().trim();
     if url.is_empty() {
         return Err(Failure::Usage(
             "--onchain needs an RPC URL; set IDL_DRIFT_RPC_URL or --rpc".into(),
         ));
     }
+    Ok(url)
+}
+
+fn fetch_onchain(
+    program: &str,
+    rpc: Option<&str>,
+    source: Option<Source>,
+) -> Result<OnchainIdl, Failure> {
+    let url = rpc_url(rpc)?;
     let agent = idl_drift::rpc::agent();
     let call = |method: &str, params: serde_json::Value| {
         idl_drift::rpc::call(&agent, url, method, &params).map_err(onchain::Error::Rpc)
@@ -455,14 +508,16 @@ const TIERS: [(Severity, &str, &str); 4] = [
     (Severity::Cosmetic, "COSMETIC", "Cosmetic"),
 ];
 
-/// The changes in report order: by tier, Breaking first.
-fn by_tier(report: &Report) -> impl Iterator<Item = (&Change, &'static str, &'static str)> {
-    TIERS.into_iter().flat_map(move |(severity, tag, title)| {
-        report
-            .changes
+/// Changes or findings in report order: by tier, Breaking first.
+fn by_tier<T>(
+    items: &[T],
+    severity: fn(&T) -> Severity,
+) -> impl Iterator<Item = (&T, &'static str, &'static str)> {
+    TIERS.into_iter().flat_map(move |(tier, tag, title)| {
+        items
             .iter()
-            .filter(move |c| c.severity == severity)
-            .map(move |c| (c, tag, title))
+            .filter(move |i| severity(i) == tier)
+            .map(move |i| (i, tag, title))
     })
 }
 
@@ -477,7 +532,7 @@ fn print_human(report: &Report, view: &View) -> io::Result<()> {
             escape_control(&o.account)
         )?;
     }
-    for (change, tag, _) in by_tier(report) {
+    for (change, tag, _) in by_tier(&report.changes, |c| c.severity) {
         let allowed = if change.allowed { "[ALLOWED] " } else { "" };
         writeln!(
             out,
@@ -531,29 +586,17 @@ fn print_markdown(report: &Report, view: &View) -> io::Result<()> {
             escape(view.new)
         )?;
     }
-    let (b, d, a, c) = report.counts();
     let allowed = report.changes.iter().filter(|c| c.allowed).count();
-    writeln!(out, "| Tier | Changes |\n|---|---:|")?;
-    for ((_, _, title), n) in TIERS.iter().zip([b, d, a, c]) {
-        writeln!(out, "| {title} | {n} |")?;
-    }
+    write_counts(&mut out, "Changes", report.counts())?;
     if allowed > 0 {
         writeln!(out, "| Allowed | {allowed} |")?;
     }
-    let fail_on = json_name(&view.fail_on);
-    let result = if view.exit_code == 0 {
-        "no change"
-    } else {
-        "at least one change"
-    };
-    writeln!(
-        out,
-        "\nExit code {}: {result} at or above `{fail_on}`.",
-        view.exit_code
-    )?;
+    write_exit_line(&mut out, "change", view.fail_on, view.exit_code)?;
+    let changes = || by_tier(&report.changes, |c| c.severity);
     if report.changes.len() > allowed {
         writeln!(out)?;
-        write_change_table(&mut out, by_tier(report).filter(|(c, _, _)| !c.allowed))?;
+        let rows = changes().filter(|(c, _, _)| !c.allowed).map(change_row);
+        write_table(&mut out, rows)?;
     }
     if allowed > 0 {
         let noun = if allowed == 1 { "change" } else { "changes" };
@@ -561,7 +604,10 @@ fn print_markdown(report: &Report, view: &View) -> io::Result<()> {
             out,
             "\n<details>\n<summary>{allowed} allowed {noun}</summary>\n"
         )?;
-        write_change_table(&mut out, by_tier(report).filter(|(c, _, _)| c.allowed))?;
+        write_table(
+            &mut out,
+            changes().filter(|(c, _, _)| c.allowed).map(change_row),
+        )?;
         writeln!(out, "\n</details>")?;
     }
     if let Some(unused) = view.unused.filter(|u| !u.is_empty()) {
@@ -573,21 +619,51 @@ fn print_markdown(report: &Report, view: &View) -> io::Result<()> {
     Ok(())
 }
 
-fn write_change_table<'a>(
+/// The number of changes or findings in each tier, as a Markdown table.
+fn write_counts(
     out: &mut impl Write,
-    changes: impl Iterator<Item = (&'a Change, &'static str, &'static str)>,
+    noun: &str,
+    (b, d, a, c): (usize, usize, usize, usize),
 ) -> io::Result<()> {
+    writeln!(out, "| Tier | {noun} |\n|---|---:|")?;
+    for ((_, _, title), n) in TIERS.iter().zip([b, d, a, c]) {
+        writeln!(out, "| {title} | {n} |")?;
+    }
+    Ok(())
+}
+
+fn write_exit_line(
+    out: &mut impl Write,
+    noun: &str,
+    fail_on: Severity,
+    exit_code: u8,
+) -> io::Result<()> {
+    let result = if exit_code == 0 { "no" } else { "at least one" };
+    writeln!(
+        out,
+        "\nExit code {exit_code}: {result} {noun} at or above `{}`.",
+        json_name(&fail_on)
+    )
+}
+
+/// One row of a Markdown table of changes or findings: tier, rule, subject and message.
+type Row<'a> = (&'static str, String, &'a str, &'a str);
+
+fn change_row<'a>((c, _, title): (&'a Change, &str, &'static str)) -> Row<'a> {
+    (title, json_name(&c.kind), &c.subject, &c.message)
+}
+
+fn write_table<'a>(out: &mut impl Write, rows: impl Iterator<Item = Row<'a>>) -> io::Result<()> {
     writeln!(
         out,
         "| Tier | Rule | Subject | Message |\n|---|---|---|---|"
     )?;
-    for (c, _, title) in changes {
+    for (title, rule, subject, message) in rows {
         writeln!(
             out,
-            "| {title} | `{}` | {} | {} |",
-            json_name(&c.kind),
-            escape(&c.subject),
-            escape(&c.message)
+            "| {title} | `{rule}` | {} | {} |",
+            escape(subject),
+            escape(message)
         )?;
     }
     Ok(())
@@ -625,6 +701,17 @@ struct JsonCounts {
     cosmetic: usize,
 }
 
+impl From<(usize, usize, usize, usize)> for JsonCounts {
+    fn from((breaking, dangerous, additive, cosmetic): (usize, usize, usize, usize)) -> Self {
+        Self {
+            breaking,
+            dangerous,
+            additive,
+            cosmetic,
+        }
+    }
+}
+
 fn print_json(report: &Report, view: &View) -> io::Result<()> {
     // Allowed changes stay in `changes` only, so that the tier lists agree with `counts`.
     let messages = |severity| {
@@ -635,7 +722,6 @@ fn print_json(report: &Report, view: &View) -> io::Result<()> {
             .map(|c| c.message.as_str())
             .collect()
     };
-    let (breaking, dangerous, additive, cosmetic) = report.counts();
     let json = JsonReport {
         onchain: view.onchain.map(|o| JsonOnchain {
             source: o.source.key(),
@@ -646,14 +732,171 @@ fn print_json(report: &Report, view: &View) -> io::Result<()> {
         dangerous: messages(Severity::Dangerous),
         additive: messages(Severity::Additive),
         cosmetic: messages(Severity::Cosmetic),
-        counts: JsonCounts {
-            breaking,
-            dangerous,
-            additive,
-            cosmetic,
-        },
+        counts: report.counts().into(),
         unused_allows: view.unused,
         exit_code: view.exit_code,
+    };
+    let text = serde_json::to_string_pretty(&json).map_err(io::Error::other)?;
+    writeln!(io::stdout().lock(), "{text}")
+}
+
+fn run_source(args: &SourceCheckArgs, rpc_flag: bool, format: Format) -> Result<u8, Failure> {
+    rpc_needs_onchain(rpc_flag, args.onchain)?;
+    // Before the scan, so that a missing URL costs nothing.
+    let url = args
+        .onchain
+        .then(|| rpc_url(args.rpc.as_deref()))
+        .transpose()?;
+    let root = &args.root;
+    if !root.is_dir() {
+        return Err(Failure::Input(format!(
+            "{} is not a directory",
+            root.display()
+        )));
+    }
+    let input = |e: source::SourceError| Failure::Input(e.to_string());
+    let mut ids = source::discover(root).map_err(input)?;
+    for path in &args.idl {
+        ids.push(source::read_idl(path).map_err(input)?);
+    }
+    // A wrong ROOT, or files that give no id, has nothing to compare. An exit 0 would pass it.
+    if ids.iter().all(|i| i.id.is_empty()) {
+        return Err(Failure::Input(format!(
+            "no program id under {}: no [programs.<cluster>] entry, root-level declare_id! or IDL address",
+            root.display()
+        )));
+    }
+    let mut report = source::check(ids);
+    if let Some(url) = url {
+        let agent = idl_drift::rpc::agent();
+        source::check_onchain(&mut report, |m, p| {
+            idl_drift::rpc::call(&agent, url, m, &p).map_err(onchain::Error::Rpc)
+        })
+        .map_err(Failure::Onchain)?;
+    }
+    // A finding, such as an invalid id, is a result. Only a run that found nothing stops.
+    if !report.compared() && report.findings.is_empty() {
+        return Err(Failure::Input(format!(
+            "nothing to compare under {}: no program has its id in two places",
+            root.display()
+        )));
+    }
+    let fail_on = args.fail_on.into();
+    let code = u8::from(report.fails_at(fail_on));
+    let root = root.to_string_lossy();
+    written(match format {
+        Format::Human => print_source_human(&report, code),
+        Format::Json => print_source_json(&report, &root, code),
+        Format::Markdown => print_source_markdown(&report, &root, fail_on, code),
+    })?;
+    Ok(code)
+}
+
+/// Where the report read an id.
+fn leg_text(leg: &Leg) -> String {
+    match leg {
+        Leg::DeclareId { path } => format!("declare_id! in {path}"),
+        Leg::AnchorToml { path, cluster } => format!("[programs.{cluster}] in {path}"),
+        Leg::IdlAddress { path } => format!("address in {path}"),
+        Leg::Onchain { source, account } => {
+            format!("address in the on-chain IDL ({source} account {account})")
+        }
+    }
+}
+
+/// An empty id is a file that holds none, such as a `lib.rs` with no `declare_id!`.
+fn id_text(id: &str) -> &str {
+    if id.is_empty() {
+        "(none)"
+    } else {
+        id
+    }
+}
+
+fn print_source_human(report: &SourceReport, exit_code: u8) -> io::Result<()> {
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut out = io::stdout().lock();
+    for id in &report.ids {
+        writeln!(
+            out,
+            "{}  {}  {}",
+            escape_control(&id.program),
+            escape_control(&leg_text(&id.leg)),
+            escape_control(id_text(&id.id))
+        )?;
+    }
+    for (finding, tag, _) in by_tier(&report.findings, |f| f.severity) {
+        writeln!(
+            out,
+            "  [{}] {}: {}",
+            paint(tag, finding.severity, color),
+            escape_control(&finding.subject),
+            escape_control(&finding.message)
+        )?;
+    }
+    let (b, d, a, c) = report.counts();
+    writeln!(
+        out,
+        "summary: {b} breaking, {d} dangerous, {a} additive, {c} cosmetic"
+    )?;
+    writeln!(out, "exit code: {exit_code}")
+}
+
+/// GitHub Markdown: a heading, the counts per tier, the exit code, a table of the ids, and a
+/// table of the findings.
+fn print_source_markdown(
+    report: &SourceReport,
+    root: &str,
+    fail_on: Severity,
+    exit_code: u8,
+) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "### idl-drift source: {}\n", escape(root))?;
+    write_counts(&mut out, "Findings", report.counts())?;
+    write_exit_line(&mut out, "finding", fail_on, exit_code)?;
+    writeln!(out, "\n| Program | Place | Program id |\n|---|---|---|")?;
+    for id in &report.ids {
+        writeln!(
+            out,
+            "| {} | {} | {} |",
+            escape(&id.program),
+            escape(&leg_text(&id.leg)),
+            escape(id_text(&id.id))
+        )?;
+    }
+    if !report.findings.is_empty() {
+        writeln!(out)?;
+        let rows = by_tier(&report.findings, |f| f.severity).map(|(f, _, title)| {
+            (
+                title,
+                json_name(&f.kind),
+                f.subject.as_str(),
+                f.message.as_str(),
+            )
+        });
+        write_table(&mut out, rows)?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct JsonSource<'a> {
+    /// ROOT as given.
+    root: &'a str,
+    /// Each program id read, with its place (`leg`).
+    ids: &'a [ProgramId],
+    findings: &'a [Finding],
+    counts: JsonCounts,
+    exit_code: u8,
+}
+
+fn print_source_json(report: &SourceReport, root: &str, exit_code: u8) -> io::Result<()> {
+    let json = JsonSource {
+        root,
+        ids: &report.ids,
+        findings: &report.findings,
+        counts: report.counts().into(),
+        exit_code,
     };
     let text = serde_json::to_string_pretty(&json).map_err(io::Error::other)?;
     writeln!(io::stdout().lock(), "{text}")

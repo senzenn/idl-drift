@@ -1,8 +1,8 @@
 # CI with GitHub Actions
 
 This repository is also a GitHub Action. In one step, it installs the tool and runs
-`idl-drift diff` or `idl-verify`. It writes a Markdown report to the job summary and a JSON
-report to a file, and it fails the step on drift.
+`idl-drift diff`, `idl-drift source` or `idl-verify`. It writes a Markdown report to the job
+summary and a JSON report to a file, and it fails the step on drift.
 
 ```mermaid
 flowchart LR
@@ -39,13 +39,13 @@ The smallest step diffs an IDL with the same file on the base branch of the pull
 
 | Input | Default | Meaning |
 |---|---|---|
-| `command` | `diff` | `diff` runs `idl-drift diff`. `verify` runs `idl-verify`. |
-| `idl` | none | Path of the new IDL. Required. |
+| `command` | `diff` | `diff` runs `idl-drift diff`. `verify` runs `idl-verify`. `source` runs `idl-drift source` on the workspace: see [source](idl-drift.md#source). Give the workspace directory in `args` when it is not the current directory. |
+| `idl` | none | Path of the new IDL. Required for `diff` and `verify`. `source`: one more IDL to check (`--idl`). The path must resolve to a file in the workspace, also through a symlink. |
 | `old` | the base branch | `diff`: path of the old IDL. By default, the action reads the file at the same path on the base branch of the pull request with `git show`. When the base branch has no such file, the step passes with a notice. On other events, set `old` or `program`. |
 | `program` | none | `diff`: compare with the IDL that this program publishes on chain (`--onchain`), in place of `old`. `verify`: the program to sample (`--program`). |
-| `rpc-url` | none | The JSON-RPC URL for `program` with `diff`, and for `verify`. See [RPC URL](#rpc-url). |
-| `fail-on` | `breaking`, `error` | The lowest tier (`diff`) or severity (`verify`) that fails the step. |
-| `allow` | none | Path of an allow file: see [idl-drift](idl-drift.md#allow-file) and [idl-verify](idl-verify.md#allow-file). |
+| `rpc-url` | none | The JSON-RPC URL for `program` with `diff`, and for `verify`. With `source`, it turns on `--onchain`. See [RPC URL](#rpc-url). |
+| `fail-on` | `breaking`, `error` | The lowest tier (`diff` and `source`) or severity (`verify`) that fails the step. |
+| `allow` | none | Path of an allow file: see [idl-drift](idl-drift.md#allow-file) and [idl-verify](idl-verify.md#allow-file). `source` takes no allow input. The path must resolve to a file in the workspace. |
 | `args` | none | More options, separated by spaces, such as `--min-coverage 50` or `--decoder target/release/verify-decoder`. The action does not expand quotes, globs or variables in them. |
 | `version` | the action's ref | The idl-drift tag or commit SHA to install. |
 
@@ -82,6 +82,7 @@ that commit, so that the action downloads the release binary:
 |---|---|---|
 | Passes | Exit 0: no change or finding at or above `fail-on`, other than allowed ones. The report can still list smaller changes, warnings and notes. | Nothing. |
 | `IDL drift` | Exit 1. `diff`: at least one change at or above `fail-on`. `verify`: at least one error, such as an unknown discriminator, bytes that the IDL does not read, or values that differ between your parser and the IDL. | Read the job summary. The rules are in [idl-drift.md](idl-drift.md#tiers), the checks in [idl-verify.md](idl-verify.md#checks). To accept a change, add it to the allow file. |
+| `Program id drift` | Exit 1. `source`: at least one finding at or above `fail-on`, for example an `Anchor.toml` or IDL id that is not the `declare_id!`. | Read the job summary. The findings are in [idl-drift.md](idl-drift.md#findings). `source` has no allow file. |
 | `idl-drift could not run`, `idl-verify could not run` | Exit 2. A file could not be read, an input is wrong, the RPC failed or rate-limited after 5 attempts, the decoder did not start, or nothing of the program was sampled. | This is not a finding about the IDL. Fix the setup, or run the workflow again. |
 | Timeout | The RPC is too slow for `--max-tx`. | Run again, or lower the sampling limits in `args`. |
 

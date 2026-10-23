@@ -26,12 +26,13 @@ cargo run -p idl-verify -- --idl IDL --samples SAMPLES
 
 | Path | Content |
 |---|---|
-| `crates/idl-drift/` | The `idl-drift` crate: IDL model, layouts, diff rules, `inspect`, CLI. |
+| `crates/idl-drift/` | The `idl-drift` crate: IDL model, layouts, diff rules, `inspect`, the program-id check of `source` (`src/source.rs`), CLI. |
 | `crates/idl-verify/` | The `idl-verify` crate: samples, live sampling, runtime decoder, checks, report, CLI. |
 | `fixtures/manual/` | Small old and new IDL pairs, one for each diff rule, and malformed files. |
 | `fixtures/real/` | Real on-chain Anchor IDLs. |
 | `fixtures/shipstern/` | Codama IDLs from Shipstern's integration tests. |
 | `fixtures/live/` | Captured mainnet samples with their IDLs, for `idl-verify`. |
+| `fixtures/source/` | Small Anchor workspaces for `idl-drift source`. |
 | `integration/scenarios/` | End-to-end diff scenarios. Each has a `NOTES.md`. |
 | `integration/run-all.sh` | Runs each scenario, manual pair and fixture through both CLIs, and checks the exit codes. |
 | `tools/reference/` | Reference decoder (`@coral-xyz/anchor`) for `idl-verify --reference`. |

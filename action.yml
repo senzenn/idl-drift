@@ -1,13 +1,13 @@
 name: idl-drift
-description: Diff a Solana program IDL with its old version, or check it against real data, and fail the job on drift.
+description: Diff a Solana program IDL with its old version, check it against real data, or check the program id of an Anchor workspace, and fail the job on drift.
 
 inputs:
   command:
-    description: "`diff` compares the IDL with its old version (idl-drift). `verify` checks the IDL against real data (idl-verify)."
+    description: "`diff` compares the IDL with its old version (idl-drift). `source` checks that the Anchor workspace gives one program id (idl-drift source; give the workspace directory in `args` when it is not the current directory). `verify` checks the IDL against real data (idl-verify)."
     default: diff
   idl:
-    description: Path of the new IDL.
-    required: true
+    description: "diff and verify: path of the new IDL. Required for them. source: one more IDL to check, such as a published copy outside target/idl."
+    default: ""
   old:
     description: "diff: path of the old IDL. Default: the file at the same path on the base branch of the pull request."
     default: ""
@@ -15,13 +15,13 @@ inputs:
     description: "diff: compare with the IDL that this program publishes on chain, in place of `old`. verify: the program to sample. Default: the IDL's address."
     default: ""
   rpc-url:
-    description: "JSON-RPC URL for `program` with diff, and for live sampling with verify. Give a secret. The action masks it and gives it to the tool only in an environment variable."
+    description: "JSON-RPC URL for `program` with diff, for live sampling with verify, and for the chain check (`--onchain`) with source. Give a secret. The action masks it and gives it to the tool only in an environment variable."
     default: ""
   fail-on:
-    description: "The lowest tier (diff: breaking, dangerous, additive, cosmetic) or severity (verify: error, warning) that fails the step. Default: breaking for diff, error for verify."
+    description: "The lowest tier (diff and source: breaking, dangerous, additive, cosmetic) or severity (verify: error, warning) that fails the step. Default: breaking for diff and source, error for verify."
     default: ""
   allow:
-    description: Path of an allow file. Its changes or findings stay in the report as allowed, and do not fail the step.
+    description: "diff and verify: path of an allow file. Its changes or findings stay in the report as allowed, and do not fail the step. source takes no allow file."
     default: ""
   args:
     description: "More options for the tool, separated by spaces, such as `--min-coverage 50`. The action does not expand quotes, globs or variables in them."

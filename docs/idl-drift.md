@@ -1,7 +1,8 @@
 # idl-drift reference
 
 `idl-drift` compares two versions of a Solana program IDL. It puts each change in a tier,
-by its effect on a parser that was generated from the old IDL.
+by its effect on a parser that was generated from the old IDL. `idl-drift source` checks
+the program id of an Anchor workspace.
 
 ## Commands
 
@@ -9,18 +10,21 @@ by its effect on a parser that was generated from the old IDL.
 idl-drift diff [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <OLD> <NEW>
 idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <PROGRAM> <NEW>
 idl-drift inspect [--layout] <IDL>
+idl-drift source [--idl <PATH>]... [--onchain [--rpc <URL>]] [--json | --markdown] [--fail-on <TIER>] [<ROOT>]
 ```
 
 | Option | Command | Meaning |
 |---|---|---|
-| `--json` | `diff` | Print the report as JSON. See [JSON output](#json-output). |
-| `--markdown` | `diff` | Print the report as GitHub Markdown. It cannot be combined with `--json`. See [Markdown output](#markdown-output). |
-| `--fail-on <TIER>` | `diff` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
+| `--json` | `diff`, `source` | Print the report as JSON. See [JSON output](#json-output). |
+| `--markdown` | `diff`, `source` | Print the report as GitHub Markdown. It cannot be combined with `--json`. See [Markdown output](#markdown-output). |
+| `--fail-on <TIER>` | `diff`, `source` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
 | `--allow <FILE>` | `diff` | Changes that you accept. They do not set exit code 1. See [Allow file](#allow-file). |
 | `--onchain` | `diff` | Read the first argument as a program id, and use the IDL that the program publishes on chain as the old IDL. See [On-chain IDL](#on-chain-idl). |
-| `--rpc <URL>` | `diff` | The JSON-RPC URL for `--onchain`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
+| `--onchain` | `source` | Also check the chain. See [Chain check](#chain-check). |
+| `--rpc <URL>` | `diff`, `source` | The JSON-RPC URL for `--onchain`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
 | `--source <SOURCE>` | `diff` | With `--onchain`, the account to read: `metadata` (the Program Metadata program) or `anchor` (the Anchor IDL account). |
 | `--layout` | `inspect` | Also print each zero-copy type field by field, with its gaps and both sizes. |
+| `--idl <PATH>` | `source` | One more IDL to check, such as a published copy outside `target/idl`. Give it again for more IDLs. |
 
 Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
 
@@ -412,12 +416,153 @@ AdaptorAddReceipt (bytemuckunsafe repr(C)): repr(C) size 144, Borsh size 137, pa
 An IDL whose converter removed `serialization` lists no zero-copy types. Check this first
 when a parser reads too few bytes.
 
+## source
+
+`source` checks that an Anchor workspace gives each program one program id. Anchor keeps
+the id in more than one place, and a new keypair or a deploy to another cluster can change
+one copy and not the others. Anchor's generated entrypoint compares the program id with
+`declare_id!` and rejects each instruction when they differ (`DeclaredProgramIdMismatch`).
+Clients built from an IDL send to the address in the IDL.
+
+```bash
+idl-drift source                                   # the workspace in the current directory
+idl-drift source path/to/workspace --idl idls/amm.json
+```
+
+ROOT is the directory that holds `Anchor.toml`. `source` reads the program id from four
+places, the *legs*:
+
+| Leg | JSON `leg` | Where |
+|---|---|---|
+| `declare_id!` | `declare_id` | `programs/*/src/lib.rs`. The program name is the `[lib] name` in the program's `Cargo.toml`, else its `[package] name`. |
+| Anchor.toml | `anchor_toml` | Each entry of each `[programs.<cluster>]` table: `name = "<ID>"` or `name = { address = "<ID>" }`. |
+| IDL address | `idl_address` | Each `target/idl/*.json`, and each IDL given with `--idl`. For Anchor, the id is `address`, else `metadata.address` (legacy Anchor), and the program name is `metadata.name`, else the top-level `name`. For Codama (`rootNode`), only `program.publicKey` and `program.name` count, as in the Codama tools. |
+| On chain | `onchain` | Only with `--onchain`. See [Chain check](#chain-check). |
+
+`declare_id!` is the reference, because the program accepts only the id that it was built
+with. Each other leg is compared with it. When a program has no `declare_id!`, its IDL
+address must match one of its Anchor.toml ids. Program names match in `snake_case`, so the
+Codama name `orderEngine` and the key `order-engine` are the crate `order_engine`. The crates
+`a_mm` and `am_m` stay two programs. Only a `declare_id!` at the crate root of `lib.rs`
+counts. One in a
+comment, a string or a module (such as `mod jupiter { declare_id!(..) }` for a CPI target)
+does not count.
+
+`source` reads only the program id from the source code. It does not build or parse the
+program. A missing file is not an error, because a CI job often has only some of the
+files. When no program has its id in two places (the chain included) and there is no
+finding, `source` has nothing to compare, and the run stops (exit 2). For example, ROOT holds
+no program id, or only a library crate.
+
+`source` reads only regular files under ROOT. A symlink that points out of ROOT, a path
+that is not a regular file, or a file over 16 MiB stops the run (exit 2). An IDL given with
+`--idl` can be outside ROOT, but the same file type and size rules apply to it.
+
+`source` reads the IDL name and address from the raw JSON, not with the IDL model of
+`diff`. So an IDL of any format gives its id, also an IDL that `diff` cannot load. This is
+also true for the on-chain IDL with `--onchain`. A file that is not JSON, or an IDL with no
+name, stops the run (exit 2).
+
+### Findings
+
+**Tiers for source.** A Breaking finding means that a tool or a client uses a wrong program
+id. A Dangerous finding means that the check is weaker, or that a client cannot read the
+IDL from chain. A Cosmetic finding means that an id cannot be checked. `source` has no
+Additive findings.
+
+| `kind` | Tier | Why |
+|---|---|---|
+| `anchor_toml_mismatch` | Breaking | The id in `[programs.<cluster>]` is not the `declare_id!`. Anchor's tools use that id on that cluster. For example, `anchor test` loads the program at the `[programs.localnet]` id, where the program rejects each instruction. |
+| `idl_address_mismatch` | Breaking | The IDL address is not the `declare_id!`. Clients and indexers built from the IDL use the wrong program. |
+| `invalid_id` | Breaking | An id is not base58 of 32 bytes. |
+| `onchain_missing` | Breaking | With `--onchain`: no `declare_id!` value of the program is a deployed program. Each value has no account, or an account that is not executable. |
+| `onchain_mismatch` | Breaking | With `--onchain`: the IDL that the program publishes on chain gives another address, or no address that can be read. A legacy IDL has no address key, so the program is its address. |
+| `onchain_idl_missing` | Dangerous | With `--onchain`: the program is deployed, but it has no on-chain IDL account. A client cannot read its IDL from chain. |
+| `declare_id_duplicate` | Dangerous | The crate root has more than one `declare_id!` value, so the program picks its id with `cfg`, for example one for each feature. An id that matches any one of the values passes, so a wrong id for one build is not found. This finding lists the values. Use `--fail-on dangerous` to fail on it. More than 16 values is Breaking, and the chain check skips them, because a `cfg` set needs far fewer. |
+| `declare_id_missing` | Cosmetic | The `lib.rs` of a program that Anchor.toml or an IDL names has no `declare_id!` at the crate root, so its other ids cannot be checked. A crate that nothing else names is a library, and a program with no crate in `programs/` has its source elsewhere. Neither one is a finding. |
+| `idl_address_missing` | Cosmetic | An IDL has no address, so its id cannot be checked. |
+
+A mismatch message names the `declare_id!` value. When the program has more than one value,
+the message says "one of the N declare_id! values", and `declare_id_duplicate` lists them.
+
+The `subject` is the program (`amm`), the program and the cluster (`amm@mainnet`), the
+program and the chain (`amm@chain`), or, for `invalid_id`, the file
+(`target/idl/amm.json`, `Anchor.toml:mainnet`).
+
+### Chain check
+
+`--onchain` checks each distinct valid `declare_id!` value of each program. A program that
+picks its id with `cfg` can have one value for each cluster, so `source` needs only one
+deployed value on the cluster of the RPC URL.
+
+1. At least one value must be an executable program account. If no value is, `source`
+   gives one `onchain_missing` for the program.
+2. For each value that is a deployed program, the IDL that the program publishes, in its
+   Program Metadata account or its Anchor IDL account (see [On-chain IDL](#on-chain-idl)),
+   must give the same `address`. When the program has both accounts, `source` checks both.
+   When it has neither, `source` gives `onchain_idl_missing`. A legacy IDL with no address
+   gets the program id, so it always matches.
+
+Each IDL read from chain is in the report as an `onchain` leg. In the JSON report, this leg
+has `source` (`metadata` or `anchor`), the IDL account (`account`), and the address in the
+IDL (`id`):
+
+```json
+{"program": "amm", "leg": "onchain", "source": "anchor", "account": "<IDL ACCOUNT>", "id": "<ADDRESS>"}
+```
+
+A failed RPC request, an RPC answer with no account `value` or no `executable` flag, or an
+IDL account that cannot be read stops the run (exit 2). Give the URL in
+`IDL_DRIFT_RPC_URL` or with `--rpc`, as for `diff --onchain`.
+
+A CI job with no RPC URL can run `source` without `--onchain`. It still checks
+`declare_id!`, Anchor.toml and the IDLs.
+
+### Exit codes and output
+
+`source` exits 0 when no finding is at or above `--fail-on` (default `breaking`), 1 when
+at least one is, and 2 when it cannot run: ROOT is not a directory or has nothing to compare,
+a file cannot be read or parsed, a file is outside ROOT, not a regular file or over 16 MiB,
+an option is wrong, or an RPC request failed.
+
+The human report prints one line for each id, `<program>  <place>  <id>`, then the
+findings, Breaking first, then the counts:
+
+```text
+amm  [programs.localnet] in Anchor.toml  29dv8e1WcjL4w6a7HDaHbUfXrF12yiJiVcKQ1qgeT3rF
+vault  [programs.localnet] in Anchor.toml  6k78AbasGMFFrhG95Pj6jQbqkVt7FQMhVgemxJovWKR6
+amm  [programs.mainnet] in Anchor.toml  4SsxzsqrisRmgB5N7NfXVEuU9e9sssebVUyhzmD1rNpH
+amm  declare_id! in programs/amm/src/lib.rs  29dv8e1WcjL4w6a7HDaHbUfXrF12yiJiVcKQ1qgeT3rF
+vault  declare_id! in programs/vault/src/lib.rs  (none)
+amm  address in target/idl/amm.json  5bVzRzm2mwUd3iKzXTD9S82SJLjJKxKXzRJrzDyCZ3JJ
+  [BREAKING] amm@mainnet: [programs.mainnet] amm is 4SsxzsqrisRmgB5N7NfXVEuU9e9sssebVUyhzmD1rNpH, ...
+  [BREAKING] amm: target/idl/amm.json address is 5bVzRzm2mwUd3iKzXTD9S82SJLjJKxKXzRJrzDyCZ3JJ, ...
+  [COSMETIC] vault: no declare_id! at the crate root of programs/vault/src/lib.rs: the ids of vault cannot be checked
+summary: 2 breaking, 0 dangerous, 0 additive, 1 cosmetic
+exit code: 1
+```
+
+`--json` prints one object with these keys:
+
+| Key | Content |
+|---|---|
+| `root` | ROOT as given. |
+| `ids` | Each id read, with `program`, `leg` and `id`. `leg` is `declare_id`, `anchor_toml`, `idl_address` or `onchain`. A leg from a file has `path`. An `anchor_toml` leg also has `cluster`. An `onchain` leg has `source` and `account`. An empty `id` is a file that holds none: a `lib.rs` with no `declare_id!`, or an IDL with no address. |
+| `findings` | Each finding, with `severity`, `kind`, `program`, `subject` and `message`. |
+| `counts` | The number of findings in each tier. |
+| `exit_code` | The same value as the process exit code. |
+
+On exit 2, stdout holds only `{"error": "<message>", "exit_code": 2}`, as for `diff`.
+`--markdown` prints a heading with ROOT, the counts, the exit code, a table of the ids and a
+table of the findings. `source` has no allow file.
+
 ## Library
 
 The `idl_drift` crate exposes the same functions as the CLI. An example is in the
 [crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
 both tools use. `idl_drift::layout` calculates zero-copy layouts. `idl_drift::inspect` holds
-the functions behind `inspect`.
+the functions behind `inspect`. `idl_drift::source` holds the functions behind `source`:
+`discover`, `read_idl`, `check` and `check_onchain`.
 
 ## Limitations
 
@@ -425,6 +570,9 @@ the functions behind `inspect`.
   from Metaplex or Phoenix) keeps each instruction tag in `discriminant`, and idl-drift reads
   it. Shank accounts have no discriminator, so a change in how a program tells its accounts
   apart is not found. A Shank `vec` with a `size` does not load (exit 2).
+- **source: the Anchor layout only.** `source` reads `programs/*/` and `target/idl/` under
+  ROOT. For another layout, give each IDL with `--idl`. It does not find a `declare_id!`
+  outside `programs/*/src/lib.rs`.
 - **IDL against IDL only.** idl-drift compares IDLs, also with `--onchain`. It cannot see a
   program that was upgraded on chain with no IDL update. Use [idl-verify](idl-verify.md) to
   check an IDL against real data.

@@ -240,10 +240,43 @@ impl std::error::Error for DecodeError {}
 /// `source`, it has both and `source` is `None`, or the account does not hold an IDL that
 /// can be read.
 pub fn fetch(
-    mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
     program: &str,
     source: Option<Source>,
 ) -> Result<OnchainIdl, Error> {
+    let found = fetch_text(rpc, program, source)?;
+    let mut idl = Idl::from_json(&found.text).map_err(|error| Error::Idl {
+        source: found.source,
+        account: found.account.clone(),
+        error,
+    })?;
+    // A legacy IDL has no address. The program asked for is its address.
+    if idl.address.is_empty() {
+        idl.address = found.program;
+    }
+    Ok(OnchainIdl {
+        idl,
+        source: found.source,
+        account: found.account,
+    })
+}
+
+/// The JSON text of an on-chain IDL, before the IDL model reads it.
+pub(crate) struct OnchainText {
+    pub(crate) text: String,
+    pub(crate) source: Source,
+    pub(crate) account: String,
+    /// The program in base58, as the RPC requests use it.
+    pub(crate) program: String,
+}
+
+/// As [`fetch`], up to valid JSON with no control character. `source` reads only the address,
+/// so an IDL that the model rejects still gives it.
+pub(crate) fn fetch_text(
+    mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    program: &str,
+    source: Option<Source>,
+) -> Result<OnchainText, Error> {
     let key = parse_key(program).ok_or_else(|| Error::Program(program.to_string()))?;
     let program = bs58::encode(key).into_string();
     let candidates: Vec<(Source, String, &str)> = [
@@ -322,15 +355,11 @@ pub fn fetch(
             account: account.clone(),
         });
     }
-    let mut idl = Idl::from_json(&text).map_err(idl_error)?;
-    // A legacy IDL has no address. The program asked for is its address.
-    if idl.address.is_empty() {
-        idl.address = program;
-    }
-    Ok(OnchainIdl {
-        idl,
+    Ok(OnchainText {
+        text,
         source,
         account,
+        program,
     })
 }
 

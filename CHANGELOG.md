@@ -7,9 +7,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `idl-drift source` checks that an Anchor workspace gives each program one id in
+  `declare_id!`, `Anchor.toml` and `target/idl`, and with `--onchain`, on chain. The GitHub
+  Action runs it with `command: source`.
 - `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
   apart and account types that Shipstern skips. The exit code does not change.
 - Library: `idl_drift::markdown::escape_control` writes each control character as an escape.
+- Library: `idl_drift::source` holds the program-id check. `discover` reads a workspace,
+  `read_idl` reads one more IDL, `check` compares the ids, and `check_onchain` checks the
+  chain through an RPC call that the caller gives.
 
 ### Changed
 
@@ -67,6 +73,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - RPC: an answer over 32 MiB is not retried, and `"error": null` is not an error.
 - RPC: an answer that is not a JSON object is an error, not a panic.
 - Control characters in findings, changes, IDL names and errors are escaped on the terminal.
+  The GitHub Action writes them as `?` in the job log.
 
 ## [0.1.0] - 2026-10-16
 
