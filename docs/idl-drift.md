@@ -412,10 +412,6 @@ AdaptorAddReceipt (bytemuckunsafe repr(C)): repr(C) size 144, Borsh size 137, pa
 An IDL whose converter removed `serialization` lists no zero-copy types. Check this first
 when a parser reads too few bytes.
 
-## Library
-
-The `idl_drift` crate exposes the same functions as the CLI. An example is in the
-[crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
 ## source
 
 `source` checks that an Anchor workspace gives each program one program id. Anchor keeps
@@ -556,6 +552,10 @@ On exit 2, stdout holds only `{"error": "<message>", "exit_code": 2}`, as for `d
 `--markdown` prints a heading with ROOT, the counts, the exit code, a table of the ids and a
 table of the findings. `source` has no allow file.
 
+## Library
+
+The `idl_drift` crate exposes the same functions as the CLI. An example is in the
+[crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
 both tools use. `idl_drift::layout` calculates zero-copy layouts. `idl_drift::inspect` holds
 the functions behind `inspect`. `idl_drift::source` holds the functions behind `source`:
 `discover`, `read_idl`, `check` and `check_onchain`.
@@ -566,13 +566,13 @@ the functions behind `inspect`. `idl_drift::source` holds the functions behind `
   from Metaplex or Phoenix) keeps each instruction tag in `discriminant`, and idl-drift reads
   it. Shank accounts have no discriminator, so a change in how a program tells its accounts
   apart is not found. A Shank `vec` with a `size` does not load (exit 2).
+- **source: the Anchor layout only.** `source` reads `programs/*/` and `target/idl/` under
+  ROOT. For another layout, give each IDL with `--idl`. It does not find a `declare_id!`
+  outside `programs/*/src/lib.rs`.
 - **IDL against IDL only.** idl-drift compares IDLs, also with `--onchain`. It cannot see a
   program that was upgraded on chain with no IDL update. Use [idl-verify](idl-verify.md) to
   check an IDL against real data.
 - **New types in `types` are not reported.** A type removed from `types` is reported only
-- **source: the Anchor layout only.** `source` reads `programs/*/` and `target/idl/` under
-  ROOT. For another layout, give each IDL with `--idl`. It does not find a `declare_id!`
-  outside `programs/*/src/lib.rs`.
   when a parser still reads it.
 - **Unresolved Codama nodes.** idl-drift cannot read inside some Codama nodes. A change
   inside one is Breaking on a reachable type, with a message that idl-drift cannot read the

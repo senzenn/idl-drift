@@ -49,6 +49,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - RPC: an answer over 32 MiB is not retried, and `"error": null` is not an error.
 - RPC: an answer that is not a JSON object is an error, not a panic.
 - Control characters in findings, changes, IDL names and errors are escaped on the terminal.
+  The GitHub Action writes them as `?` in the job log.
 
 ## [0.1.0] - 2026-10-16
 
@@ -73,7 +74,6 @@ The first release of `idl-drift` and `idl-verify`.
   change.
 - `idl-drift inspect IDL` lists unresolved fields, types that the IDL uses but does not
   define, and padded zero-copy types that Borsh also reads. `--layout` prints each zero-copy
-  The GitHub Action writes them as `?` in the job log.
   type field by field. A generic parameter that its type declares is not unresolved.
 - Shank IDLs: instruction tags come from `discriminant`. Shank maps and sets load.
 - Const generic values are read as Codama's Anchor converter and Shipstern read them (JS
