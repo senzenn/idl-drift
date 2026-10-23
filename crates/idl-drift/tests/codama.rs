@@ -3,6 +3,7 @@
 mod common;
 
 use common::{fixture, fixture_text, kinds, max_sev, parse};
+use idl_drift::allow::AllowList;
 use idl_drift::codama_convert::decode_encoded_bytes;
 use idl_drift::model::{ArrayLen, Idl, Type, TypeDefTy};
 use idl_drift::{coverage, diff, ChangeKind, Severity};
@@ -514,6 +515,34 @@ fn a_number_to_bytes_account_discriminator_moves_the_body() {
 }
 
 #[test]
+fn an_allowed_account_discriminator_change_does_not_hide_a_moved_body() {
+    let root = |data: &str, offset: usize| {
+        codama_root(
+            "",
+            &format!(
+                r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[
+                {{"kind":"structFieldTypeNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}]}},
+                "discriminators":[{{"kind":"constantDiscriminatorNode","offset":{offset},"constant":{{"kind":"constantValueNode",
+                "type":{{"kind":"bytesTypeNode"}},"value":{{"kind":"bytesValueNode","data":"{data}","encoding":"base16"}}}}}}]}}"#
+            ),
+            "",
+        )
+    };
+    let allow = AllowList::parse("account_discriminator_changed vault").unwrap();
+    // The new tag is at byte 4, so `amount` moves from byte 4 to byte 8.
+    let mut report = diff(&parse(&root("01020304", 0)), &parse(&root("05060708", 4)));
+    report.allow(&allow);
+    assert!(report.fails_at(Severity::Breaking), "{:?}", report.changes);
+    // A longer tag also moves the body, but the allowed tag change already says so.
+    let mut report = diff(
+        &parse(&root("01020304", 0)),
+        &parse(&root("0102030405060708", 0)),
+    );
+    report.allow(&allow);
+    assert!(!report.fails_at(Severity::Breaking), "{:?}", report.changes);
+}
+
+#[test]
 fn limit_order_v1_to_v2_is_breaking() {
     let report = diff(
         &fixture("shipstern/limit_order_v1.json"),
@@ -593,6 +622,46 @@ fn token_2022_sub_discriminator_change_is_breaking() {
         breaking,
         [(ChangeKind::DiscriminatorChanged, "transferCheckedWithFee")]
     );
+}
+
+#[test]
+fn a_later_discriminator_on_a_kept_field_is_part_of_the_body() {
+    // `version` is a discriminator and a field, so the body starts at byte 8, before it.
+    let tag = r#""type":{"kind":"fixedSizeTypeNode","size":8,"type":{"kind":"bytesTypeNode"}},
+        "defaultValueStrategy":"omitted","defaultValue":{"kind":"bytesValueNode","data":"0102030405060708","encoding":"base16"}"#;
+    let version = r#""type":{"kind":"numberTypeNode","format":"u8","endian":"le"},"defaultValue":{"kind":"numberValueNode","number":2}"#;
+    let amount = r#""type":{"kind":"numberTypeNode","format":"u64","endian":"le"}"#;
+    let discs = r#""discriminators":[{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0},
+        {"kind":"fieldDiscriminatorNode","name":"version","offset":8}]"#;
+    let fields = |node: &str| {
+        format!(
+            r#"{{"kind":"{node}","name":"discriminator",{tag}}},{{"kind":"{node}","name":"version",{version}}},
+            {{"kind":"{node}","name":"amount",{amount}}}"#
+        )
+    };
+    let idl = parse(&codama_root(
+        &format!(
+            r#"{{"kind":"instructionNode","name":"deposit","accounts":[],"arguments":[{}],{discs}}}"#,
+            fields("instructionArgumentNode")
+        ),
+        &format!(
+            r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[{}]}},{discs}}}"#,
+            fields("structFieldTypeNode")
+        ),
+        "",
+    ));
+    let ix = &idl.instructions[0];
+    let names: Vec<&str> = ix.args.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!((ix.payload_start(), names), (8, vec!["version", "amount"]));
+    assert_eq!(idl.accounts[0].payload_start(), 8);
+    // Both Token-2022 discriminator args are omitted, so the body starts after both.
+    let token = fixture("codama/token_2022_transfer_fee.json");
+    let ix = token
+        .instructions
+        .iter()
+        .find(|ix| ix.name == "transferCheckedWithFee")
+        .unwrap();
+    assert_eq!(ix.payload_start(), 2);
 }
 
 #[test]

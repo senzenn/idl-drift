@@ -212,6 +212,52 @@ fn codama_inline_struct_arg_reads_like_a_linked_struct() {
 }
 
 #[test]
+fn a_struct_field_that_links_a_struct_reads_like_an_inline_one() {
+    // Codama inlines a type that has only one use. Borsh writes both forms as the fields.
+    let anchor = parse(
+        r#"{"address":"P","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+      "accounts":[{"name":"Vault","discriminator":[1,2,3,4,5,6,7,8]}],
+      "types":[
+        {"name":"Vault","type":{"kind":"struct","fields":[{"name":"cfg","type":{"defined":{"name":"Config"}}},{"name":"owner","type":"pubkey"}]}},
+        {"name":"Config","type":{"kind":"struct","fields":[{"name":"fee","type":"u16"},{"name":"bump","type":"u8"}]}}]}"#,
+    );
+    let config =
+        |fee: &str| codama_struct(&[("fee", &codama_num(fee)), ("bump", &codama_num("u8"))]);
+    let codama = |cfg: &str| {
+        parse(&format!(
+            r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+            "program":{{"kind":"programNode","name":"p","publicKey":"P","version":"1","instructions":[],"pdas":[],"errors":[],"events":[],
+            "definedTypes":[{{"kind":"definedTypeNode","name":"config","type":{}}}],
+            "accounts":[{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[
+              {{"kind":"structFieldTypeNode","name":"discriminator","defaultValueStrategy":"omitted",
+                "type":{{"kind":"fixedSizeTypeNode","size":8,"type":{{"kind":"bytesTypeNode"}}}},
+                "defaultValue":{{"kind":"bytesValueNode","data":"0102030405060708","encoding":"base16"}}}},
+              {},{}]}},
+              "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}]}}]}}}}"#,
+            config("u16"),
+            codama_field("structFieldTypeNode", "cfg", cfg),
+            codama_field(
+                "structFieldTypeNode",
+                "owner",
+                r#"{"kind":"publicKeyTypeNode"}"#
+            ),
+        ))
+    };
+    let link = codama(r#"{"kind":"definedTypeLinkNode","name":"config"}"#);
+    for (old, new) in [
+        (&anchor, &codama(&config("u16"))),
+        (&link, &codama(&config("u16"))),
+    ] {
+        let report = diff(old, new);
+        assert!(report.changes.is_empty(), "{:#?}", report.changes);
+    }
+    assert_eq!(
+        messages(&link, &codama(&config("u32"))),
+        ["FIELD changed (vault#0) via reachable type: cfg: config -> { fee: u32, bump: u8 } (Borsh layout)"]
+    );
+}
+
+#[test]
 fn generic_type_matches_the_codama_body_written_at_each_use() {
     // Codama has no generics, so its converters write the body of `Price<u128>` and
     // `Signer<pubkey>` in place of each use.

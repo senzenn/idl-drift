@@ -235,12 +235,32 @@ fn enum_append_is_dangerous() {
 }
 
 #[test]
-fn enum_middle_insert_is_breaking() {
-    // Inserting before Slow moves its tag from 1 to 2.
+fn enum_middle_insert_and_removal_name_the_variant() {
+    // Inserting before Slow moves its tag from 1 to 2. Slow is not appended.
     let inserted = mode_enum(r#"{"name":"Fast"},{"name":"Paused"},{"name":"Slow"}"#);
+    let old = mode_enum(FAST_SLOW);
     assert_eq!(
-        max_sev(&mode_enum(FAST_SLOW), &inserted),
-        Some(Severity::Breaking)
+        kinds(&old, &inserted),
+        [(Severity::Breaking, ChangeKind::VariantInserted)]
+    );
+    assert_eq!(
+        kinds(&inserted, &old),
+        [(Severity::Breaking, ChangeKind::VariantRemoved)]
+    );
+    assert_eq!(
+        kinds(&mode_enum(""), &mode_enum(r#"{"name":"Fast"}"#)),
+        [(Severity::Dangerous, ChangeKind::VariantAppended)]
+    );
+    // Two variants after the insert shift too, but only the insert is reported.
+    let three = mode_enum(r#"{"name":"Fast"},{"name":"Slow"},{"name":"Off"}"#);
+    let four = mode_enum(r#"{"name":"Fast"},{"name":"Paused"},{"name":"Slow"},{"name":"Off"}"#);
+    assert_eq!(
+        kinds(&three, &four),
+        [(Severity::Breaking, ChangeKind::VariantInserted)]
+    );
+    assert_eq!(
+        kinds(&four, &three),
+        [(Severity::Breaking, ChangeKind::VariantRemoved)]
     );
 }
 
@@ -256,6 +276,28 @@ fn enum_variant_rename_is_dangerous() {
     assert_eq!(
         kinds(&mode_enum(FAST_SLOW), &retagged),
         [(Severity::Breaking, ChangeKind::VariantMoved)]
+    );
+}
+
+#[test]
+fn variant_payload_field_rename_is_dangerous() {
+    let pool = |fields: &str| parse(&pool_with_enum(fields, ""));
+    let amount = pool(r#"[{"name":"amount","type":"u64"}]"#);
+    let renamed = [(Severity::Dangerous, ChangeKind::FieldRenamed)];
+    assert_eq!(
+        idl_kinds(&amount, &pool(r#"[{"name":"qty","type":"u64"}]"#)),
+        renamed
+    );
+    // The same bytes with no field names.
+    assert_eq!(idl_kinds(&amount, &pool(r#"["u64"]"#)), renamed);
+    let swapped = |a: &str, b: &str| {
+        pool(&format!(
+            r#"[{{"name":"{a}","type":"u64"}},{{"name":"{b}","type":"u64"}}]"#
+        ))
+    };
+    assert_eq!(
+        idl_kinds(&swapped("a", "b"), &swapped("b", "a")),
+        [(Severity::Breaking, ChangeKind::VariantPayloadChanged)]
     );
 }
 

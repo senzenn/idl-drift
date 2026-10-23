@@ -5,7 +5,7 @@ use std::fmt;
 
 use super::collisions::DispatchKey;
 use super::text::{disc_changed, extra_discs_text, field_change, field_str, size_text};
-use super::{ChangeKind, FieldEdit, Report, Severity};
+use super::{names, ChangeKind, FieldEdit, Report, Severity};
 use crate::model::{camel, AccountItem, Idl, Instruction};
 
 /// Instructions are matched by name, so a duplicate name would hide drift on all but one.
@@ -137,11 +137,12 @@ fn diff_instruction(oi: &Instruction, ni: &Instruction, camel_paths: bool, r: &m
     );
 
     // Any arg change moves every later byte.
+    let (old_names, new_names) = (names(&oi.args), names(&ni.args));
     for pos in 0..oi.args.len().max(ni.args.len()) {
         let subject = format!("{ix}#{pos}");
         match (oi.args.get(pos), ni.args.get(pos)) {
             (Some(o), Some(n)) if o != n => {
-                let edit = FieldEdit::of(&oi.args, &ni.args, o, n);
+                let edit = FieldEdit::of(&old_names, &new_names, o, n);
                 let kind = match edit {
                     FieldEdit::Changed => ChangeKind::ArgChanged,
                     FieldEdit::Moved => ChangeKind::ArgMoved,
