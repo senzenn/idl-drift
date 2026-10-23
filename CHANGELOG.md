@@ -16,20 +16,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Library: `idl_drift::layout::FieldLayout` has a new `padding` field, and
   `idl_verify::decode::DecodeErrorKind` has a new `NaN` variant. Both types are now
   `#[non_exhaustive]`, so code that builds `FieldLayout` or matches every variant must change.
-
-### Fixed
-
-- idl-verify: an instruction matches only when its Codama size discriminator matches too, at
-  any position. A program that takes one tag at two data lengths no longer gives a false
-  "bytes after the arguments" error.
 - Library: `idl_drift::layout::LayoutError` has a new `TooLarge` variant and is now
   `#[non_exhaustive]`. A layout call returns it when it needs more than
   `idl_drift::layout::MAX_WORK` (65536) type nodes.
 - Library: `idl_drift::model::Instruction` has a new `payload_offset` field, as `NamedDisc`
   has. Code that builds an `Instruction` must set it.
-- A Codama discriminator after a size discriminator now counts in both tools.
-- idl-verify: an instruction with only a Codama size discriminator matches by data length.
-- idl-drift: a change from a number to a bytes account discriminator is Breaking.
+
+### Fixed
+
 - idl-drift: a field rename inside an enum variant payload is Dangerous (`field_renamed`), as
   in a struct. It was Breaking. A change from named fields to a tuple of the same types is
   also a rename.
@@ -49,6 +43,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an account body or of the instruction arguments. That field is part of the body, so
   idl-verify read each later field one byte late. Shipstern also starts after the first
   discriminator.
+- idl-verify: an instruction matches only when its Codama size discriminator matches too, at
+  any position. A program that takes one tag at two data lengths no longer gives a false
+  "bytes after the arguments" error.
+- A Codama discriminator after a size discriminator now counts in both tools.
+- idl-verify: an instruction with only a Codama size discriminator matches by data length.
+- idl-drift: a change from a number to a bytes account discriminator is Breaking.
 - idl-drift: generic params match by position. A reorder is Breaking, and a rename is no
   change.
 - idl-drift: a renamed enum variant with a new tag is Breaking.
