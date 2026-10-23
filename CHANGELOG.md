@@ -22,9 +22,33 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - idl-verify: an instruction matches only when its Codama size discriminator matches too, at
   any position. A program that takes one tag at two data lengths no longer gives a false
   "bytes after the arguments" error.
+- Library: `idl_drift::layout::LayoutError` has a new `TooLarge` variant and is now
+  `#[non_exhaustive]`. A layout call returns it when it needs more than
+  `idl_drift::layout::MAX_WORK` (65536) type nodes.
+- Library: `idl_drift::model::Instruction` has a new `payload_offset` field, as `NamedDisc`
+  has. Code that builds an `Instruction` must set it.
 - A Codama discriminator after a size discriminator now counts in both tools.
 - idl-verify: an instruction with only a Codama size discriminator matches by data length.
 - idl-drift: a change from a number to a bytes account discriminator is Breaking.
+- idl-drift: a field rename inside an enum variant payload is Dangerous (`field_renamed`), as
+  in a struct. It was Breaking. A change from named fields to a tuple of the same types is
+  also a rename.
+- idl-drift: a struct field, a variant payload or an alias that links a struct now matches
+  the same struct written inline. Codama inlines a type that has only one use, so this gave
+  a false Breaking `field_changed`.
+- idl-drift: a variant inserted before the end is `variant_inserted`, and a variant removed
+  before the end is `variant_removed` at its own index. The variants after it are no longer
+  reported as `variant_moved` and `variant_appended`. The first variant of an empty enum is
+  `variant_appended`.
+- A small IDL whose types each hold two of the next type no longer stops `diff` and
+  `inspect` for minutes. A layout that needs more than 65536 type nodes is reported as
+  unknown. An on-chain IDL can be hostile, so this matters for `diff --onchain`.
+- idl-drift: each account discriminator check runs on its own. An allowed
+  `account_discriminator_changed` no longer hides an `account_discriminator_offset_changed`.
+- A later Codama discriminator on a field that is not omitted no longer moves the start of
+  an account body or of the instruction arguments. That field is part of the body, so
+  idl-verify read each later field one byte late. Shipstern also starts after the first
+  discriminator.
 - idl-drift: generic params match by position. A reorder is Breaking, and a rename is no
   change.
 - idl-drift: a renamed enum variant with a new tag is Breaking.

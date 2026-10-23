@@ -101,6 +101,9 @@ For every pair of files, idl-drift also does these steps, because the bytes are 
   hold the same field types in the same order, it compares the arguments field by field.
   For example, Codama links a params type after it gets a second use. Other arguments stay
   as written, so a change inside a params type keeps its type and field name.
+- It compares a link to a struct in a field, a variant payload or an alias with the same
+  struct written inline, as the same type. Codama inlines a type that has only one use.
+  Two links to types with different names stay different.
 
 ### Zero-copy types
 
@@ -178,7 +181,8 @@ Two rules follow Shipstern's dispatch:
 - The `writable`, `signer` or `optional` flag of an instruction account changed.
 - A field, argument, account or variant was renamed in place: the same type, the same
   position, and neither name is used at another position on the other side. Otherwise
-  idl-drift reports a move.
+  idl-drift reports a move. This includes a field of an enum variant payload, and a payload
+  that changes from named fields to a tuple of the same types (`field_renamed`).
 - A discriminator collision exists in both versions.
 - The set of account counts under a shared discriminator changed. This changes the
   dispatch order.

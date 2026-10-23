@@ -17,6 +17,8 @@ mod text;
 mod types;
 mod zero_copy;
 
+use std::collections::BTreeSet;
+
 use crate::model::{Field, Idl};
 
 pub use crate::reach::reachable_types;
@@ -55,6 +57,11 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
     r
 }
 
+/// The names in a field list. A set keeps each position check from a scan of both lists.
+fn names(fields: &[Field]) -> BTreeSet<&str> {
+    fields.iter().map(|f| f.name.as_str()).collect()
+}
+
 /// How a field at a fixed position changed.
 #[derive(Debug, Clone, Copy)]
 enum FieldEdit {
@@ -68,12 +75,11 @@ enum FieldEdit {
 }
 
 impl FieldEdit {
-    fn of(old_list: &[Field], new_list: &[Field], o: &Field, n: &Field) -> Self {
+    /// `old_names` and `new_names` are the [`names`] of both lists, built once per list.
+    fn of(old_names: &BTreeSet<&str>, new_names: &BTreeSet<&str>, o: &Field, n: &Field) -> Self {
         if o.ty != n.ty {
             Self::Changed
-        } else if old_list.iter().any(|f| f.name == n.name)
-            || new_list.iter().any(|f| f.name == o.name)
-        {
+        } else if old_names.contains(n.name.as_str()) || new_names.contains(o.name.as_str()) {
             Self::Moved
         } else {
             Self::Renamed

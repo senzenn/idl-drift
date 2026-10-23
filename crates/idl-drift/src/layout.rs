@@ -5,6 +5,7 @@
 //! follows SBF, not `x86_64`: `u128` and `i128` align to 8, a pubkey (`[u8; 32]`) to 1, and
 //! `packed` aligns every field to 1.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -14,6 +15,10 @@ use crate::model::{
 
 /// Deeper nesting than this is treated as a recursive type.
 pub const MAX_DEPTH: usize = 64;
+
+/// Type nodes that one call may visit. A few small types that each hold two of the next
+/// expand to millions of nodes, and an on-chain IDL can be hostile.
+pub const MAX_WORK: usize = 1 << 16;
 
 /// The IDL's `types[]`, indexed by name.
 #[derive(Debug, Clone)]
@@ -42,7 +47,7 @@ impl<'a> TypeIndex<'a> {
     /// `repr(Rust)` (except packed with no bool), undefined types, overflowing sizes or
     /// recursive types.
     pub fn struct_layout(&self, td: &TypeDef) -> Result<StructLayout, LayoutError> {
-        self.struct_layout_at(td, 0)
+        Walk::new(self).struct_layout_at(td, 0)
     }
 
     /// Size and alignment of `ty` inside zero-copy memory.
@@ -51,7 +56,7 @@ impl<'a> TypeIndex<'a> {
     ///
     /// As [`Self::struct_layout`].
     pub fn size_align(&self, ty: &Type) -> Result<(usize, usize), LayoutError> {
-        self.size_align_at(ty, 0)
+        Walk::new(self).size_align_at(ty, 0)
     }
 
     /// Every primitive and array in `td`, flattened with its offset under `reading`. Arrays
@@ -62,7 +67,7 @@ impl<'a> TypeIndex<'a> {
     /// As [`Self::struct_layout`] for zero-copy, or when a Borsh size varies.
     pub fn leaves(&self, td: &TypeDef, reading: Reading) -> Result<Vec<Leaf>, LayoutError> {
         let mut out = Vec::new();
-        self.def_leaves(td, reading, "", 0, 0, &mut out)?;
+        Walk::new(self).def_leaves(td, reading, "", 0, 0, &mut out)?;
         Ok(out)
     }
 
@@ -72,7 +77,32 @@ impl<'a> TypeIndex<'a> {
     ///
     /// As [`Self::leaves`].
     pub fn reading_size(&self, ty: &Type, reading: Reading) -> Result<usize, LayoutError> {
-        self.reading_size_at(ty, reading, 0)
+        Walk::new(self).reading_size_at(ty, reading, 0)
+    }
+
+    /// Borsh size of `ty` when every value has the same size, `None` when it varies.
+    ///
+    /// # Errors
+    ///
+    /// On undefined types, overflowing sizes or recursive types.
+    pub fn borsh_size(&self, ty: &Type) -> Result<Option<usize>, LayoutError> {
+        Walk::new(self).borsh_size_at(ty, 0)
+    }
+}
+
+/// One call into a [`TypeIndex`], with the work that it may still spend. The index holds
+/// no state, so it stays `Sync`.
+struct Walk<'i, 'a> {
+    index: &'i TypeIndex<'a>,
+    work: Cell<usize>,
+}
+
+impl<'i, 'a> Walk<'i, 'a> {
+    fn new(index: &'i TypeIndex<'a>) -> Self {
+        Self {
+            index,
+            work: Cell::new(MAX_WORK),
+        }
     }
 
     fn reading_size_at(
@@ -98,9 +128,7 @@ impl<'a> TypeIndex<'a> {
         depth: usize,
         out: &mut Vec<Leaf>,
     ) -> Result<(), LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         match &td.ty {
             TypeDefTy::Struct { fields } => {
                 let offsets = match reading {
@@ -181,24 +209,28 @@ impl<'a> TypeIndex<'a> {
         }
     }
 
-    /// Borsh size of `ty` when every value has the same size, `None` when it varies.
-    ///
-    /// # Errors
-    ///
-    /// On undefined types, overflowing sizes or recursive types.
-    pub fn borsh_size(&self, ty: &Type) -> Result<Option<usize>, LayoutError> {
-        self.borsh_size_at(ty, 0)
+    /// Spends one node of the work for this call. Each recursive walk passes here.
+    fn step(&self, depth: usize) -> Result<(), LayoutError> {
+        if depth > MAX_DEPTH {
+            return Err(LayoutError::TooDeep);
+        }
+        let left = self
+            .work
+            .get()
+            .checked_sub(1)
+            .ok_or(LayoutError::TooLarge)?;
+        self.work.set(left);
+        Ok(())
     }
 
     fn lookup(&self, name: &str) -> Result<&'a TypeDef, LayoutError> {
-        self.get(name)
+        self.index
+            .get(name)
             .ok_or_else(|| LayoutError::UndefinedType(name.to_string()))
     }
 
     fn struct_layout_at(&self, td: &TypeDef, depth: usize) -> Result<StructLayout, LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         let TypeDefTy::Struct { fields } = &td.ty else {
             return Err(LayoutError::unknown("only structs have a zero-copy layout"));
         };
@@ -281,9 +313,7 @@ impl<'a> TypeIndex<'a> {
     /// Size, alignment and implicit padding of a field. A nested struct keeps its padding in
     /// zero-copy memory, so an array of it has that padding in each item.
     fn field_shape(&self, ty: &Type, depth: usize) -> Result<(usize, usize, usize), LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         match ty {
             Type::Array(item, ArrayLen::Value(len)) => {
                 let (size, align, padding) = self.field_shape(item, depth + 1)?;
@@ -310,9 +340,7 @@ impl<'a> TypeIndex<'a> {
     /// `true` when `ty` holds a bool at any depth. Types without a zero-copy layout give
     /// `false`, so the layout error names them.
     fn holds_bool(&self, ty: &Type, depth: usize) -> Result<bool, LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         Ok(match ty {
             Type::Bool => true,
             Type::Array(item, _) => self.holds_bool(item, depth + 1)?,
@@ -333,9 +361,7 @@ impl<'a> TypeIndex<'a> {
     }
 
     fn size_align_at(&self, ty: &Type, depth: usize) -> Result<(usize, usize), LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         Ok(match ty {
             Type::Bool | Type::U8 | Type::I8 => (1, 1),
             Type::U16 | Type::I16 => (2, 2),
@@ -409,9 +435,7 @@ impl<'a> TypeIndex<'a> {
     }
 
     fn borsh_size_at(&self, ty: &Type, depth: usize) -> Result<Option<usize>, LayoutError> {
-        if depth > MAX_DEPTH {
-            return Err(LayoutError::TooDeep);
-        }
+        self.step(depth)?;
         Ok(match ty {
             Type::Bool | Type::U8 | Type::I8 => Some(1),
             Type::U16 | Type::I16 => Some(2),
@@ -576,6 +600,7 @@ impl fmt::Display for Padding {
 
 /// Why a layout or size could not be computed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LayoutError {
     /// The layout depends on something the IDL does not pin down. `path` is the field chain,
     /// innermost first.
@@ -586,6 +611,8 @@ pub enum LayoutError {
     UndefinedType(String),
     Overflow,
     TooDeep,
+    /// The type tree has more than [`MAX_WORK`] nodes.
+    TooLarge,
 }
 
 impl LayoutError {
@@ -615,6 +642,7 @@ impl fmt::Display for LayoutError {
             Self::UndefinedType(name) => write!(f, "type `{name}` is not defined in the IDL"),
             Self::Overflow => f.write_str("size overflows"),
             Self::TooDeep => write!(f, "types nest deeper than {MAX_DEPTH} levels"),
+            Self::TooLarge => write!(f, "the type tree has more than {MAX_WORK} nodes"),
         }
     }
 }
@@ -801,6 +829,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, LayoutError::TooDeep);
+    }
+
+    #[test]
+    fn type_index_is_sync() {
+        // Callers share one index across threads; the work budget must not live in it.
+        fn sync<T: Sync>() {}
+        sync::<TypeIndex<'static>>();
+    }
+
+    #[test]
+    fn type_tree_that_doubles_at_each_level_stops_early() {
+        // S0 holds two S1, S1 two S2, and so on: 2^25 leaves, within MAX_DEPTH.
+        let types: Vec<String> = (0..25)
+            .map(|i| {
+                format!(
+                    r#"{{"name":"S{i}","repr":{{"kind":"c"}},"type":{{"kind":"struct","fields":[
+                    {{"name":"a","type":{{"defined":{{"name":"S{n}"}}}}}},
+                    {{"name":"b","type":{{"defined":{{"name":"S{n}"}}}}}}]}}}}"#,
+                    n = i + 1
+                )
+            })
+            .chain([
+                r#"{"name":"S25","type":{"kind":"struct","fields":[{"name":"x","type":"u8"}]}}"#
+                    .to_string(),
+            ])
+            .collect();
+        let idl = idl(&format!("[{}]", types.join(",")));
+        let index = TypeIndex::new(&idl);
+        let s0 = index.get("S0").unwrap();
+        let ty = Type::Defined {
+            name: "S0".into(),
+            generics: Vec::new(),
+        };
+        assert_eq!(index.struct_layout(s0), Err(LayoutError::TooLarge));
+        assert_eq!(index.leaves(s0, Reading::Borsh), Err(LayoutError::TooLarge));
+        assert_eq!(index.borsh_size(&ty), Err(LayoutError::TooLarge));
     }
 
     #[test]

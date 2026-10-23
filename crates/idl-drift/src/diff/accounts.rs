@@ -23,65 +23,7 @@ pub(super) fn diff_account_types(
                 *name,
                 format!("new account type: {name}"),
             ),
-            Some(oa) if oa.discriminator != na.discriminator => r.push(
-                Severity::Breaking,
-                ChangeKind::AccountDiscriminatorChanged,
-                *name,
-                disc_changed(
-                    "account discriminator",
-                    name,
-                    &oa.discriminator,
-                    &na.discriminator,
-                    "scheme swap, e.g. Anchor<->Quasar",
-                ),
-            ),
-            Some(oa) if oa.discriminator_offset != na.discriminator_offset => r.push(
-                Severity::Breaking,
-                ChangeKind::AccountDiscriminatorOffsetChanged,
-                *name,
-                format!(
-                    "account discriminator offset changed ({name}): {} -> {}",
-                    oa.discriminator_offset, na.discriminator_offset
-                ),
-            ),
-            Some(oa) if oa.extra_discriminators != na.extra_discriminators => r.push(
-                Severity::Breaking,
-                ChangeKind::AccountDiscriminatorChanged,
-                *name,
-                format!(
-                    "account later discriminators changed ({name}): {} -> {}",
-                    extra_discs_text(&oa.extra_discriminators),
-                    extra_discs_text(&na.extra_discriminators)
-                ),
-            ),
-            Some(oa) if oa.size_discriminator != na.size_discriminator => r.push(
-                Severity::Breaking,
-                ChangeKind::AccountDiscriminatorChanged,
-                *name,
-                format!(
-                    "account size discriminator changed ({name}): {} -> {}: parsers built from the old IDL select it by data length",
-                    size_text(oa.size_discriminator),
-                    size_text(na.size_discriminator)
-                ),
-            ),
-            // A number constant is also the first field. A bytes constant comes before the fields.
-            // When the fields change too, the type diff reports them, and the bytes can line up.
-            Some(oa)
-                if oa.payload_start() != na.payload_start()
-                    && field_names(old_types, name) == field_names(new_types, name) =>
-            {
-                r.push(
-                    Severity::Breaking,
-                    ChangeKind::AccountDiscriminatorOffsetChanged,
-                    *name,
-                    format!(
-                        "account body start changed ({name}): byte {} -> {}: each field moves",
-                        oa.payload_start(),
-                        na.payload_start()
-                    ),
-                );
-            }
-            _ => {}
+            Some(oa) => diff_account(name, oa, na, old_types, new_types, r),
         }
     }
     for name in om.keys() {
@@ -106,6 +48,87 @@ pub(super) fn diff_account_types(
                 format!("account type removed: {name}"),
             );
         }
+    }
+}
+
+/// Each check runs on its own, so an allow entry for one change does not hide another.
+fn diff_account(
+    name: &str,
+    oa: &NamedDisc,
+    na: &NamedDisc,
+    old_types: &[TypeDef],
+    new_types: &[TypeDef],
+    r: &mut Report,
+) {
+    let any_disc_changed = oa.discriminator != na.discriminator
+        || oa.extra_discriminators != na.extra_discriminators
+        || oa.size_discriminator != na.size_discriminator
+        || oa.discriminator_offset != na.discriminator_offset;
+    if oa.discriminator != na.discriminator {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorChanged,
+            name,
+            disc_changed(
+                "account discriminator",
+                name,
+                &oa.discriminator,
+                &na.discriminator,
+                "scheme swap, e.g. Anchor<->Quasar",
+            ),
+        );
+    }
+    if oa.extra_discriminators != na.extra_discriminators {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorChanged,
+            name,
+            format!(
+                "account later discriminators changed ({name}): {} -> {}",
+                extra_discs_text(&oa.extra_discriminators),
+                extra_discs_text(&na.extra_discriminators)
+            ),
+        );
+    }
+    if oa.size_discriminator != na.size_discriminator {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorChanged,
+            name,
+            format!(
+                "account size discriminator changed ({name}): {} -> {}: parsers built from the old IDL select it by data length",
+                size_text(oa.size_discriminator),
+                size_text(na.size_discriminator)
+            ),
+        );
+    }
+    if oa.discriminator_offset != na.discriminator_offset {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged,
+            name,
+            format!(
+                "account discriminator offset changed ({name}): {} -> {}",
+                oa.discriminator_offset, na.discriminator_offset
+            ),
+        );
+    }
+    // A number constant is also the first field. A bytes constant comes before the fields.
+    // A discriminator change above already moves the body. A field change is in the type diff.
+    if !any_disc_changed
+        && oa.payload_start() != na.payload_start()
+        && field_names(old_types, name) == field_names(new_types, name)
+    {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::AccountDiscriminatorOffsetChanged,
+            name,
+            format!(
+                "account body start changed ({name}): byte {} -> {}: each field moves",
+                oa.payload_start(),
+                na.payload_start()
+            ),
+        );
     }
 }
 

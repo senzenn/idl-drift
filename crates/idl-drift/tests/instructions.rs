@@ -25,6 +25,7 @@ fn ix(name: &str, disc: Vec<u8>, accounts: Vec<AccountItem>) -> Instruction {
         size_discriminator: None,
         accounts,
         args: vec![],
+        payload_offset: None,
         optional_accounts: OptionalAccounts::ProgramId,
     }
 }

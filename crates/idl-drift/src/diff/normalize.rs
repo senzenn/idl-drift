@@ -396,7 +396,7 @@ pub(super) fn rename_generics(ty: &mut Type, names: &BTreeMap<&str, &str>) {
 }
 
 /// Call `f` on each type that `ty` holds, the same list as `Type::children`.
-fn each_child_mut(ty: &mut Type, f: &mut impl FnMut(&mut Type)) {
+pub(super) fn each_child_mut(ty: &mut Type, f: &mut impl FnMut(&mut Type)) {
     match ty {
         Type::Option(inner)
         | Type::COption(inner)

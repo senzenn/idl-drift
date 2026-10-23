@@ -73,6 +73,9 @@ pub struct Instruction {
     pub accounts: Vec<AccountItem>,
     #[serde(default)]
     pub args: Vec<Field>,
+    /// Explicit start of the arguments; `None` means right after the discriminators.
+    #[serde(default)]
+    pub payload_offset: Option<usize>,
     /// How a caller passes an absent optional account. Anchor IDLs do not say.
     #[serde(skip)]
     pub optional_accounts: OptionalAccounts,
@@ -216,14 +219,17 @@ pub struct NamedDisc {
 }
 
 impl Instruction {
-    /// Where the arguments start: after the discriminator bytes.
+    /// Where the arguments start: `payload_offset` when the IDL sets it, else after the
+    /// discriminator bytes.
     #[must_use]
     pub fn payload_start(&self) -> usize {
-        discriminator_end(
-            self.discriminator_offset,
-            &self.discriminator,
-            &self.extra_discriminators,
-        )
+        self.payload_offset.unwrap_or_else(|| {
+            discriminator_end(
+                self.discriminator_offset,
+                &self.discriminator,
+                &self.extra_discriminators,
+            )
+        })
     }
 }
 

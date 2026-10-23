@@ -32,7 +32,13 @@ pub fn from_codama(root: RootNode) -> Idl {
         .map(|a| {
             let discs = extract_account_discriminators(a);
             // Codama keeps account data inline; give it a `types` entry like Anchor does.
-            types.push(account_as_type_def(a, discs.end()));
+            let (ty, covered_end) = account_as_type_def(a, discs.end());
+            types.push(ty);
+            let payload_offset = if numeric_constant_discriminator(a) {
+                Some(0)
+            } else {
+                covered_end.and_then(|end| discs.body_offset(end))
+            };
             NamedDisc {
                 name: a.name.to_string(),
                 discriminator: discs.first,
@@ -46,7 +52,7 @@ pub fn from_codama(root: RootNode) -> Idl {
                         _ => None,
                     })
                     .and_then(|n| usize::try_from(n).ok()),
-                payload_offset: numeric_constant_discriminator(a).then_some(0),
+                payload_offset,
                 size_discriminator: size_discriminator(&a.discriminators),
             }
         })
@@ -109,13 +115,14 @@ fn convert_instruction(ix: &InstructionNode, pdas: &[PdaNode]) -> Instruction {
         .iter()
         .map(|a| convert_ix_account(a, ix, pdas))
         .collect();
-    let covered = covered_fields(
+    let (covered, covered_end) = covered_fields(
         ix.arguments.iter().map(|a| {
             let omitted = a.default_value_strategy == Some(DefaultValueStrategy::Omitted);
             (omitted, a.r#type.as_ref(), arg_default_bytes(a))
         }),
         discs.end(),
     );
+    let payload_offset = discs.body_offset(covered_end);
     let args = ix
         .arguments
         .iter()
@@ -133,6 +140,7 @@ fn convert_instruction(ix: &InstructionNode, pdas: &[PdaNode]) -> Instruction {
         size_discriminator: any_size_discriminator(&ix.discriminators),
         accounts,
         args,
+        payload_offset,
         optional_accounts: match ix.optional_account_strategy.unwrap_or_default() {
             codama_nodes::OptionalAccountStrategy::ProgramId => OptionalAccounts::ProgramId,
             codama_nodes::OptionalAccountStrategy::Omitted => OptionalAccounts::Omitted,
@@ -279,16 +287,21 @@ fn convert_defined_type(dt: &DefinedTypeNode) -> TypeDef {
 }
 
 /// `disc_end` is where the discriminator bytes end, which the leading omitted fields fill.
-fn account_as_type_def(a: &AccountNode, disc_end: usize) -> TypeDef {
-    let ty = match &a.data {
-        NestedTypeNode::Value(st) => TypeDefTy::Struct {
-            fields: struct_fields(&st.fields, disc_end),
-        },
-        wrapped => TypeDefTy::Type {
-            alias: unresolved(wrapper_kind(wrapped), wrapped),
-        },
+/// Also gives where those omitted fields end, for a struct body.
+fn account_as_type_def(a: &AccountNode, disc_end: usize) -> (TypeDef, Option<usize>) {
+    let (ty, covered_end) = match &a.data {
+        NestedTypeNode::Value(st) => {
+            let (fields, end) = body_fields(&st.fields, disc_end);
+            (TypeDefTy::Struct { fields }, Some(end))
+        }
+        wrapped => (
+            TypeDefTy::Type {
+                alias: unresolved(wrapper_kind(wrapped), wrapped),
+            },
+            None,
+        ),
     };
-    borsh_type_def(a.name.to_string(), ty)
+    (borsh_type_def(a.name.to_string(), ty), covered_end)
 }
 
 fn event_as_type_def(e: &EventNode, event: &Event) -> TypeDef {
@@ -327,32 +340,39 @@ fn wrapper_kind<T: TypeNodeTrait>(n: &NestedTypeNode<T>) -> &'static str {
     }
 }
 
-/// The fields after the omitted ones that fill the first `disc_end` bytes. Codama keeps an
-/// omitted field in the data, so every other field stays.
+/// The fields after the omitted ones that fill the first `disc_end` bytes.
 fn struct_fields(fields: &[StructFieldTypeNode], disc_end: usize) -> Vec<Field> {
-    let covered = covered_fields(
+    body_fields(fields, disc_end).0
+}
+
+/// As [`struct_fields`], and where the omitted fields end. Codama keeps an omitted field in
+/// the data, so every other field stays.
+fn body_fields(fields: &[StructFieldTypeNode], disc_end: usize) -> (Vec<Field>, usize) {
+    let (covered, covered_end) = covered_fields(
         fields.iter().map(|f| {
             let omitted = f.default_value_strategy == Some(DefaultValueStrategy::Omitted);
             (omitted, f.r#type.as_ref(), field_default_bytes(f))
         }),
         disc_end,
     );
-    fields
+    let kept = fields
         .iter()
         .skip(covered)
         .map(|f| Field {
             name: f.name.to_string(),
             ty: convert_type(&f.r#type),
         })
-        .collect()
+        .collect();
+    (kept, covered_end)
 }
 
-/// How many leading fields lie in the first `disc_end` bytes, which the discriminators hold.
-/// Each is `(omitted, type, default bytes)`. Only an omitted field of a known size counts.
+/// How many leading fields lie in the first `disc_end` bytes, which the discriminators hold,
+/// and where they end. Each is `(omitted, type, default bytes)`. Only an omitted field of a
+/// known size counts.
 fn covered_fields<'a>(
     fields: impl Iterator<Item = (bool, &'a TypeNode, Option<Vec<u8>>)>,
     disc_end: usize,
-) -> usize {
+) -> (usize, usize) {
     let mut end = 0usize;
     let mut count = 0;
     for (omitted, ty, default) in fields {
@@ -366,7 +386,7 @@ fn covered_fields<'a>(
             _ => break,
         }
     }
-    count
+    (count, end)
 }
 
 /// The byte size of a number or a fixed-size type; `None` for any other type.
@@ -751,6 +771,16 @@ struct Discs {
 impl Discs {
     fn end(&self) -> usize {
         discriminator_end(self.offset, &self.first, &self.extra)
+    }
+
+    /// The body start when a later discriminator lies on a field that the body keeps.
+    /// Shipstern starts after the first discriminator, and Codama after the omitted fields.
+    fn body_offset(&self, covered_end: usize) -> Option<usize> {
+        let start = self
+            .offset
+            .saturating_add(self.first.len())
+            .max(covered_end);
+        (start != self.end()).then_some(start)
     }
 }
 
