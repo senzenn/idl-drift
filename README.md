@@ -130,7 +130,27 @@ export IDL_DRIFT_RPC_URL=<your RPC URL>
 idl-drift diff --onchain <PROGRAM_ID> target/idl/my_program.json
 ```
 
-### 4. Check an IDL against real data
+### 4. Check the program id of an Anchor workspace
+
+Anchor keeps the program id in `declare_id!`, in `Anchor.toml` and in the IDL `address`.
+`idl-drift source` checks that they agree for each program. With `--onchain`, it also checks
+that the program is deployed at its `declare_id!`, and that its on-chain IDL gives the same
+address.
+
+```bash
+idl-drift source fixtures/source/drift
+```
+
+```text
+...
+  [BREAKING] amm@mainnet: [programs.mainnet] amm is 4SsxzsqrisRmgB5N7NfXVEuU9e9sssebVUyhzmD1rNpH, ...
+  [BREAKING] amm: target/idl/amm.json address is 5bVzRzm2mwUd3iKzXTD9S82SJLjJKxKXzRJrzDyCZ3JJ, ...
+  [COSMETIC] vault: no declare_id! at the crate root of programs/vault/src/lib.rs: the ids of vault cannot be checked
+summary: 2 breaking, 0 dangerous, 0 additive, 1 cosmetic
+exit code: 1
+```
+
+### 5. Check an IDL against real data
 
 From captured samples. This Codama conversion drops 7 bytes of padding:
 
@@ -151,7 +171,7 @@ export IDL_VERIFY_RPC_URL=<your RPC URL>
 idl-verify --idl idl.json --save-samples samples.json
 ```
 
-### 5. Measure the upgrade impact before a deploy
+### 6. Measure the upgrade impact before a deploy
 
 `--upgrade-impact` reads the live accounts of the program with the new IDL. It counts the
 accounts that break or need a realloc, and the extra rent.
@@ -176,7 +196,7 @@ Both tools use the same exit codes:
 |---|---|
 | `0` | No finding at or above `--fail-on`. |
 | `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, or a padded zero-copy type that Borsh also reads. |
-| `2` | The tool could not run: a file could not be read or parsed, an option is wrong, or (idl-verify) the RPC or decoder failed or nothing was sampled. |
+| `2` | The tool could not run: a file could not be read or parsed, an option is wrong, an RPC request failed (`diff --onchain`, `source --onchain`, idl-verify), or (idl-verify) the decoder failed or nothing was sampled. |
 
 ## Use it in CI
 
@@ -243,7 +263,8 @@ On 2026-10-16, with live mainnet data:
 ## Limits
 
 - The tools read IDLs, not program source code. A change that the IDL does not show is not
-  found.
+  found. `idl-drift source` is the one exception: it reads only the program id from the
+  source.
 - Live sampling sees recent transactions only. Instructions and account types that nobody
   uses in that window are not checked.
 - For Shank IDLs (for example Metaplex and Phoenix), the tools check instructions only.

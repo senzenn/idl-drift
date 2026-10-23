@@ -7,9 +7,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `idl-drift source` checks that an Anchor workspace gives each program one id in
+  `declare_id!`, `Anchor.toml` and `target/idl`, and with `--onchain`, on chain. The GitHub
+  Action runs it with `command: source`.
 - `idl-drift inspect` lists, on `SHIPSTERN:` lines, instructions that Shipstern cannot tell
   apart and account types that Shipstern skips. The exit code does not change.
 - Library: `idl_drift::markdown::escape_control` writes each control character as an escape.
+- Library: `idl_drift::source` holds the program-id check. `discover` reads a workspace,
+  `read_idl` reads one more IDL, `check` compares the ids, and `check_onchain` checks the
+  chain through an RPC call that the caller gives.
 
 ### Changed
 
@@ -67,6 +73,7 @@ The first release of `idl-drift` and `idl-verify`.
   change.
 - `idl-drift inspect IDL` lists unresolved fields, types that the IDL uses but does not
   define, and padded zero-copy types that Borsh also reads. `--layout` prints each zero-copy
+  The GitHub Action writes them as `?` in the job log.
   type field by field. A generic parameter that its type declares is not unresolved.
 - Shank IDLs: instruction tags come from `discriminant`. Shank maps and sets load.
 - Const generic values are read as Codama's Anchor converter and Shipstern read them (JS

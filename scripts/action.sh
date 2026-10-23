@@ -39,9 +39,9 @@ sha256() {
 # Sets `tool` from the command input. Not in a subshell, so that `fail` can stop the step.
 set_tool() {
   case ${INPUT_COMMAND:-diff} in
-    diff) tool=idl-drift ;;
+    diff | source) tool=idl-drift ;;
     verify) tool=idl-verify ;;
-    *) fail "idl-drift action" "The command input must be diff or verify, not \`$INPUT_COMMAND\`." ;;
+    *) fail "idl-drift action" "The command input must be diff, source or verify, not \`$INPUT_COMMAND\`." ;;
   esac
 }
 
@@ -128,14 +128,32 @@ base_version() {
   git -C "$dir" show "origin/$BASE_REF:./$file" >"$old"
 }
 
+# A path input must stay in the checkout. A symlink in a pull request could otherwise make the
+# tool read a file on the runner and print a part of it.
+in_workspace() {
+  [[ -z ${GITHUB_WORKSPACE:-} ]] && return 0
+  local real workspace
+  real=$(realpath -- "$1" 2>/dev/null) || return 1
+  workspace=$(realpath -- "$GITHUB_WORKSPACE") || return 1
+  [[ $real == "$workspace" || $real == "$workspace"/* ]]
+}
+
 run() {
   local tool bin out report summary cmd extra old live=false samples="" code=0
+  local command=${INPUT_COMMAND:-diff}
   set_tool
   bin=${IDL_DRIFT_BIN:?the install step sets IDL_DRIFT_BIN}
   : "${GITHUB_OUTPUT:?}" "${GITHUB_STEP_SUMMARY:?}"
-  if [[ ! -f ${INPUT_IDL:-} ]]; then
+  # source finds the IDLs in the workspace; the idl input only adds one.
+  if [[ ($command != source || -n ${INPUT_IDL:-}) && ! -f ${INPUT_IDL:-} ]]; then
     fail "$tool could not run" "The idl input \`${INPUT_IDL:-}\` is not a file. Give the path of the new IDL."
   fi
+  local input
+  for input in "${INPUT_IDL:-}" "${INPUT_ALLOW:-}"; do
+    if [[ -n $input ]] && ! in_workspace "$input"; then
+      fail "$tool could not run" "The input \`$input\` resolves to a path outside the workspace."
+    fi
+  done
   if [[ -n ${INPUT_RPC_URL:-} ]]; then
     # The mask covers one line only, so a line break could print the rest of the URL.
     if [[ $INPUT_RPC_URL == *[$'\r\n']* ]]; then
@@ -149,7 +167,19 @@ run() {
   # Split on whitespace only: no globs, quotes or variables.
   read -r -d '' -a extra <<<"${INPUT_ARGS:-}" || true
 
-  if [[ $tool == idl-drift ]]; then
+  if [[ $command == source ]]; then
+    if [[ -n ${INPUT_OLD:-}${INPUT_PROGRAM:-}${INPUT_ALLOW:-} ]]; then
+      fail "idl-drift could not run" "The source command reads the program id from the workspace, and takes no old, program or allow input. Set rpc-url to also check the chain."
+    fi
+    cmd=(source)
+    if [[ -n ${INPUT_IDL:-} ]]; then
+      cmd+=(--idl "$INPUT_IDL")
+    fi
+    if [[ -n ${INPUT_RPC_URL:-} ]]; then
+      export IDL_DRIFT_RPC_URL=$INPUT_RPC_URL
+      cmd+=(--onchain)
+    fi
+  elif [[ $tool == idl-drift ]]; then
     cmd=(diff)
     if [[ -n ${INPUT_PROGRAM:-} ]]; then
       if [[ -n ${INPUT_OLD:-} ]]; then
@@ -231,9 +261,12 @@ run() {
   echo "::stop-commands::$token"
   cat "$out/stderr.txt"
   if command -v jq >/dev/null; then
-    jq -r '{breaking: 0, dangerous: 1, additive: 2, cosmetic: 3, error: 0, warning: 1, note: 2} as $rank
+    # A control character in IDL text could move the cursor or add a line in the log. jq's gsub
+    # is quadratic in the string length, so map the code points.
+    jq -r 'def clean: explode | map(if . < 32 or (. >= 127 and . < 160) then 63 else . end) | implode;
+      {breaking: 0, dangerous: 1, additive: 2, cosmetic: 3, error: 0, warning: 1, note: 2} as $rank
       | (.changes // .findings // []) | sort_by($rank[.severity])[]
-      | "\(if .allowed then "allowed " else "" end)\(.severity): \(.kind // .check) \(.subject): \(.message)"' \
+      | "\(if .allowed then "allowed " else "" end)\(.severity): \(.kind // .check) \(.subject | clean): \(.message | clean)"' \
       "$report" 2>/dev/null || true
   fi
   echo "::$token::"
@@ -252,7 +285,9 @@ run() {
   case $code in
     0) ;;
     1)
-      if [[ $tool == idl-drift ]]; then
+      if [[ $command == source ]]; then
+        echo "::error title=Program id drift::At least one finding is at or above the fail-on tier: the workspace does not give one program id. The job summary lists each finding."
+      elif [[ $tool == idl-drift ]]; then
         echo "::error file=$(escape_property "$INPUT_IDL"),title=IDL drift::At least one change is at or above the fail-on tier. The job summary lists each change."
       else
         echo "::error file=$(escape_property "$INPUT_IDL"),title=IDL drift::At least one finding is at or above the fail-on severity: the program or your parser does not match the IDL. The job summary lists each finding."

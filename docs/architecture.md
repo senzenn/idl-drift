@@ -6,7 +6,7 @@ The repository is a Cargo workspace with two crates. Each crate is a library and
 
 | Crate | Main dependencies | Responsibility |
 |---|---|---|
-| `idl-drift` | `codama-nodes`, `serde`, `sha2`, `flate2`, `curve25519-dalek`, `clap`, `ureq` | The IDL model, layouts, the diff rules, `inspect` and the on-chain IDL reader. |
+| `idl-drift` | `codama-nodes`, `serde`, `sha2`, `flate2`, `curve25519-dalek`, `clap`, `ureq` | The IDL model, layouts, the diff rules, `inspect`, the on-chain IDL reader and the program-id check (`source`). |
 | `idl-verify` | `idl-drift`, `ureq`, `serde`, `clap` | Samples, live sampling, the runtime decoder, the checks and value comparison. |
 
 Neither crate depends on the Solana SDK or on Anchor. Both tools read IDLs as JSON.
@@ -34,6 +34,7 @@ flowchart LR
 | `idl-drift` | Diff rules | Finds the reachable types, compares the two IDLs by name and by position, and gives each change a severity and a `kind`. When the formats differ, it first brings both IDLs to the same names and shapes. |
 | `idl-drift` | Inspect | Lists `Generic` fields and types that are used but not defined, prints zero-copy layouts, and finds padded zero-copy types that Borsh also reads. |
 | `idl-drift` | On-chain IDL | Finds the program's Program Metadata `idl` account and Anchor IDL account, and reads the IDL from them. The account data is untrusted: each length is checked, and decompression stops at 16 MiB. |
+| `idl-drift` | Program-id check (`src/source.rs`) | Reads the program id of an Anchor workspace from `declare_id!`, `Anchor.toml` and the IDL addresses, and compares the other ids with `declare_id!`. With `--onchain`, it also reads the program account and the on-chain IDL. It reads only regular files under the workspace root and the `--idl` files, each up to 16 MiB. The test workspaces are in `fixtures/source/`. |
 | `idl-verify` | Samples | Loads and saves the samples file. |
 | `idl-verify` | Live sampler | Reads the program's transactions and accounts over JSON-RPC. It tracks the invoke stack, so that a log line is credited only to the innermost running program. It stops at the program's last deploy, because older transactions ran other code. |
 | `idl-verify` | Runtime decoder | Decodes bytes with the IDL model alone: Borsh types in order, zero-copy types at their `repr(C)` offsets. It returns the value and the number of bytes it read. |

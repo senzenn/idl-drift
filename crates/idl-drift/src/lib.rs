@@ -25,6 +25,7 @@ mod reach;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod shipstern;
+pub mod source;
 
 pub use diff::{diff, Change, ChangeKind, Report, Severity};
 pub use inspect::{coverage, layouts, CoverageReport, TypeLayout, UnmappedField};
