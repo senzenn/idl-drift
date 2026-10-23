@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "idl-drift"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "idl-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bs58",
