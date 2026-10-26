@@ -30,7 +30,7 @@ The smallest step diffs an IDL with the same file on the base branch of the pull
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-- uses: senzenn/idl-drift@v0.2.0
+- uses: senzenn/idl-drift@v0.3.0
   with:
     idl: idls/my_program.json
 ```
@@ -70,9 +70,9 @@ For stable results, pin the action to a full commit SHA, and set `version` to th
 that commit, so that the action downloads the release binary:
 
 ```yaml
-- uses: senzenn/idl-drift@<full commit SHA> # v0.2.0
+- uses: senzenn/idl-drift@<full commit SHA> # v0.3.0
   with:
-    version: v0.2.0
+    version: v0.3.0
     idl: idls/my_program.json
 ```
 

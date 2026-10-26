@@ -32,7 +32,7 @@ jobs:
       # - run: cargo build --release --bin verify-decoder
 
       # For stable results, pin a full commit SHA here and set `version` to its tag.
-      - uses: senzenn/idl-drift@v0.2.0
+      - uses: senzenn/idl-drift@v0.3.0
         id: verify
         with:
           command: verify
