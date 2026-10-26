@@ -51,6 +51,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 bash integration/run-all.sh
+cargo build --locked -p idl-drift -p idl-verify && IDL_DRIFT_BIN=target/debug bash scripts/test-action.sh
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo +1.91 check --workspace --all-targets --locked
 ```

@@ -28,6 +28,8 @@ owo-colors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+# Anchor.toml and Cargo.toml for `source`. codama-nodes already builds this version.
+toml = "0.8"
 ureq = { version = "3.4", features = ["json"], optional = true }
 
 [features]

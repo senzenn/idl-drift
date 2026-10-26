@@ -3,9 +3,9 @@
 
 mod common;
 
-use common::{fixture, fixture_text, messages, parse};
-use idl_drift::diff;
+use common::{fixture, fixture_text, idl_kinds, messages, parse};
 use idl_drift::model::{AccountItem, Format};
+use idl_drift::{diff, ChangeKind, Severity};
 
 #[test]
 fn same_program_in_two_formats_diffs_clean() {
@@ -223,7 +223,8 @@ fn a_struct_field_that_links_a_struct_reads_like_an_inline_one() {
     );
     let config =
         |fee: &str| codama_struct(&[("fee", &codama_num(fee)), ("bump", &codama_num("u8"))]);
-    let codama = |cfg: &str| {
+    let link_config = r#"{"kind":"definedTypeLinkNode","name":"config"}"#;
+    let codama = |name: &str, cfg: &str| {
         parse(&format!(
             r#"{{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
             "program":{{"kind":"programNode","name":"p","publicKey":"P","version":"1","instructions":[],"pdas":[],"errors":[],"events":[],
@@ -235,7 +236,7 @@ fn a_struct_field_that_links_a_struct_reads_like_an_inline_one() {
               {},{}]}},
               "discriminators":[{{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0}}]}}]}}}}"#,
             config("u16"),
-            codama_field("structFieldTypeNode", "cfg", cfg),
+            codama_field("structFieldTypeNode", name, cfg),
             codama_field(
                 "structFieldTypeNode",
                 "owner",
@@ -243,17 +244,97 @@ fn a_struct_field_that_links_a_struct_reads_like_an_inline_one() {
             ),
         ))
     };
-    let link = codama(r#"{"kind":"definedTypeLinkNode","name":"config"}"#);
-    for (old, new) in [
-        (&anchor, &codama(&config("u16"))),
-        (&link, &codama(&config("u16"))),
-    ] {
+    let link = codama("cfg", link_config);
+    let inline = codama("cfg", &config("u16"));
+    for (old, new) in [(&anchor, &inline), (&link, &inline), (&inline, &link)] {
         let report = diff(old, new);
         assert!(report.changes.is_empty(), "{:#?}", report.changes);
     }
     assert_eq!(
-        messages(&link, &codama(&config("u32"))),
+        messages(&link, &codama("cfg", &config("u32"))),
         ["FIELD changed (vault#0) via reachable type: cfg: config -> { fee: u32, bump: u8 } (Borsh layout)"]
+    );
+    // The bytes are the same, so only the name changed.
+    assert_eq!(
+        idl_kinds(&link, &codama("settings", &config("u16"))),
+        [(Severity::Dangerous, ChangeKind::FieldRenamed)]
+    );
+    // A struct type is not an alias, so this alias holds an array of `config`.
+    let configs = |item: &str| {
+        let configs = format!(
+            r#"{{"kind":"arrayTypeNode","item":{item},"count":{{"kind":"fixedCountNode","value":2}}}}"#
+        );
+        parse(&codama_go(
+            &[codama_field(
+                "instructionArgumentNode",
+                "cfgs",
+                r#"{"kind":"definedTypeLinkNode","name":"configs"}"#,
+            )],
+            &format!(
+                "{},{}",
+                codama_field("definedTypeNode", "config", &config("u16")),
+                codama_field("definedTypeNode", "configs", &configs)
+            ),
+        ))
+    };
+    let report = diff(&configs(link_config), &configs(&config("u16")));
+    assert!(report.changes.is_empty(), "{:#?}", report.changes);
+}
+
+/// Codama types for the same bytes: each level is a link on one side and an inline struct on
+/// the other, with `w * w` pairs. Gives the types and the top type, old side first.
+fn link_inline_levels(p: &str, w: usize, levels: usize) -> [(String, String); 2] {
+    let link = |name: String| format!(r#"{{"kind":"definedTypeLinkNode","name":"{p}{name}"}}"#);
+    let def = |name: String, ty: &str| codama_field("definedTypeNode", &format!("{p}{name}"), ty);
+    let wide = |field: &str, ty: &str| {
+        let fields: Vec<String> = (0..w)
+            .map(|i| codama_field("structFieldTypeNode", &format!("{field}{i}"), ty))
+            .collect();
+        format!(
+            r#"{{"kind":"structTypeNode","fields":[{}]}}"#,
+            fields.join(",")
+        )
+    };
+    let leaf = codama_struct(&[("f0", &codama_num("u8"))]);
+    let mut old = vec![def("a0".into(), &leaf)];
+    let mut new = Vec::new();
+    let mut inline = leaf;
+    for k in 1..=levels {
+        let below = link(format!("a{}", k - 1));
+        old.push(def(format!("a{k}"), &wide("f", &wide("g", &below))));
+        new.push(def(format!("b{k}"), &wide("g", &inline)));
+        inline = wide("f", &link(format!("b{k}")));
+    }
+    [
+        (old.join(","), link(format!("a{levels}"))),
+        (new.join(","), inline),
+    ]
+}
+
+#[test]
+fn a_link_inline_compare_too_wide_or_too_deep_stops_with_a_change() {
+    // The bytes are the same, but a compare stops at depth 16 or after 2^14 nodes, and then
+    // reports a change. `wide` has 16^7 pairs to compare. `deep` goes to depth 16.
+    let [wide_old, wide_new] = link_inline_levels("w", 4, 7);
+    let [deep_old, deep_new] = link_inline_levels("d", 1, 8);
+    let idl = |(wide_types, wide): &(String, String), (deep_types, deep): &(String, String)| {
+        let top = codama_field(
+            "definedTypeNode",
+            "top",
+            &codama_struct(&[("wide", wide), ("deep", deep)]),
+        );
+        parse(&codama_go(
+            &[codama_field(
+                "instructionArgumentNode",
+                "top",
+                r#"{"kind":"definedTypeLinkNode","name":"top"}"#,
+            )],
+            &format!("{wide_types},{deep_types},{top}"),
+        ))
+    };
+    assert_eq!(
+        idl_kinds(&idl(&wide_old, &deep_old), &idl(&wide_new, &deep_new)),
+        [(Severity::Breaking, ChangeKind::FieldChanged); 2]
     );
 }
 

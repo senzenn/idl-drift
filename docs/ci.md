@@ -122,3 +122,6 @@ GitHub stops scheduled workflows in a public repository after 60 days with no ac
   text.
 - A pull request from a fork gets no secrets. Run `verify` on `schedule` or
   `workflow_dispatch`, not on `pull_request_target`.
+- The CI of this repository runs `scripts/test-action.sh`. It runs the action script on small
+  workspaces, and checks that control characters reach the log as `?`, that an `idl` or
+  `allow` path outside the workspace stops the step, and the `exit-code` output.
