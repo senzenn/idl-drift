@@ -196,7 +196,7 @@ Both tools use the same exit codes:
 |---|---|
 | `0` | No finding at or above `--fail-on`. |
 | `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, or a padded zero-copy type that Borsh also reads. |
-| `2` | The tool could not run: a file could not be read or parsed, an option is wrong, an RPC request failed (`diff --onchain`, `source --onchain`, idl-verify), or (idl-verify) the decoder failed or nothing was sampled. |
+| `2` | The tool could not run: a file could not be read or parsed, an option is wrong, an RPC request failed (`diff --onchain`, `source --onchain`, idl-verify), (`source`) the workspace has nothing to compare, or (idl-verify) the decoder failed or nothing was sampled. |
 
 ## Use it in CI
 

@@ -759,13 +759,6 @@ fn run_source(args: &SourceCheckArgs, rpc_flag: bool, format: Format) -> Result<
     for path in &args.idl {
         ids.push(source::read_idl(path).map_err(input)?);
     }
-    // A wrong ROOT, or files that give no id, has nothing to compare. An exit 0 would pass it.
-    if ids.iter().all(|i| i.id.is_empty()) {
-        return Err(Failure::Input(format!(
-            "no program id under {}: no [programs.<cluster>] entry, root-level declare_id! or IDL address",
-            root.display()
-        )));
-    }
     let mut report = source::check(ids);
     if let Some(url) = url {
         let agent = idl_drift::rpc::agent();
@@ -774,10 +767,10 @@ fn run_source(args: &SourceCheckArgs, rpc_flag: bool, format: Format) -> Result<
         })
         .map_err(Failure::Onchain)?;
     }
-    // A finding, such as an invalid id, is a result. Only a run that found nothing stops.
-    if !report.compared() && report.findings.is_empty() {
+    // A wrong ROOT, or files that give no id, has nothing to compare. An exit 0 would pass it.
+    if report.nothing_to_compare() {
         return Err(Failure::Input(format!(
-            "nothing to compare under {}: no program has its id in two places",
+            "nothing to compare under {}: no program has a declare_id! or an IDL address to compare with another id",
             root.display()
         )));
     }
@@ -801,6 +794,7 @@ fn leg_text(leg: &Leg) -> String {
         Leg::Onchain { source, account } => {
             format!("address in the on-chain IDL ({source} account {account})")
         }
+        _ => "another place".to_string(),
     }
 }
 

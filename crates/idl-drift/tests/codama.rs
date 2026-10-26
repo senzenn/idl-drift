@@ -516,16 +516,25 @@ fn a_number_to_bytes_account_discriminator_moves_the_body() {
 
 #[test]
 fn an_allowed_account_discriminator_change_does_not_hide_a_moved_body() {
-    let root = |data: &str, offset: usize| {
+    // `tags` are omitted fields before `amount`, which a field discriminator reads.
+    let account = |tags: &str, discriminators: &str| {
         codama_root(
             "",
             &format!(
-                r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[
+                r#"{{"kind":"accountNode","name":"vault","data":{{"kind":"structTypeNode","fields":[{tags}
                 {{"kind":"structFieldTypeNode","name":"amount","type":{{"kind":"numberTypeNode","format":"u64","endian":"le"}}}}]}},
-                "discriminators":[{{"kind":"constantDiscriminatorNode","offset":{offset},"constant":{{"kind":"constantValueNode",
-                "type":{{"kind":"bytesTypeNode"}},"value":{{"kind":"bytesValueNode","data":"{data}","encoding":"base16"}}}}}}]}}"#
+                "discriminators":[{discriminators}]}}"#
             ),
             "",
+        )
+    };
+    let root = |data: &str, offset: usize| {
+        account(
+            "",
+            &format!(
+                r#"{{"kind":"constantDiscriminatorNode","offset":{offset},"constant":{{"kind":"constantValueNode",
+                "type":{{"kind":"bytesTypeNode"}},"value":{{"kind":"bytesValueNode","data":"{data}","encoding":"base16"}}}}}}"#
+            ),
         )
     };
     let allow = AllowList::parse("account_discriminator_changed vault").unwrap();
@@ -538,6 +547,25 @@ fn an_allowed_account_discriminator_change_does_not_hide_a_moved_body() {
         &parse(&root("01020304", 0)),
         &parse(&root("0102030405060708", 0)),
     );
+    report.allow(&allow);
+    assert!(!report.fails_at(Severity::Breaking), "{:?}", report.changes);
+    // The same for a longer later tag in an omitted field: `amount` moves from byte 5 to 6.
+    let later = |sub: &str| {
+        let tag = |name: &str, data: &str| {
+            format!(
+                r#"{{"kind":"structFieldTypeNode","name":"{name}","defaultValueStrategy":"omitted",
+                "type":{{"kind":"fixedSizeTypeNode","size":{},"type":{{"kind":"bytesTypeNode"}}}},
+                "defaultValue":{{"kind":"bytesValueNode","data":"{data}","encoding":"base16"}}}},"#,
+                data.len() / 2
+            )
+        };
+        parse(&account(
+            &(tag("discriminator", "01020304") + &tag("sub", sub)),
+            r#"{"kind":"fieldDiscriminatorNode","name":"discriminator","offset":0},
+            {"kind":"fieldDiscriminatorNode","name":"sub","offset":4}"#,
+        ))
+    };
+    let mut report = diff(&later("05"), &later("0506"));
     report.allow(&allow);
     assert!(!report.fails_at(Severity::Breaking), "{:?}", report.changes);
 }

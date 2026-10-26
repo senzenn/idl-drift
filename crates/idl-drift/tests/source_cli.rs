@@ -107,22 +107,20 @@ fn missing_root_exits_2_with_the_error_object() {
 }
 
 #[test]
-fn workspace_that_gives_no_id_exits_2() {
-    // The files exist but hold no id, so nothing can be compared.
-    let root = std::env::temp_dir().join(format!("idl-drift-no-id-{}", std::process::id()));
-    let src = root.join("programs/amm/src");
-    std::fs::create_dir_all(&src).unwrap();
+fn workspace_with_an_id_in_one_place_exits_2() {
+    // A valid id with no other copy and no finding is not a pass.
+    let root = std::env::temp_dir().join(format!("idl-drift-one-id-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
-        root.join("programs/amm/Cargo.toml"),
-        "[package]\nname = \"amm\"\n",
+        root.join("Anchor.toml"),
+        "[programs.mainnet]\namm = \"29dv8e1WcjL4w6a7HDaHbUfXrF12yiJiVcKQ1qgeT3rF\"\n",
     )
     .unwrap();
-    std::fs::write(src.join("lib.rs"), "pub fn f() {}\n").unwrap();
     let out = source().arg(&root).output().unwrap();
     std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no program id under"),
+        String::from_utf8_lossy(&out.stderr).contains("nothing to compare"),
         "{out:?}"
     );
 }
@@ -223,28 +221,19 @@ fn serve(results: Vec<&'static str>) -> String {
 }
 
 #[test]
-fn onchain_missing_program_is_breaking_and_missing_idl_is_dangerous() {
+fn onchain_sends_the_requests_to_the_rpc_url() {
+    // The chain rules have library tests. This test checks only the RPC wiring of the CLI.
     let no_account = r#"{"context":{"slot":1},"value":null}"#;
-    let program = r#"{"context":{"slot":1},"value":{"executable":true,"lamports":1,
-        "owner":"BPFLoaderUpgradeab1e11111111111111111111111","data":["","base64"],"rentEpoch":0}}"#;
-    let no_idl_accounts = r#"{"context":{"slot":1},"value":[null,null]}"#;
-    let cases = [
-        (vec![no_account], Some(1), "onchain_missing", "breaking"),
-        (
-            vec![program, no_idl_accounts],
-            Some(0),
-            "onchain_idl_missing",
-            "dangerous",
-        ),
-    ];
-    for (results, code, kind, severity) in cases {
-        let out = source()
-            .args([CONSISTENT, "--onchain", "--json"])
-            .env("IDL_DRIFT_RPC_URL", serve(results))
-            .output()
-            .unwrap();
-        let json: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(out.status.code(), code, "{json}");
-        assert_eq!(findings(&json), [(kind, "amm@chain", severity)], "{json}");
-    }
+    let out = source()
+        .args([CONSISTENT, "--onchain", "--json"])
+        .env("IDL_DRIFT_RPC_URL", serve(vec![no_account]))
+        .output()
+        .unwrap();
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{json}");
+    assert_eq!(
+        findings(&json),
+        [("onchain_missing", "amm@chain", "breaking")],
+        "{json}"
+    );
 }

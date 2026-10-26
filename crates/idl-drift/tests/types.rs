@@ -265,6 +265,19 @@ fn enum_middle_insert_and_removal_name_the_variant() {
 }
 
 #[test]
+fn enum_variant_swap_is_breaking() {
+    // Each tag now selects the other variant.
+    let swapped = mode_enum(r#"{"name":"Slow"},{"name":"Fast"}"#);
+    assert_eq!(
+        kinds(&mode_enum(FAST_SLOW), &swapped),
+        [
+            (Severity::Breaking, ChangeKind::VariantMoved),
+            (Severity::Breaking, ChangeKind::VariantMoved)
+        ]
+    );
+}
+
+#[test]
 fn enum_variant_rename_is_dangerous() {
     let renamed = mode_enum(r#"{"name":"Fast"},{"name":"Lazy"}"#);
     assert_eq!(

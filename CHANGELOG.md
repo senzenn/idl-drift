@@ -5,6 +5,35 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Library: `idl_drift::source::SourceReport::nothing_to_compare` is `true` when no program
+  was compared and there is no finding. `idl-drift source` stops with exit 2 on such a
+  report, and a caller must not take it as a pass.
+
+### Changed
+
+- Library: `idl_drift::source::FindingKind`, `Leg` and `SourceError` are now
+  `#[non_exhaustive]`, so a `match` on them needs a `_` arm.
+- Library: `SourceReport::compared` is `true` only for a program with a valid `declare_id!`
+  and one more valid id, or, with no valid `declare_id!`, a valid IDL address and a valid
+  `Anchor.toml` id.
+- `idl-drift source` lists the `Anchor.toml` ids by cluster, then program. It lists a
+  `declare_id!` value that `lib.rs` repeats only one time.
+
+### Fixed
+
+- `idl-drift source`: a hostile `lib.rs` no longer stalls the `declare_id!` scan.
+- `idl-drift source`: a `declare_id!` that rustc does not compile into `ID`, in a macro other
+  than `cfg_if!` or in a module glob that another id shadows, no longer counts. A
+  `use <module>::{ID, ..}` now counts.
+- `idl-drift source` reads the crate root at the Cargo `[lib] path`, and the `programs` of
+  `Anchor.toml` in each TOML form.
+- `idl-drift source`: two `Anchor.toml` clusters alone no longer count as compared, so the
+  run stops with exit 2.
+- `idl-drift source`: an IDL file whose `address` is empty or not a string is Breaking
+  `invalid_id`. It was Cosmetic.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
@@ -18,6 +47,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Library: `idl_drift::source` holds the program-id check. `discover` reads a workspace,
   `read_idl` reads one more IDL, `check` compares the ids, and `check_onchain` checks the
   chain through an RPC call that the caller gives.
+- Library: `idl_drift::shipstern` (`ambiguous_instructions`, `skipped_accounts`) lists what
+  Shipstern cannot parse.
 
 ### Changed
 
@@ -29,6 +60,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `idl_drift::layout::MAX_WORK` (65536) type nodes.
 - Library: `idl_drift::model::Instruction` has a new `payload_offset` field, as `NamedDisc`
   has. Code that builds an `Instruction` must set it.
+- Library: `idl_drift::layout::StructLayout::padding_len` now counts the padding inside fields
+  too.
 
 ### Fixed
 
