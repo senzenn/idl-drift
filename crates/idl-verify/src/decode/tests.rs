@@ -302,3 +302,64 @@ fn codama_only_encodings_decode_and_bad_tags_are_errors() {
     let long_form = decoder.borsh(&Type::ShortU16, &[0x80, 0x00]).unwrap_err();
     assert_eq!(long_form.kind, DecodeErrorKind::InvalidShortU16);
 }
+
+/// `S0` to `S{levels - 1}`, each with the fields that `fields(next type)` gives, and `last`.
+fn chain(levels: usize, attrs: &str, fields: impl Fn(&str) -> String, last: &str) -> Vec<String> {
+    (0..levels)
+        .map(|i| {
+            let next = format!(r#"{{"defined":{{"name":"S{}"}}}}"#, i + 1);
+            format!(
+                r#"{{"name":"S{i}",{attrs}"type":{{"kind":"struct","fields":{}}}}}"#,
+                fields(&next)
+            )
+        })
+        .chain([format!(
+            r#"{{"name":"S{levels}",{attrs}"type":{{"kind":"struct","fields":{last}}}}}"#
+        )])
+        .collect()
+}
+
+#[test]
+fn a_type_tree_that_doubles_at_each_level_stops_the_decode() {
+    // S0 holds two S1, S1 two S2, and so on to an empty struct: 2^17 values from 2 bytes.
+    let two = |next: &str| format!(r#"[{{"name":"a","type":{{"array":[{next},2]}}}}]"#);
+    for attrs in ["", r#""serialization":"bytemuck","repr":{"kind":"c"},"#] {
+        let idl = idl(&format!("[{}]", chain(17, attrs, two, "[]").join(",")));
+        let err = decode(&idl, "S0", &[0, 0]).unwrap_err();
+        assert_eq!(err.kind, DecodeErrorKind::TooLarge, "{attrs}");
+    }
+}
+
+#[test]
+fn a_type_tree_that_doubles_at_each_level_stops_the_size_walks() {
+    // A Vec walks its item type before it reads the items. The u8 leaf makes the smallest-size
+    // walk visit all 2^21 nodes, the empty leaf the zero-size walk, also with no items.
+    let two =
+        |next: &str| format!(r#"[{{"name":"a","type":{next}}},{{"name":"b","type":{next}}}]"#);
+    let vec_of = |leaf: &str| {
+        let mut types = chain(20, "", two, leaf);
+        types.push(
+            r#"{"name":"T","type":{"kind":"struct","fields":[
+                {"name":"v","type":{"vec":{"defined":{"name":"S0"}}}},
+                {"name":"w","type":{"vec":{"defined":{"name":"Z"}}}}]}},
+            {"name":"Z","type":{"kind":"struct","fields":[{"name":"a","type":"u8"},
+                {"name":"z","type":{"array":[{"defined":{"name":"S0"}},0]}}]}}"#
+                .to_string(),
+        );
+        idl(&format!("[{}]", types.join(",")))
+    };
+    let u8_leaf = vec_of(r#"[{"name":"x","type":"u8"}]"#);
+    // The walk stops early, and the bound it gives is still more than the 1 byte left.
+    let err = decode(&u8_leaf, "T", &[1, 0, 0, 0, 0]).unwrap_err();
+    let too_long = DecodeErrorKind::TooLong {
+        len: 1,
+        remaining: 1,
+    };
+    assert_eq!(err.kind, too_long);
+    let err = decode(&vec_of("[]"), "T", &[0, 0, 0, 0]).unwrap_err();
+    assert_eq!(err.kind, DecodeErrorKind::TooLarge);
+    // Borsh reads an empty Vec or array without the item size, so the data does not pay for
+    // that walk.
+    let data = [0, 0, 0, 0, 1, 0, 0, 0, 5];
+    assert_eq!(decode(&u8_leaf, "T", &data).map(|d| d.len), Ok(9));
+}

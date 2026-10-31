@@ -399,15 +399,18 @@ fn broken(e: &DecodeError) -> Class {
 }
 
 /// `ours` and `theirs` cut down to the struct fields that both IDLs name and the list items
-/// that both read. So a new field, or a reserved array that gives bytes to one, is not a
-/// difference. Other values compare whole.
+/// that both read, also inside a present option or the same enum variant. So a new field, or
+/// a reserved array that gives bytes to one, is not a difference. Other values compare whole.
 fn shared_fields(ours: &Value, theirs: &Json) -> (Json, Json) {
     match (ours, theirs) {
         (Value::Struct(fields), Json::Object(map)) => {
+            let mut by_key: BTreeMap<String, (&String, &Json)> = BTreeMap::new();
+            for (k, v) in map {
+                by_key.entry(normalize(k)).or_insert((k, v));
+            }
             let (mut a, mut b) = (Map::new(), Map::new());
             for (name, value) in fields {
-                let key = normalize(name);
-                if let Some((k, v)) = map.iter().find(|(k, _)| normalize(k) == key) {
+                if let Some(&(k, v)) = by_key.get(&normalize(name)) {
                     let (x, y) = shared_fields(value, v);
                     a.insert(name.clone(), x);
                     b.insert(k.clone(), y);
@@ -422,6 +425,20 @@ fn shared_fields(ours: &Value, theirs: &Json) -> (Json, Json) {
                 .map(|(x, y)| shared_fields(x, y))
                 .unzip();
             (Json::Array(a), Json::Array(b))
+        }
+        // `to_json` writes a present option as its value, and a variant as a one-key object.
+        (Value::Option(Some(inner)), other) if !other.is_null() => shared_fields(inner, other),
+        (Value::Enum { variant, value }, Json::Object(map))
+            if map.len() == 1 && map.keys().all(|k| normalize(k) == normalize(variant)) =>
+        {
+            let (a, b) = map
+                .iter()
+                .map(|(k, v)| {
+                    let (x, y) = shared_fields(value, v);
+                    ((variant.clone(), x), (k.clone(), y))
+                })
+                .unzip();
+            (Json::Object(a), Json::Object(b))
         }
         _ => (to_json(ours), theirs.clone()),
     }
@@ -608,6 +625,36 @@ mod tests {
             row(&impact(&appended, Some(&old), &samples)).realloc.count,
             1
         );
+    }
+
+    /// The new IDL's `{a: 5, b: 0}`: it adds `b` to a struct that the old IDL reads as `{a: 5}`.
+    fn with_new_field() -> Value {
+        Value::Struct(vec![("a".into(), Value::U8(5)), ("b".into(), Value::U8(0))])
+    }
+
+    #[test]
+    fn shared_fields_look_inside_an_option() {
+        let ours = Value::Option(Some(Box::new(with_new_field())));
+        assert_eq!(
+            shared_fields(&ours, &json!({"a": 5})),
+            (json!({"a": 5}), json!({"a": 5}))
+        );
+        // An option that only one IDL reads as present is still a difference.
+        assert_eq!(shared_fields(&ours, &Json::Null).0, to_json(&ours));
+    }
+
+    #[test]
+    fn shared_fields_look_inside_the_same_enum_variant() {
+        let ours = Value::Enum {
+            variant: "on".into(),
+            value: Box::new(with_new_field()),
+        };
+        assert_eq!(
+            shared_fields(&ours, &json!({"On": {"a": 5}})),
+            (json!({"on": {"a": 5}}), json!({"On": {"a": 5}}))
+        );
+        // Another variant compares whole.
+        assert_eq!(shared_fields(&ours, &json!({"Off": {}})).0, to_json(&ours));
     }
 
     #[test]

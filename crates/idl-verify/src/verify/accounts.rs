@@ -361,17 +361,24 @@ impl Verifier<'_> {
             // Anchor's `space` often reserves more than a Borsh type needs. A zero-copy
             // layout sets the size, so its unused bytes stay an error.
             let borsh = zero_copy.is_none();
-            // A Borsh-labeled struct whose padded repr(C) size is exactly the account size.
-            let padded = borsh
-                .then(|| self.decoder.types().struct_layout(td).ok())
-                .flatten()
-                .filter(|l| l.padding_len() > 0 && disc.checked_add(l.size) == Some(size));
             let zeros = borsh
                 && idxs.iter().all(|&i| {
                     accounts[i]
                         .data
                         .get(used..)
                         .is_some_and(|rest| rest.iter().all(|b| *b == 0))
+                });
+            // A Borsh-labeled struct whose padded repr(C) size is exactly the account size. Padding
+            // only at the end moves no field, so it counts only if a byte after the data is not 0.
+            let padded = borsh
+                .then(|| self.decoder.types().struct_layout(td).ok())
+                .flatten()
+                .filter(|l| {
+                    l.padding_len() > 0
+                        && (!zeros
+                            || l.padding.iter().any(|p| p.before.is_some())
+                            || l.fields.iter().any(|f| f.padding > 0))
+                        && disc.checked_add(l.size) == Some(size)
                 });
             let (severity, message, hint) = if let Some(layout) = padded {
                 // Name the field after the first gap, unless an earlier field has a gap inside.
@@ -776,6 +783,21 @@ mod tests {
 
         let zero_copy = r#"{"name":"A","serialization":"bytemuck","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}"#;
         let report = verify(&account_idl(zero_copy), &accounts(&[body]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
+    }
+
+    #[test]
+    fn repr_c_padding_only_at_the_end_is_not_a_misread_layout() {
+        // As Jito tip distribution `Config` on mainnet: disc + size_of::<A>() bytes. Padding
+        // after the last field moves no field, so Borsh reads each field correctly.
+        let borsh = r#"{"name":"A","type":{"kind":"struct","fields":[{"name":"a","type":"u16"},{"name":"b","type":"u16"},{"name":"c","type":"u8"}]}}"#;
+        let report = verify(&account_idl(borsh), &accounts(&[&[1, 0, 2, 0, 3, 0]]), None);
+        let f = only(&report);
+        assert_eq!((f.severity, f.check), (Severity::Warning, Check::BytesUsed));
+
+        // A stale IDL that lacks a last field `d: u8` gives the same size.
+        let report = verify(&account_idl(borsh), &accounts(&[&[1, 0, 2, 0, 3, 9]]), None);
         let f = only(&report);
         assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
     }

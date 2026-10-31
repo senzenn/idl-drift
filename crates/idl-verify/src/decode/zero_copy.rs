@@ -4,10 +4,10 @@ use idl_drift::model::{ArrayLen, Type, TypeDef, TypeDefTy};
 
 use super::generics::Scope;
 use super::reader::Reader;
-use super::{DecodeError, DecodeErrorKind, Decoded, Decoder, Value};
-use crate::layout::{LayoutError, MAX_DEPTH};
+use super::{Call, DecodeError, DecodeErrorKind, Decoded, Value};
+use crate::layout::LayoutError;
 
-impl Decoder<'_> {
+impl Call<'_, '_> {
     pub(super) fn zero_copy(&self, td: &TypeDef, data: &[u8]) -> Result<Decoded, DecodeError> {
         let layout = self
             .types
@@ -65,9 +65,7 @@ impl Decoder<'_> {
         at: usize,
         depth: usize,
     ) -> Result<Value, DecodeError> {
-        if depth > MAX_DEPTH {
-            return Err(DecodeError::new(at, DecodeErrorKind::TooDeep));
-        }
+        self.step(at, depth)?;
         let layout_err = |e| DecodeError::new(at, DecodeErrorKind::Layout(e));
         match ty {
             Type::Defined { name, .. } => {
