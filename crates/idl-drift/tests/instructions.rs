@@ -5,9 +5,20 @@ mod common;
 
 use common::{empty_idl, idl_kinds, kinds, max_sev, messages, parse, AMM_OLD};
 use idl_drift::model::{
-    Account, AccountItem, Format, Idl, Instruction, NamedDisc, OptionalAccounts,
+    Account, AccountItem, Event, Format, Idl, Instruction, NamedDisc, OptionalAccounts, TypeDef,
+    TypeDefTy,
 };
 use idl_drift::{diff, ChangeKind, Severity};
+
+fn empty_struct(name: &str) -> TypeDef {
+    TypeDef {
+        name: name.into(),
+        serialization: "borsh".into(),
+        repr: None,
+        generics: vec![],
+        ty: TypeDefTy::Struct { fields: vec![] },
+    }
+}
 
 fn bare_idl(instructions: Vec<Instruction>) -> Idl {
     Idl {
@@ -112,28 +123,83 @@ fn same_disc_different_account_count_is_not_a_change() {
 }
 
 #[test]
-fn disambiguation_order_change_is_dangerous() {
-    // Counts {2,4} become {2,3} by dropping an optional tail account, which alone is only
-    // Dangerous.
+fn disambiguation_order_change_is_breaking_when_an_old_parser_routes_elsewhere() {
+    // An old parser takes the highest old count at or below the number of accounts that only
+    // one instruction has.
     let disc = vec![0xaa, 0xbb];
-    let old = bare_idl(vec![
-        ix("swap_a", disc.clone(), vec![acct("a"), acct("b")]),
-        ix(
-            "swap_b",
-            disc.clone(),
-            vec![acct("a"), acct("b"), acct("c"), opt_acct("d")],
-        ),
-    ]);
-    let new = bare_idl(vec![
-        ix("swap_a", disc.clone(), vec![acct("a"), acct("b")]),
-        ix("swap_b", disc, vec![acct("a"), acct("b"), acct("c")]),
-    ]);
+    let two = |a: Vec<AccountItem>, b: Vec<AccountItem>| {
+        bare_idl(vec![
+            ix("swap_a", disc.clone(), a),
+            ix("swap_b", disc.clone(), b),
+        ])
+    };
+    let old = two(
+        vec![acct("a"), acct("b")],
+        vec![acct("a"), acct("b"), acct("c"), opt_acct("d")],
+    );
+    // Counts {2,4} become {2,3} by dropping an optional tail account, which alone is only
+    // Dangerous. A 3-account swap_b goes to swap_a.
+    let new = two(
+        vec![acct("a"), acct("b")],
+        vec![acct("a"), acct("b"), acct("c")],
+    );
     assert_eq!(
         idl_kinds(&old, &new),
         [
             (Severity::Dangerous, ChangeKind::OptionalAccountRemoved),
-            (Severity::Dangerous, ChangeKind::DispatchOrderChanged)
+            (Severity::Breaking, ChangeKind::DispatchOrderChanged)
         ]
+    );
+    assert_eq!(
+        messages(&old, &new)[1],
+        "disambiguation order changed for discriminator aabb: account counts {2,4} -> {2,3}: parsers built from the old IDL route swap_b with 3 accounts to [swap_a]"
+    );
+    let dispatch = |old: &Idl, new: &Idl| -> Vec<Severity> {
+        diff(old, new)
+            .changes
+            .into_iter()
+            .filter(|c| c.kind == ChangeKind::DispatchOrderChanged)
+            .map(|c| c.severity)
+            .collect()
+    };
+    // The counts swap, so the set stays {2,4}, but each instruction goes to the other.
+    let swapped = two(
+        vec![acct("a"), acct("b"), acct("c"), opt_acct("d")],
+        vec![acct("a"), acct("b")],
+    );
+    assert_eq!(dispatch(&old, &swapped), [Severity::Breaking]);
+    // A 5-account swap_b still goes to swap_b.
+    let grown = two(
+        vec![acct("a"), acct("b")],
+        vec![
+            acct("a"),
+            acct("b"),
+            acct("c"),
+            opt_acct("d"),
+            opt_acct("e"),
+        ],
+    );
+    assert_eq!(dispatch(&old, &grown), [Severity::Dangerous]);
+    // swap_b and swap_c share 4, so an old parser has no arm for 4. A 5-account swap_a
+    // still goes to swap_a.
+    let four = vec![acct("a"), acct("b"), acct("c"), acct("d")];
+    let three = |a: Vec<AccountItem>| {
+        bare_idl(vec![
+            ix("swap_a", disc.clone(), a),
+            ix("swap_b", disc.clone(), four.clone()),
+            ix("swap_c", disc.clone(), four.clone()),
+        ])
+    };
+    let five = vec![
+        acct("a"),
+        acct("b"),
+        opt_acct("c"),
+        opt_acct("d"),
+        opt_acct("e"),
+    ];
+    assert_eq!(
+        dispatch(&three(vec![acct("a"), acct("b")]), &three(five)),
+        [Severity::Dangerous]
     );
 }
 
@@ -290,10 +356,12 @@ fn account_types_with_one_size_discriminator_collide() {
     };
     let old = Idl {
         accounts: vec![sized("Pool")],
+        types: vec![empty_struct("Pool")],
         ..empty_idl()
     };
     let new = Idl {
         accounts: vec![sized("Pool"), sized("Vault")],
+        types: vec![empty_struct("Pool"), empty_struct("Vault")],
         ..empty_idl()
     };
     assert_eq!(
@@ -306,6 +374,73 @@ fn account_types_with_one_size_discriminator_collide() {
     assert_eq!(
         idl_kinds(&new, &new),
         [(Severity::Dangerous, ChangeKind::CollisionPreexisting)]
+    );
+}
+
+#[test]
+fn account_or_event_types_with_one_discriminator_collide() {
+    // Shipstern's account parser takes the first type whose discriminator matches. Its event
+    // parser stops the build.
+    let account = |name: &str| NamedDisc {
+        name: name.into(),
+        discriminator: vec![1],
+        discriminator_offset: 0,
+        extra_discriminators: vec![],
+        size: None,
+        size_discriminator: None,
+        payload_offset: None,
+    };
+    let event = |name: &str| Event {
+        name: name.into(),
+        discriminator: vec![9; 8],
+        discriminator_offset: 0,
+        extra_discriminators: vec![],
+        envelope_discriminator: vec![],
+        envelope_payload_offset: None,
+    };
+    let old = Idl {
+        accounts: vec![account("Pool")],
+        events: vec![event("Swapped")],
+        types: vec![empty_struct("Pool"), empty_struct("Swapped")],
+        ..empty_idl()
+    };
+    let new = Idl {
+        accounts: vec![account("Pool"), account("Position")],
+        events: vec![event("Swapped"), event("FeePaid")],
+        types: ["Pool", "Position", "Swapped", "FeePaid"]
+            .map(empty_struct)
+            .into(),
+        ..empty_idl()
+    };
+    assert_eq!(
+        messages(&old, &new),
+        [
+            "unresolvable collision on account discriminator 01: [Pool, Position] all decode as Pool",
+            "unresolvable collision on event discriminator 0909090909090909: [Swapped, FeePaid]: no parser can be generated",
+            "new account type: Position",
+            "new event type: FeePaid"
+        ]
+    );
+    // The subject differs from an instruction collision on the same bytes.
+    let preexisting: Vec<_> = diff(&new, &new)
+        .changes
+        .into_iter()
+        .map(|c| (c.severity, c.kind, c.subject))
+        .collect();
+    assert_eq!(
+        preexisting,
+        [
+            (
+                Severity::Dangerous,
+                ChangeKind::CollisionPreexisting,
+                "account:01".to_owned()
+            ),
+            (
+                Severity::Dangerous,
+                ChangeKind::CollisionPreexisting,
+                "event:0909090909090909".to_owned()
+            )
+        ]
     );
 }
 

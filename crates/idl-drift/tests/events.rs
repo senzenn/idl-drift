@@ -14,7 +14,8 @@ fn event_envelope_length_8_to_1_is_breaking() {
             r#"{{"address":"A","metadata":{{"name":"e","version":"1","spec":"0.1.0"}},
   "instructions":[{{"name":"noop","discriminator":[1],"accounts":[],"args":[]}}],
   "events":[{{"name":"Trade","discriminator":[1,2,3,4,5,6,7,8],
-    "envelope_discriminator":[{envelope}],"envelope_payload_offset":{offset}}}]}}"#
+    "envelope_discriminator":[{envelope}],"envelope_payload_offset":{offset}}}],
+  "types":[{{"name":"Trade","type":{{"kind":"struct","fields":[]}}}}]}}"#
         ))
     };
     assert_eq!(
