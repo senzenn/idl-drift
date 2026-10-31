@@ -145,6 +145,26 @@ fn legacy_discriminators_match_the_real_ones() {
 }
 
 #[test]
+fn legacy_account_and_event_discriminators_hash_the_rust_type_name() {
+    // Pyth's on-chain IDL writes `priceUpdateV2`, but the account on chain starts with
+    // sha256("account:PriceUpdateV2").
+    let idl = parse(
+        r#"{"version":"0.1.0","name":"pyth","metadata":{"address":"A"},"instructions":[],
+            "accounts":[{"name":"priceUpdateV2","type":{"kind":"struct","fields":[]}}],
+            "events":[{"name":"priceFeedMessage","fields":[]}]}"#,
+    );
+    assert_eq!(
+        idl.accounts[0].discriminator,
+        [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]
+    );
+    // sha256("event:PriceFeedMessage")
+    assert_eq!(
+        idl.events[0].discriminator,
+        [0x44, 0xd2, 0xe5, 0xa4, 0xaf, 0x38, 0xd7, 0x81]
+    );
+}
+
+#[test]
 fn anchor_spec_other_than_0_1_0_fails_with_its_spec() {
     let err =
         Idl::from_json(r#"{"address":"A","metadata":{"name":"t","version":"1","spec":"0.2.0"}}"#)
@@ -152,6 +172,21 @@ fn anchor_spec_other_than_0_1_0_fails_with_its_spec() {
     assert_eq!(
         err.to_string(),
         "Anchor IDL spec 0.2.0 is not supported; only spec 0.1.0 can be read"
+    );
+}
+
+#[test]
+fn quasar_idl_fails_with_its_spec() {
+    let err = Idl::from_json(
+        r#"{"spec":"quasar-idl/1.0.0","name":"vault","version":"0.1.0",
+            "address":"11111111111111111111111111111111",
+            "instructions":[{"name":"deposit","discriminator":[0],"accounts":[],
+              "args":[{"name":"amount","type":"u64"},{"name":"memo","type":"string"}]}]}"#,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "IDL spec quasar-idl/1.0.0 is not supported; only Anchor, Shank and Codama IDLs can be read"
     );
 }
 

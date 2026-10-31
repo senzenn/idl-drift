@@ -226,6 +226,59 @@ fn alias_target_change_is_breaking() {
 }
 
 #[test]
+fn a_link_to_an_alias_reads_like_its_target() {
+    // Shipstern writes the alias target in the generated type, so the bytes are the same.
+    let idl = |amount: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"a","version":"1","spec":"0.1.0"}},
+  "instructions":[{{"name":"x","discriminator":[1],"accounts":[],
+    "args":[{{"name":"limit","type":{{"option":{amount}}}}}]}}],
+  "accounts":[{{"name":"Pool","discriminator":[2]}}],
+  "types":[{{"name":"Amount","type":{{"kind":"type","alias":"u64"}}}},
+    {{"name":"Pool","type":{{"kind":"struct","fields":[{{"name":"total","type":{amount}}},
+      {{"name":"kind","type":{{"defined":{{"name":"Kind"}}}}}}]}}}},
+    {{"name":"Kind","type":{{"kind":"enum","variants":[{{"name":"A","fields":[{amount}]}}]}}}}]}}"#
+        )
+    };
+    let link = idl(r#"{"defined":{"name":"Amount"}}"#);
+    assert_eq!(kinds(&link, &idl(r#""u64""#)), []);
+    assert_eq!(
+        kinds(&link, &idl(r#""u32""#)),
+        [
+            (Severity::Breaking, ChangeKind::ArgChanged),
+            (Severity::Breaking, ChangeKind::VariantPayloadChanged),
+            (Severity::Breaking, ChangeKind::FieldChanged)
+        ]
+    );
+}
+
+#[test]
+fn a_type_kind_change_counts_only_on_a_reachable_type() {
+    let idl = |accounts: &str, ty: &str| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"k","version":"1","spec":"0.1.0"}},
+  "accounts":[{accounts}],"types":[{{"name":"Pool","type":{ty}}}]}}"#
+        )
+    };
+    let st = r#"{"kind":"struct","fields":[{"name":"a","type":"u64"}]}"#;
+    let en = r#"{"kind":"enum","variants":[{"name":"A"}]}"#;
+    let pool = r#"{"name":"Pool","discriminator":[1]}"#;
+    assert_eq!(
+        kinds(&idl(pool, st), &idl(pool, en)),
+        [(Severity::Breaking, ChangeKind::TypeKindChanged)]
+    );
+    let (old, new) = (parse(&idl("", st)), parse(&idl("", en)));
+    assert_eq!(
+        idl_kinds(&old, &new),
+        [(Severity::Cosmetic, ChangeKind::TypeKindChanged)]
+    );
+    assert_eq!(
+        messages(&old, &new),
+        ["type kind changed in UNREACHED type (Pool)"]
+    );
+}
+
+#[test]
 fn enum_append_is_dangerous() {
     let appended = mode_enum(r#"{"name":"Fast"},{"name":"Slow"},{"name":"Paused"}"#);
     assert_eq!(
@@ -427,5 +480,22 @@ fn a_reference_dangling_in_both_idls_is_breaking() {
     assert_eq!(
         messages(&parse(DANGLING_NEW), &parse(DANGLING_NEW)),
         ["type used but not defined (Config): no parser can be generated"]
+    );
+}
+
+#[test]
+fn an_account_or_event_with_no_type_is_undefined() {
+    // Shipstern and Codama need a type for each account and event payload.
+    let idl = parse(
+        r#"{"address":"A","metadata":{"name":"d","version":"1","spec":"0.1.0"},
+  "accounts":[{"name":"Pool","discriminator":[1]}],
+  "events":[{"name":"Evt","discriminator":[2]}]}"#,
+    );
+    assert_eq!(
+        messages(&idl, &idl),
+        [
+            "type used but not defined (Evt): no parser can be generated",
+            "type used but not defined (Pool): no parser can be generated"
+        ]
     );
 }

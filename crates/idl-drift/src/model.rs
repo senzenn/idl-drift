@@ -690,6 +690,12 @@ impl Idl {
             let root: codama_nodes::RootNode = serde_json::from_value(value)?;
             Ok(crate::codama_convert::from_codama(root))
         } else {
+            // Anchor puts spec in metadata. A top-level spec is another format, for example Quasar.
+            if let Some(spec) = value.get("spec").and_then(|s| s.as_str()) {
+                return Err(serde::de::Error::custom(format!(
+                    "IDL spec {spec} is not supported; only Anchor, Shank and Codama IDLs can be read"
+                )));
+            }
             // Anchor reads only spec 0.1.0. Another spec can rename fields, which serde then
             // reads as empty, so a diff would not see them.
             if let Some(spec) = value.pointer("/metadata/spec").and_then(|s| s.as_str()) {
@@ -986,7 +992,7 @@ fn move_inline_types(obj: &mut serde_json::Map<String, serde_json::Value>) {
 }
 
 /// Fill in the discriminators legacy IDLs leave out, the way Anchor derives them: the first
-/// 8 bytes of `sha256("global:<snake_case name>")`, `"account:<Name>"` or `"event:<Name>"`.
+/// 8 bytes of `sha256("global:<snake_case name>")`, `"account:<Type>"` or `"event:<Type>"`.
 /// Shank accounts and events have no discriminator, so they get none.
 fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value>, shank: bool) {
     use heck::ToSnakeCase;
@@ -1021,7 +1027,7 @@ fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value
             let name = if namespace == "global" {
                 name.to_snake_case()
             } else {
-                name.to_string()
+                rust_type_name(name)
             };
             let hash = Sha256::digest(format!("{namespace}:{name}").as_bytes());
             map.insert(
@@ -1030,6 +1036,20 @@ fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value
             );
         }
     }
+}
+
+/// Anchor hashes the Rust type name. Hand-made IDLs such as Pyth's lowercase its first letter
+/// (`priceUpdateV2`), or write it in snake case. Shipstern reads an ASCII name the same way.
+fn rust_type_name(name: &str) -> String {
+    use heck::ToUpperCamelCase;
+
+    if name.contains('_') && !name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return name.to_upper_camel_case();
+    }
+    let mut chars = name.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_ascii_uppercase().to_string() + chars.as_str()
+    })
 }
 
 /// Two shapes the spec structs don't take: tuple struct fields, which Anchor writes as bare

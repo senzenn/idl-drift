@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::text::{disc_changed, extra_discs_text, size_text};
 use super::{ChangeKind, Report, Severity};
-use crate::model::{NamedDisc, TypeDef, TypeDefTy};
+use crate::model::{Field, NamedDisc, TypeDef, TypeDefTy};
 
 pub(super) fn diff_account_types(
     old: &[NamedDisc],
@@ -114,10 +114,14 @@ fn diff_account(
         );
     }
     // A number constant is also the first field. A bytes constant comes before the fields.
-    // A discriminator change above already moves the body. A field change is in the type diff.
+    // A discriminator change above already moves the body.
     if !any_disc_changed
         && oa.payload_start() != na.payload_start()
-        && field_names(old_types, name) == field_names(new_types, name)
+        && !first_field_dropped(
+            fields(old_types, name),
+            fields(new_types, name),
+            oa.payload_start() < na.payload_start(),
+        )
     {
         r.push(
             Severity::Breaking,
@@ -132,10 +136,20 @@ fn diff_account(
     }
 }
 
-/// The field names of the struct that holds an account's data.
-fn field_names<'a>(types: &'a [TypeDef], name: &str) -> Option<Vec<&'a str>> {
+/// The fields of the struct that holds an account's data.
+fn fields<'a>(types: &'a [TypeDef], name: &str) -> Option<&'a [Field]> {
     match &types.iter().find(|t| t.name == name)?.ty {
-        TypeDefTy::Struct { fields } => Some(fields.iter().map(|f| f.name.as_str()).collect()),
+        TypeDefTy::Struct { fields } => Some(fields),
         _ => None,
     }
+}
+
+/// `true` when the body that starts first only adds a first field. A number constant is that
+/// field, so each later field stays at its byte.
+fn first_field_dropped(old: Option<&[Field]>, new: Option<&[Field]>, old_first: bool) -> bool {
+    let (Some(o), Some(n)) = (old, new) else {
+        return false;
+    };
+    let (first, later) = if old_first { (o, n) } else { (n, o) };
+    first.get(1..) == Some(later)
 }
