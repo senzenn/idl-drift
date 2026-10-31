@@ -3,14 +3,14 @@ members = ["crates/idl-drift", "crates/idl-verify"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/senzenn/idl-drift"
 
 [workspace.dependencies]
-idl-drift = { path = "crates/idl-drift", version = "0.2.0" }
+idl-drift = { path = "crates/idl-drift", version = "0.3.0" }
 base64 = "0.22"
 bs58 = "0.5"
 clap = { version = "4", features = ["derive"] }
