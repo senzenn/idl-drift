@@ -1,6 +1,6 @@
 //! Find where two JSON writings of a value differ, ignoring how each decoder wraps it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value as Json};
 
@@ -28,11 +28,13 @@ fn diff_at(ours: &Json, theirs: &Json, path: &mut Vec<String>) -> Option<Differe
             if a.len() != b.len() {
                 return Some(difference(path, ours, theirs));
             }
+            // Normalize each key once: a scan per key costs two allocations per pair.
+            let mut by_key: BTreeMap<String, &Json> = BTreeMap::new();
+            for (k, v) in b {
+                by_key.entry(normalize(k)).or_insert(v);
+            }
             for (key, av) in a {
-                let Some(bv) = b
-                    .iter()
-                    .find_map(|(k, v)| (normalize(k) == normalize(key)).then_some(v))
-                else {
+                let Some(&bv) = by_key.get(&normalize(key)) else {
                     return Some(difference(path, ours, theirs));
                 };
                 path.push(key.clone());

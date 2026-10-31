@@ -48,18 +48,30 @@ impl<'d> Reader<'d> {
     }
 
     /// Read a Borsh `u32` length and reject one the remaining bytes cannot hold.
-    pub(super) fn len_prefix(&mut self, min_item: usize) -> Result<usize, DecodeError> {
+    pub(super) fn len_prefix(
+        &mut self,
+        min_item: impl FnOnce() -> usize,
+    ) -> Result<usize, DecodeError> {
         let at = self.pos;
         let raw = u32::from_le_bytes(self.array()?);
         self.fits(at, u128::from(raw), min_item)
     }
 
-    /// `len` items of at least `min_item` bytes each, if the remaining bytes can hold them.
+    /// `len` items of at least `min_item()` bytes each, if the remaining bytes can hold them.
     /// `at` is where the length was read, for the error.
-    pub(super) fn fits(&self, at: usize, len: u128, min_item: usize) -> Result<usize, DecodeError> {
+    pub(super) fn fits(
+        &self,
+        at: usize,
+        len: u128,
+        min_item: impl FnOnce() -> usize,
+    ) -> Result<usize, DecodeError> {
+        // Zero items fit in any data, and no item pays for the size walk.
+        if len == 0 {
+            return Ok(0);
+        }
         let remaining = self.remaining();
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        let fits = match min_item {
+        let fits = match min_item() {
             0 => len <= remaining,
             n => len <= remaining / n,
         };

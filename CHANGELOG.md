@@ -21,6 +21,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `idl-drift source` lists the `Anchor.toml` ids by cluster, then program. It lists a
   `declare_id!` value that `lib.rs` repeats only one time.
 - `idl-drift inspect` parses an Anchor IDL one time, not two times.
+- `idl-verify`: `--compare-idl`, `--upgrade-impact` and the PDA check are faster on large IDLs
+  and many samples. The output does not change.
 
 ### Fixed
 
@@ -59,6 +61,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Before, it was dropped, so a change of its value was not reported.
 - `idl-drift inspect`: an array length that names no const parameter of its type is an
   unresolved field. It was read as resolved.
+- `idl-verify`: a hostile IDL whose type tree doubles at each level no longer stalls the
+  decode or uses all memory. A decode that needs more than 65536 type nodes, plus 64 for each
+  byte of data, is a `decode` error.
+- `idl-verify`: a Borsh account of `8 + size_of::<T>()` bytes, with `repr(C)` padding only
+  after the last field and zero bytes after the data, is a warning, not an error. Such padding
+  moves no field, as in Jito `Config` and Flash `FlpStake`.
+- `idl-verify`: an account fixed to the IDL's own address accepts the sampled program id. So
+  another deployment of the program is no longer a `fixed_address` error.
+- `idl-verify --upgrade-impact --compare-idl`: a new field in a struct inside an option or an
+  enum variant is no longer a difference.
 
 ## [0.2.0] - 2026-10-23
 
