@@ -20,11 +20,12 @@ pub fn reachable_types(idl: &Idl) -> BTreeSet<String> {
         .collect()
 }
 
-/// Names that a `defined` type uses but `types` does not hold, from every instruction arg
-/// and every type, reached or not. A parser generator cannot build such an IDL.
+/// Names that an account, an event or a `defined` type uses but `types` does not hold, from
+/// every arg and type, reached or not. A parser generator cannot build such an IDL.
 pub(crate) fn undefined_types(idl: &Idl) -> BTreeSet<String> {
     let index = TypeIndex::new(idl);
-    let mut used: Vec<&str> = Vec::new();
+    let mut used: Vec<&str> = idl.accounts.iter().map(|a| a.name.as_str()).collect();
+    used.extend(idl.events.iter().map(|e| e.name.as_str()));
     for arg in idl.instructions.iter().flat_map(|ix| &ix.args) {
         push_defined(&arg.ty, &mut used);
     }

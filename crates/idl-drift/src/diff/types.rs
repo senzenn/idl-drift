@@ -1,5 +1,5 @@
-//! Type definitions: struct fields, enum variants and aliases. A field, variant, tag or alias
-//! change on a type that no parser reads is Cosmetic.
+//! Type definitions: struct fields, enum variants and aliases. A field, variant, tag, alias or
+//! kind change on a type that no parser reads is Cosmetic.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,11 +14,7 @@ use crate::model::{EnumFields, EnumVariant, Field, GenericParam, Idl, Type, Type
 pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
     let om = old.type_map();
     let nm = new.type_map();
-    let defs = Defs {
-        old: &om,
-        new: &nm,
-        work: Cell::new(0),
-    };
+    let defs = Defs::new(&om, &nm);
     // An old parser reads a type only when the old IDL reaches it too.
     let old_reached = super::reachable_types(old);
     let read_by_both: BTreeSet<String> = reached.intersection(&old_reached).cloned().collect();
@@ -105,17 +101,32 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &m
                 }
             }
             (a, b) if std::mem::discriminant(a) != std::mem::discriminant(b) => {
-                r.push(
-                    Severity::Breaking,
-                    ChangeKind::TypeKindChanged,
-                    name.as_str(),
-                    format!("type kind changed ({name})"),
-                );
+                diff_type_kind(name, is_reached, r);
             }
             _ => {}
         }
     }
     diff_dangling(old, new, reached, r);
+}
+
+/// A struct read as an enum, or the reverse, misreads each byte. No parser reads an unreached
+/// type.
+fn diff_type_kind(name: &str, reached: bool, r: &mut Report) {
+    if reached {
+        r.push(
+            Severity::Breaking,
+            ChangeKind::TypeKindChanged,
+            name,
+            format!("type kind changed ({name})"),
+        );
+    } else {
+        r.push(
+            Severity::Cosmetic,
+            ChangeKind::TypeKindChanged,
+            name,
+            format!("type kind changed in UNREACHED type ({name})"),
+        );
+    }
 }
 
 /// The body of `nt` with each generic param named as the old param at its position. Args
@@ -401,18 +412,28 @@ fn payload_fields(fields: &EnumFields) -> Vec<Field> {
     }
 }
 
-/// The old and new type definitions, to see through a link to a struct.
-struct Defs<'a, 'b> {
+/// The old and new type definitions, to see through a link to a struct or an alias.
+pub(super) struct Defs<'a, 'b> {
     old: &'b BTreeMap<String, &'a TypeDef>,
     new: &'b BTreeMap<String, &'a TypeDef>,
     /// Nodes that the current [`Defs::same_bytes`] call may still visit.
     work: Cell<usize>,
 }
 
-impl Defs<'_, '_> {
-    /// `true` when `o` and `n` are the same bytes: equal, or a link to a non-generic struct
-    /// that the other side writes inline. Codama inlines a type that has only one use. Two
-    /// links with different names stay different.
+impl<'a, 'b> Defs<'a, 'b> {
+    pub(super) fn new(
+        old: &'b BTreeMap<String, &'a TypeDef>,
+        new: &'b BTreeMap<String, &'a TypeDef>,
+    ) -> Self {
+        Self {
+            old,
+            new,
+            work: Cell::new(0),
+        }
+    }
+
+    /// `true` when `o` and `n` are the same bytes. A link to a non-generic struct or alias reads
+    /// as its body, but links to two structs with different names stay different.
     fn same_bytes(&self, o: &Type, n: &Type) -> bool {
         self.work.set(MAX_SAME_WORK);
         self.same_at(o, n, 0)
@@ -430,6 +451,13 @@ impl Defs<'_, '_> {
         self.work.set(left);
         if depth >= MAX_SAME_DEPTH {
             return false;
+        }
+        // Shipstern writes a link to an alias as the alias target.
+        if let Some(target) = alias_target(o, self.old) {
+            return self.same_at(target, n, depth + 1);
+        }
+        if let Some(target) = alias_target(n, self.new) {
+            return self.same_at(o, target, depth + 1);
         }
         match (o, n) {
             (Type::Struct(of), Type::Struct(nf)) => return self.same_fields(of, nf, depth),
@@ -462,7 +490,7 @@ impl Defs<'_, '_> {
 
     /// `n` as a change from `o`, with the old type when the bytes are the same, so that only
     /// the name can differ. `None` when nothing changed.
-    fn edited(&self, o: &Field, n: &Field) -> Option<Field> {
+    pub(super) fn edited(&self, o: &Field, n: &Field) -> Option<Field> {
         let same = self.same_bytes(&o.ty, &n.ty);
         if same && o.name == n.name {
             return None;
@@ -513,6 +541,18 @@ fn inline_fields<'a>(ty: &Type, defs: &BTreeMap<String, &'a TypeDef>) -> Option<
         TypeDefTy::Struct { fields } if generics.is_empty() && td.generics.is_empty() => {
             Some(fields)
         }
+        _ => None,
+    }
+}
+
+/// The target of a link to a non-generic alias.
+fn alias_target<'a>(ty: &Type, defs: &BTreeMap<String, &'a TypeDef>) -> Option<&'a Type> {
+    let Type::Defined { name, generics } = ty else {
+        return None;
+    };
+    let td = defs.get(name)?;
+    match &td.ty {
+        TypeDefTy::Type { alias } if generics.is_empty() && td.generics.is_empty() => Some(alias),
         _ => None,
     }
 }

@@ -518,6 +518,11 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
 - **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
   `name` key of each node to `identifier`. idl-verify stops with "Codama spec 2.0.0 is not
   supported; only spec 1.x can be read" (exit 2).
+- **No Quasar IDLs.** A Quasar IDL uses another schema: a type definition has a top-level
+  `kind`, and a field can have a `codec`. An IDL with a top-level `spec`, for example
+  `quasar-idl/1.0.0`, stops idl-verify with
+  "IDL spec quasar-idl/1.0.0 is not supported; only Anchor, Shank and Codama IDLs can be read"
+  (exit 2).
 - **Bool decoding is Borsh-strict.** A bool byte other than 0 or 1 is a `decode` error, as
   in Shipstern, which decodes with Borsh. The Codama spec says that any value other than 1
   is false, so a Codama client can accept data that idl-verify rejects.

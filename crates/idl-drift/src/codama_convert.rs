@@ -840,12 +840,19 @@ fn number_to_bytes(n: &codama_nodes::NumberValueNode, ty: &TypeNode) -> Option<V
         TypeNode::DateTime(d) => d.number.get_nested_type_node(),
         _ => return None,
     };
-    let width = number_width(number.format)?;
     let value: i128 = match n.number {
         codama_nodes::Number::UnsignedInteger(v) => i128::from(v),
         codama_nodes::Number::SignedInteger(v) => i128::from(v),
         codama_nodes::Number::Float(_) => return None,
     };
+    // A compact-u16 below 0x80 is one byte, as Shipstern reads it.
+    if number.format == NumberFormat::ShortU16 {
+        return u8::try_from(value)
+            .ok()
+            .filter(|v| *v < 0x80)
+            .map(|v| vec![v]);
+    }
+    let width = number_width(number.format)?;
     let signed = matches!(
         number.format,
         NumberFormat::I8

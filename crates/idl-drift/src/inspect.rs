@@ -2,15 +2,16 @@
 //! every zero-copy type field by field, and find padded zero-copy types Borsh also reads.
 
 use crate::layout::{LayoutError, Padding, Reading, StructLayout, TypeIndex};
-use crate::model::{EnumFields, GenericParam, Idl, Repr, Type, TypeDef, TypeDefTy};
+use crate::model::{ArrayLen, EnumFields, GenericParam, Idl, Repr, Type, TypeDef, TypeDefTy};
 use crate::reach::{push_defined, reachable, reachable_types, undefined_types};
 
-/// A field or instruction arg whose type is or contains `Type::Generic`.
+/// A field or instruction arg whose type is or contains `Type::Generic`, or an array whose
+/// length names no declared const parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmappedField {
     /// Such as `MyAccount.owner` or `ix:swap.amount`.
     pub path: String,
-    /// The string inside `Type::Generic`.
+    /// The string inside `Type::Generic`, or the array length.
     pub kind: String,
 }
 
@@ -22,7 +23,7 @@ pub struct CoverageReport {
     pub events: usize,
     pub types: usize,
     pub unmapped: Vec<UnmappedField>,
-    /// Names that a `defined` type uses but `types` does not hold.
+    /// Names that an account, an event or a `defined` type uses but `types` does not hold.
     pub undefined: Vec<String>,
 }
 
@@ -34,7 +35,8 @@ impl CoverageReport {
     }
 }
 
-/// Scan instruction args and reachable types for `Type::Generic`.
+/// Scan instruction args and reachable types for `Type::Generic` and for array lengths that
+/// no const parameter gives a value.
 #[must_use]
 pub fn coverage(idl: &Idl) -> CoverageReport {
     let reached = reachable_types(idl);
@@ -126,6 +128,18 @@ fn collect_generic(path: &str, ty: &Type, params: &[GenericParam], out: &mut Vec
             path: path.to_string(),
             kind: Type::generic_kind(kind).to_string(),
         });
+    }
+    // No declared const parameter gives this length a value. Do not return: the item is read next.
+    if let Type::Array(_, ArrayLen::Generic(len)) = ty {
+        if !params
+            .iter()
+            .any(|p| matches!(p, GenericParam::Const { name, .. } if name == len))
+        {
+            out.push(UnmappedField {
+                path: path.to_string(),
+                kind: Type::generic_kind(len).to_string(),
+            });
+        }
     }
     for child in ty.children() {
         collect_generic(path, child, params, out);
@@ -303,5 +317,38 @@ mod tests {
             .collect();
         // `U` is not declared on `Fees`, so it stays unmapped.
         assert_eq!(paths, ["Fees.other"]);
+    }
+
+    #[test]
+    fn undeclared_array_length_is_unmapped() {
+        let idl = Idl::from_json(
+            r#"{"address":"A","metadata":{"name":"t","version":"0","spec":"0.1.0"},
+            "accounts":[{"name":"Pool","discriminator":[1]}],
+            "types":[
+              {"name":"Pool","type":{"kind":"struct","fields":[
+                {"name":"buf","type":{"defined":{"name":"Buf",
+                  "generics":[{"kind":"const","value":"4"},{"kind":"type","type":"u8"}]}}},
+                {"name":"a","type":{"array":[{"generic":"T"},{"generic":"N"}]}}]}},
+              {"name":"Buf","generics":[{"kind":"const","name":"N","type":"usize"},{"kind":"type","name":"M"}],
+                "type":{"kind":"struct","fields":[
+                {"name":"data","type":{"array":["u8",{"generic":"N"}]}},
+                {"name":"m","type":{"array":["u8",{"generic":"M"}]}}]}}]}"#,
+        )
+        .unwrap();
+        let unmapped: Vec<(String, String)> = coverage(&idl)
+            .unmapped
+            .into_iter()
+            .map(|u| (u.path, u.kind))
+            .collect();
+        // `N` is declared on `Buf` but not on `Pool`, and the type parameter `M` gives no length.
+        // The array item is still read.
+        assert_eq!(
+            unmapped,
+            [
+                ("Pool.a".to_string(), "N".to_string()),
+                ("Pool.a".to_string(), "T".to_string()),
+                ("Buf.m".to_string(), "M".to_string())
+            ]
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::fmt;
 
 use super::collisions::DispatchKey;
 use super::text::{disc_changed, extra_discs_text, field_change, field_str, size_text};
+use super::types::Defs;
 use super::{names, ChangeKind, FieldEdit, Report, Severity};
 use crate::model::{camel, AccountItem, Idl, Instruction};
 
@@ -31,6 +32,8 @@ pub(super) fn diff_instructions(old: &Idl, new: &Idl, r: &mut Report) {
     let camel_paths = old.format != new.format;
     let old_ix: BTreeMap<_, _> = old.instructions.iter().map(|i| (&i.name, i)).collect();
     let new_ix: BTreeMap<_, _> = new.instructions.iter().map(|i| (&i.name, i)).collect();
+    let (om, nm) = (old.type_map(), new.type_map());
+    let defs = Defs::new(&om, &nm);
 
     for (name, ni) in &new_ix {
         match old_ix.get(name) {
@@ -61,7 +64,7 @@ pub(super) fn diff_instructions(old: &Idl, new: &Idl, r: &mut Report) {
                     ),
                 }
             }
-            Some(oi) => diff_instruction(oi, ni, camel_paths, r),
+            Some(oi) => diff_instruction(oi, ni, camel_paths, &defs, r),
         }
     }
     for name in old_ix.keys() {
@@ -76,7 +79,13 @@ pub(super) fn diff_instructions(old: &Idl, new: &Idl, r: &mut Report) {
     }
 }
 
-fn diff_instruction(oi: &Instruction, ni: &Instruction, camel_paths: bool, r: &mut Report) {
+fn diff_instruction(
+    oi: &Instruction,
+    ni: &Instruction,
+    camel_paths: bool,
+    defs: &Defs,
+    r: &mut Report,
+) {
     let ix = oi.name.as_str();
     if oi.discriminator != ni.discriminator {
         r.push(
@@ -141,8 +150,9 @@ fn diff_instruction(oi: &Instruction, ni: &Instruction, camel_paths: bool, r: &m
     for pos in 0..oi.args.len().max(ni.args.len()) {
         let subject = format!("{ix}#{pos}");
         match (oi.args.get(pos), ni.args.get(pos)) {
-            (Some(o), Some(n)) if o != n => {
-                let edit = FieldEdit::of(&old_names, &new_names, o, n);
+            (Some(o), Some(n)) => {
+                let Some(n) = defs.edited(o, n) else { continue };
+                let edit = FieldEdit::of(&old_names, &new_names, o, &n);
                 let kind = match edit {
                     FieldEdit::Changed => ChangeKind::ArgChanged,
                     FieldEdit::Moved => ChangeKind::ArgMoved,
@@ -152,7 +162,7 @@ fn diff_instruction(oi: &Instruction, ni: &Instruction, camel_paths: bool, r: &m
                     edit.severity(),
                     kind,
                     subject,
-                    format!("arg changed ({ix}#{pos}): {}", field_change(o, n)),
+                    format!("arg changed ({ix}#{pos}): {}", field_change(o, &n)),
                 );
             }
             (Some(o), None) => r.push(
