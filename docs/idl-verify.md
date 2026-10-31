@@ -132,14 +132,14 @@ explorer.
 |---|---|---|
 | `discriminator` | error or note | A sample's discriminator matches nothing in the IDL. The program uses an account type, instruction or event that the IDL does not have, or the IDL has no discriminators. Event samples against an IDL with no `events` give one error. For legacy Anchor IDLs, idl-verify calculates the discriminators from the names, as Anchor does. An instruction with a Codama size discriminator matches only data of that length, at any position of the discriminator list. An account type with no discriminator matches by exact data length: the IDL's `size` (or Codama size discriminator), else the type's fixed size. Note: an account type picked only by size, with no discriminator and no Codama size discriminator. A parser that selects accounts only by a discriminator, such as Shipstern's, cannot decode it. Note: an account that the program owns and that holds no data. It has no discriminator, so no IDL can describe it, and it is not checked. Note: with an Anchor IDL, Anchor's IDL instruction (`0x40f4bc78a7e9690a`) and `IdlAccount` (`0x184662bf3a907b9e`). Each Anchor program built without the `no-idl` feature has them, and an Anchor IDL lists neither, so they are not checked. |
 | `missing_type` | error | An account has no entry in `types`, so it cannot be decoded. |
-| `decode` | error | The data does not fit the IDL: it is too short, or it has an invalid bool, option tag, enum tag or UTF-8 string. A NaN float is an error in a Borsh type, because Borsh refuses it, but not in a zero-copy type. A vec, set or map of a type with no data (such as an empty struct) is also an error, because Borsh refuses it. The message names the field and offset. When each failing account is shorter than the layout, the hint says so: these accounts can be older than an upgrade. |
+| `decode` | error | The data does not fit the IDL: it is too short, or it has an invalid bool, option tag, enum tag or UTF-8 string. A NaN float is an error in a Borsh type, because Borsh refuses it, but not in a zero-copy type. A vec, set or map of a type with no data (such as an empty struct) is also an error, because Borsh refuses it. A type tree that needs more than 65536 nodes, plus 64 for each byte of data, is an error too, because an IDL can be hostile. The message names the field and offset. When each failing account is shorter than the layout, the hint says so: these accounts can be older than an upgrade. |
 | `bytes_used` | error, warning or note | The IDL reads fewer bytes than the data holds. See [unused bytes](#unused-bytes). For instructions, any byte after the arguments is an error: instruction data has no spare room, so the IDL is missing an argument or declares one too narrow. For events, bytes after the payload are an error when a byte is not zero, else a note. When each sample has the same trailing bytes, the hint names an N-byte missing field, and an `Option` shape when it fits. |
 | `envelope` | error | A self-CPI event sample does not start with the expected envelope: the IDL's envelope, else Anchor's event tag. |
 | `layout` | error or warning | Error: a `bytemuck` (Pod) type whose calculated layout has padding, also inside a nested struct. Pod forbids padding, so the IDL's `repr` or fields are wrong (usually a missing `packed: true`). Warning: a zero-copy type whose layout the IDL does not fix (an option, vec, enum or generic inside it, `repr(Rust)` without `packed`, or `repr(Rust, packed)` with a bool inside it). idl-verify reports it as not verifiable, and does not guess. |
 | `size_distribution` | note | A fixed-size account type has more than one size, such as accounts created before an upgrade. |
 | `coverage` | error | Only with `--min-coverage`: less than the given percent of the IDL's account types, instructions or events have a sample. One finding for each kind that is short. |
 | `account_count` | error or note | Error: samples pass fewer accounts than the IDL lists. The message names the missing accounts and their fixed addresses. A parser that checks the account count rejects each such instruction. Note: only optional accounts are missing at the tail, or a Codama instruction with `optionalAccountStrategy: "omitted"` leaves out absent optional accounts. Note: samples pass more accounts than the IDL lists (remaining accounts). |
-| `fixed_address` | error, warning or note | An account that the IDL gives an address (a program or sysvar) holds another key. Error: an Anchor `address` holds another key, so the IDL's account order does not match the program. A Codama `publicKeyValueNode` default fills the account only when the caller gives no key, so the program can accept another key. Note: another key is at the position of a Codama default. Warning: the default key is at another position, so the accounts likely moved. An absent optional account passed as the program id is accepted. |
+| `fixed_address` | error, warning or note | An account that the IDL gives an address (a program or sysvar) holds another key. Error: an Anchor `address` holds another key, so the IDL's account order does not match the program. A Codama `publicKeyValueNode` default fills the account only when the caller gives no key, so the program can accept another key. Note: another key is at the position of a Codama default. Warning: the default key is at another position, so the accounts likely moved. An absent optional account passed as the program id is accepted. An account fixed to the IDL's own address accepts the sampled program id, because a program runs only at its own id. |
 | `account_flags` | error | An account that the IDL marks `writable` gets a key that the transaction makes read-only, or an account that the IDL marks `signer` gets a key that does not sign the transaction. The IDL's account order probably does not match the program, or an earlier account is missing. Only samples with flags are checked (see [the samples file](#the-samples-file)). A key with more privileges than the IDL asks for is accepted, because the transaction flags cover each instruction in it. The signer check uses only top-level instructions, because a CPI can sign for a PDA. A Codama `isSigner: "either"` account and an absent optional account are accepted. |
 | `pda` | error or note | An account that the IDL derives from seeds (Anchor `pda`, Codama `pdaValueNode` default) gets a key that its seeds do not give. Error: the derived address is passed at another position in the same instruction, so the IDL's account order does not match the program, or an earlier account is missing. Note: the derived address is not in the instruction, so the seeds may read data that the IDL does not show. A sample is skipped when a seed cannot be resolved: a path into account data (`pool.mint`) or an absent optional account. A seed path into a struct argument (`params.id`) reads the decoded argument. When the IDL names a program for the seeds, the sampled program id is also tried, because the IDL can come from another deployment. |
 | `program_id` | warning | The samples' `programId` is not the IDL's `address`. |
@@ -152,7 +152,8 @@ When an account has more bytes than the IDL reads, idl-verify tries to explain t
 
 - **The size is the `repr(C)` size.** The IDL lays out as Borsh a type that the program
   casts as `repr(C)`, and drops its implicit padding. Fields after the first gap are
-  misread. Error, with the location of the padding.
+  misread. Error, with the location of the padding. Padding only after the last field
+  moves no field, so when the bytes after the data are zero, the rules below apply to it.
 - **The size is the used size rounded up to 8, on a Borsh type.** This is a common pattern
   of spare allocation, but not proof. Warning: compare with the program source.
 - **Extra bytes that are all zero on a fixed-size Borsh type.** This is usually spare
@@ -338,7 +339,8 @@ account with it and puts the account in one class:
 
 Give the current IDL with `--compare-idl`. idl-verify then decodes each account with both
 IDLs and compares the fields that both IDLs name, with the same comparison as
-[compare two IDLs](#compare-two-idls). A field that only one IDL has is not a difference.
+[compare two IDLs](#compare-two-idls). A field that only one IDL has is not a difference,
+also in a struct inside an option or an enum variant.
 Lists compare on the items that both IDLs read, so a reserved array that gives bytes to a
 new field is not a difference when the values stay the same. Without `--compare-idl`, a
 field that changes its type, or that moves, can show as ok, shorter or realloc.
@@ -516,6 +518,11 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
 - **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
   `name` key of each node to `identifier`. idl-verify stops with "Codama spec 2.0.0 is not
   supported; only spec 1.x can be read" (exit 2).
+- **No Quasar IDLs.** A Quasar IDL uses another schema: a type definition has a top-level
+  `kind`, and a field can have a `codec`. An IDL with a top-level `spec`, for example
+  `quasar-idl/1.0.0`, stops idl-verify with
+  "IDL spec quasar-idl/1.0.0 is not supported; only Anchor, Shank and Codama IDLs can be read"
+  (exit 2).
 - **Bool decoding is Borsh-strict.** A bool byte other than 0 or 1 is a `decode` error, as
   in Shipstern, which decodes with Borsh. The Codama spec says that any value other than 1
   is false, so a Codama client can accept data that idl-verify rejects.

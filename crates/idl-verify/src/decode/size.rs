@@ -4,14 +4,14 @@
 use idl_drift::model::{ArrayLen, Count, EnumFields, GenericArg, OptionTag, Type, TypeDefTy};
 
 use super::generics::{bind, Scope};
-use super::Decoder;
-use crate::layout::MAX_DEPTH;
+use super::Call;
 
-impl Decoder<'_> {
+// Both functions give only a bound. A walk that runs out of depth or work gives the weakest.
+impl Call<'_, '_> {
     /// `true` when Rust stores `ty` in zero bytes. Borsh refuses a Vec of such items. A fixed
     /// array is never zero-sized here: Shipstern stores it as a `Vec`.
     pub(super) fn is_zero_sized(&self, ty: &Type, scope: &Scope, depth: usize) -> bool {
-        if depth > MAX_DEPTH {
+        if self.step(0, depth).is_err() {
             return false;
         }
         match ty {
@@ -67,7 +67,7 @@ impl Decoder<'_> {
 
     /// Smallest Borsh encoding of `ty`, used to reject length prefixes the data cannot hold.
     pub(super) fn min_size(&self, ty: &Type, depth: usize) -> usize {
-        if depth > MAX_DEPTH {
+        if self.step(0, depth).is_err() {
             return 0;
         }
         match ty {
@@ -85,9 +85,11 @@ impl Decoder<'_> {
             Type::U128 | Type::I128 => 16,
             Type::U256 | Type::I256 | Type::Pubkey => 32,
             Type::COption(inner) => self.min_size(inner, depth + 1).saturating_add(4),
-            Type::Array(item, ArrayLen::Value(len)) => {
-                self.min_size(item, depth + 1).saturating_mul(*len)
-            }
+            // With no items, no item pays for a walk of the item type.
+            Type::Array(item, ArrayLen::Value(len)) => match len {
+                0 => 0,
+                len => self.min_size(item, depth + 1).saturating_mul(*len),
+            },
             Type::Tuple(items) => self.min_sum(items.iter(), depth),
             Type::Struct(fields) => self.min_sum(fields.iter().map(|f| &f.ty), depth),
             Type::BigEndian(inner)

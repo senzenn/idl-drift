@@ -288,6 +288,9 @@ impl Verifier<'_> {
                 .iter()
                 .enumerate()
                 .any(|(p, a)| p != pos && a.address.as_ref() == Some(address));
+            // A program runs only at its own id, so an account fixed to the IDL's own id holds
+            // the id of the sampled deployment.
+            let own = *address == self.idl.address;
             let mut moved = Vec::new();
             let mut wrong = Vec::new();
             for &i in idxs {
@@ -296,7 +299,7 @@ impl Verifier<'_> {
                     continue;
                 };
                 // Anchor passes the program id in place of an absent optional account.
-                if key == address || (account.optional && *key == program_id) {
+                if key == address || ((account.optional || own) && *key == program_id) {
                     continue;
                 }
                 // Keys after the IDL's accounts are remaining accounts, which can be any key.
@@ -624,6 +627,17 @@ mod tests {
         );
         let report = verify(&idl, &instructions(&[(&[1], &["P"])]), None);
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn an_account_fixed_to_the_idl_address_may_hold_the_sampled_program_id() {
+        // Anchor fixes `Program<'info, Self>` to its declare_id!, and a deployment runs only
+        // at its own id. So another deployment passes its own id there.
+        let idl = go(r#"[{"name":"program","address":"P"}]"#);
+        let mut samples = instructions(&[(&[1], &["Q"])]);
+        samples.program_id = Some("Q".into());
+        let report = verify(&idl, &samples, None);
+        assert_eq!(only(&report).check, Check::ProgramId);
     }
 
     fn go(accounts: &str) -> Idl {

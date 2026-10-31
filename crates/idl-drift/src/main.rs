@@ -385,8 +385,13 @@ fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
     let (src, idl) = load_with_text(path)?;
     let report = coverage(&idl);
     let shared = shared_types(&idl);
-    let skipped = shipstern::skipped_accounts(&src)
-        .map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))?;
+    // Only a Codama IDL has account nodes to read, so do not parse an Anchor IDL again.
+    let skipped = if idl.format == idl_drift::model::Format::Codama {
+        shipstern::skipped_accounts(&src)
+            .map_err(|e| Failure::Input(format!("parse {}: {e}", path.display())))?
+    } else {
+        Vec::new()
+    };
     written(print_coverage(&report, &shared))?;
     written(print_shipstern(
         &shipstern::ambiguous_instructions(&idl),

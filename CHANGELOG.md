@@ -22,6 +22,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Anchor.toml` id.
 - `idl-drift source` lists the `Anchor.toml` ids by cluster, then program. It lists a
   `declare_id!` value that `lib.rs` repeats only one time.
+- `idl-drift inspect` parses an Anchor IDL one time, not two times.
+- `idl-verify`: `--compare-idl`, `--upgrade-impact` and the PDA check are faster on large IDLs
+  and many samples. The output does not change.
 
 ### Fixed
 
@@ -35,6 +38,41 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run stops with exit 2.
 - `idl-drift source`: an IDL file whose `address` is empty or not a string is Breaking
   `invalid_id`. It was Cosmetic.
+- `idl-drift diff`, `idl-drift inspect` and `idl-verify` stop with exit 2 on an IDL with a
+  top-level `spec`, for example a Quasar IDL. Before, such an IDL was read as a legacy Anchor
+  IDL with Borsh strings and vecs, or failed with "missing field `type`".
+- `idl-drift diff`: two account types or two event types with the same discriminator are
+  Breaking `collision`, or Dangerous `collision_preexisting` when the old IDL has the same
+  collision. Before, a new type that took the discriminator of another type was Additive.
+- `idl-drift diff`: `dispatch_order_changed` is Breaking when a parser built from the old IDL
+  routes an instruction to another instruction, or cannot route it. Before, it was always
+  Dangerous, and a swap of two account counts was not reported.
+- `idl-drift diff`: a Codama account whose discriminator changes between a number constant and
+  a bytes constant is Breaking `account_discriminator_offset_changed` also when a field name
+  changes. Before, a change to the field names hid the move.
+- `idl-drift diff`: a link to a non-generic alias compares equal to the alias target, as
+  Shipstern generates it. In an instruction argument, a link to a non-generic struct also
+  compares equal to the same struct written inline. Before, both were Breaking.
+- `idl-drift diff`: `type_kind_changed` on a type that no parser reads is Cosmetic. It was
+  Breaking.
+- Legacy Anchor IDLs: account and event discriminators hash the Rust type name, as Anchor
+  does. Before, a hand-made name such as Pyth's `priceUpdateV2` gave a wrong discriminator.
+- An account or event with no type in `types` is an undefined type. `inspect` lists it and
+  exits 1, and `diff` reports Breaking `type_undefined`. Shipstern cannot build such an IDL.
+- Codama: a `shortU16` number discriminator below 0x80 is 1 byte, as Shipstern reads it.
+  Before, it was dropped, so a change of its value was not reported.
+- `idl-drift inspect`: an array length that names no const parameter of its type is an
+  unresolved field. It was read as resolved.
+- `idl-verify`: a hostile IDL whose type tree doubles at each level no longer stalls the
+  decode or uses all memory. A decode that needs more than 65536 type nodes, plus 64 for each
+  byte of data, is a `decode` error.
+- `idl-verify`: a Borsh account of `8 + size_of::<T>()` bytes, with `repr(C)` padding only
+  after the last field and zero bytes after the data, is a warning, not an error. Such padding
+  moves no field, as in Jito `Config` and Flash `FlpStake`.
+- `idl-verify`: an account fixed to the IDL's own address accepts the sampled program id. So
+  another deployment of the program is no longer a `fixed_address` error.
+- `idl-verify --upgrade-impact --compare-idl`: a new field in a struct inside an option or an
+  enum variant is no longer a difference.
 
 ## [0.2.0] - 2026-10-23
 

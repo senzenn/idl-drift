@@ -120,12 +120,19 @@ fn codama_numeric_discriminator_keeps_its_width_and_offset() {
     assert_eq!(ix("u32", 2, 0).discriminator, [2, 0, 0, 0]);
     assert_eq!(ix("u32", 512, 0).discriminator, [0, 2, 0, 0]);
     assert_eq!(ix("u8", 2, 4).discriminator_offset, 4);
-    // A value that doesn't fit is not silently truncated.
+    let short = ix("shortU16", 5, 0);
+    assert_eq!(short.discriminator, [5]);
+    let args: Vec<&str> = short.args.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(args, ["lamports"]);
+    // A value that doesn't fit is not silently truncated. Shipstern cannot read a longer
+    // compact-u16 tag either.
     assert!(ix("u8", 256, 0).discriminator.is_empty());
+    assert!(ix("shortU16", 0x80, 0).discriminator.is_empty());
     for (old, new) in [
         (("u8", 2, 0), ("u32", 2, 0)),
         (("u32", 256, 0), ("u32", 512, 0)),
         (("u8", 2, 0), ("u8", 2, 4)),
+        (("shortU16", 5, 0), ("shortU16", 6, 0)),
     ] {
         let report = diff(
             &parse(&codama_transfer(old.0, old.1, old.2)),
@@ -503,6 +510,25 @@ fn a_number_to_bytes_account_discriminator_moves_the_body() {
             ChangeKind::AccountDiscriminatorOffsetChanged
         )]
     );
+    // A rename or an added field keeps the first field, so each field still moves. `amount` at
+    // byte 0 also moves when the new side adds a field before it.
+    for (old, new) in [
+        (
+            both.clone(),
+            format!("{},{}", field("kind", "u8"), field("amount", "u64")),
+        ),
+        (both.clone(), format!("{both},{}", field("extra", "u8"))),
+        (field("amount", "u64"), both.clone()),
+    ] {
+        let edited = kinds(&root(number, &old), &root(bytes, &new));
+        assert!(
+            edited.contains(&(
+                Severity::Breaking,
+                ChangeKind::AccountDiscriminatorOffsetChanged
+            )),
+            "{edited:?}"
+        );
+    }
     // Without the accountType field, `amount` stays at byte 1, so the body start is no change.
     let moved = kinds(&root(number, &both), &root(bytes, &field("amount", "u64")));
     assert!(

@@ -4,7 +4,7 @@ use std::fmt;
 
 use idl_drift::model::Type;
 
-use crate::layout::{LayoutError, MAX_DEPTH};
+use crate::layout::{LayoutError, MAX_DEPTH, MAX_WORK};
 
 /// Why bytes did not decode. `offset` is relative to the slice passed to the decoder.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +42,9 @@ pub enum DecodeErrorKind {
     Unsupported(String),
     ZeroSizedItems(String),
     TooDeep,
+    /// The decode needs more type nodes than its budget: [`MAX_WORK`], plus [`MAX_DEPTH`]
+    /// for each byte of data.
+    TooLarge,
     Layout(LayoutError),
 }
 
@@ -123,6 +126,10 @@ impl fmt::Display for DecodeErrorKind {
                 "borsh refuses a collection of `{item}` because that type holds no data; the IDL may lack its fields"
             ),
             Self::TooDeep => write!(f, "types nest deeper than {MAX_DEPTH} levels"),
+            Self::TooLarge => write!(
+                f,
+                "the type tree has more than {MAX_WORK} nodes, plus {MAX_DEPTH} for each byte of data"
+            ),
             Self::Layout(e) => write!(f, "{e}"),
         }
     }

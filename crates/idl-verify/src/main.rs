@@ -218,6 +218,14 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
         (samples, Some(live))
     };
     let reference = match (&cli.reference, &cli.decoder, &cli.compare_idl) {
+        // --upgrade-impact compares account values only, so the old IDL decodes only those.
+        (_, _, Some(path)) if cli.upgrade_impact => {
+            let accounts = Samples {
+                accounts: samples.accounts.clone(),
+                ..Samples::default()
+            };
+            Some(Reference::from_idl(&read_idl(path)?, &idl, &accounts))
+        }
         (_, _, Some(path)) => Some(Reference::from_idl(&read_idl(path)?, &idl, &samples)),
         (Some(path), _, None) => Some(Reference::from_json(&read(path)?, &samples)?),
         (None, Some(command), None) => {

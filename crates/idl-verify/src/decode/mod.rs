@@ -9,6 +9,8 @@ mod reader;
 mod size;
 mod zero_copy;
 
+use std::cell::Cell;
+
 use idl_drift::model::{Count, EnumFields, Field, GenericArg, OptionTag, Type, TypeDef, TypeDefTy};
 
 use error::type_label;
@@ -16,7 +18,7 @@ pub use error::{DecodeError, DecodeErrorKind};
 use generics::{bind, resolve_len, subst, Scope};
 use reader::{repeat, Reader};
 
-use crate::layout::{TypeIndex, MAX_DEPTH};
+use crate::layout::{TypeIndex, MAX_DEPTH, MAX_WORK};
 
 /// A decoded value.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,11 +86,12 @@ impl<'a> Decoder<'a> {
     /// When the bytes don't fit the type: too short, an invalid tag, bool or UTF-8 string, a
     /// NaN float in Borsh, or a type the IDL does not define well enough to decode.
     pub fn type_def(&self, td: &TypeDef, data: &[u8]) -> Result<Decoded, DecodeError> {
+        let call = Call::new(&self.types, data);
         if td.is_zero_copy() {
-            self.zero_copy(td, data)
+            call.zero_copy(td, data)
         } else {
             let mut r = Reader { data, pos: 0 };
-            let value = self.def_body(&mut r, td, &Scope::new(), 0)?;
+            let value = call.def_body(&mut r, td, &Scope::new(), 0)?;
             Ok(Decoded { value, len: r.pos })
         }
     }
@@ -100,7 +103,7 @@ impl<'a> Decoder<'a> {
     /// As [`Self::type_def`].
     pub fn borsh_fields(&self, fields: &[Field], data: &[u8]) -> Result<Decoded, DecodeError> {
         let mut r = Reader { data, pos: 0 };
-        let value = self.fields(&mut r, fields, &Scope::new(), 0)?;
+        let value = Call::new(&self.types, data).fields(&mut r, fields, &Scope::new(), 0)?;
         Ok(Decoded { value, len: r.pos })
     }
 
@@ -111,8 +114,38 @@ impl<'a> Decoder<'a> {
     /// As [`Self::type_def`].
     pub fn borsh(&self, ty: &Type, data: &[u8]) -> Result<Decoded, DecodeError> {
         let mut r = Reader { data, pos: 0 };
-        let value = self.value(&mut r, ty, &Scope::new(), 0)?;
+        let value = Call::new(&self.types, data).value(&mut r, ty, &Scope::new(), 0)?;
         Ok(Decoded { value, len: r.pos })
+    }
+}
+
+/// One decode call, with the type nodes that it may still visit. A few small types that each
+/// hold two of the next expand to millions of values, and an IDL can be hostile.
+struct Call<'c, 'a> {
+    types: &'c TypeIndex<'a>,
+    work: Cell<usize>,
+}
+
+impl<'c, 'a> Call<'c, 'a> {
+    /// A value that holds data takes at least one byte and has at most [`MAX_DEPTH`] nodes
+    /// above it. [`MAX_WORK`] is for the nodes that hold no data. The smallest-size walk runs
+    /// only for a collection with items, so the bytes of the items pay for it.
+    fn new(types: &'c TypeIndex<'a>, data: &[u8]) -> Self {
+        Self {
+            types,
+            work: Cell::new(MAX_WORK.saturating_add(data.len().saturating_mul(MAX_DEPTH))),
+        }
+    }
+
+    /// Spends one node of the work for this call. Each recursive walk passes here.
+    fn step(&self, at: usize, depth: usize) -> Result<(), DecodeError> {
+        if depth > MAX_DEPTH {
+            return Err(DecodeError::new(at, DecodeErrorKind::TooDeep));
+        }
+        let left = self.work.get().checked_sub(1);
+        let left = left.ok_or_else(|| DecodeError::new(at, DecodeErrorKind::TooLarge))?;
+        self.work.set(left);
+        Ok(())
     }
 
     fn lookup(&self, name: &str, at: usize) -> Result<&'a TypeDef, DecodeError> {
@@ -213,6 +246,9 @@ impl<'a> Decoder<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Result<Value, DecodeError> {
+        // The size walks before this can spend all the work and give only a weak bound. So
+        // stop here, also when there are no items.
+        self.step(r.pos, depth)?;
         repeat(r, len, |r| self.value(r, item, scope, depth + 1)).map(Value::List)
     }
 
@@ -224,6 +260,8 @@ impl<'a> Decoder<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Result<Value, DecodeError> {
+        // As in `list`.
+        self.step(r.pos, depth)?;
         repeat(r, len, |r| {
             let k = self.value(r, key, scope, depth + 1)?;
             let v = self.value(r, value, scope, depth + 1)?;
@@ -246,10 +284,11 @@ impl<'a> Decoder<'a> {
             Count::Prefix(prefix) => Some(self.prefix(r, prefix, depth)?),
             Count::Remainder => None,
         };
-        let fits = |r: &Reader<'_>, min| len.map(|n| r.fits(at, n, min)).transpose();
+        let fits =
+            |r: &Reader<'_>, min: &dyn Fn() -> usize| len.map(|n| r.fits(at, n, min)).transpose();
         Ok(match ty {
             Type::Bytes | Type::String => {
-                let len = fits(r, 1)?.unwrap_or_else(|| r.remaining());
+                let len = fits(r, &|| 1)?.unwrap_or_else(|| r.remaining());
                 let start = r.pos;
                 let bytes = r.take(len)?;
                 if matches!(ty, Type::Bytes) {
@@ -261,14 +300,15 @@ impl<'a> Decoder<'a> {
                 }
             }
             Type::Vec(item) | Type::Set(item) => {
-                let len = fits(r, self.min_size(item, 0))?;
+                let len = fits(r, &|| self.min_size(item, 0))?;
                 self.list(r, item, len, scope, depth)?
             }
             Type::Map(key, value) => {
-                let min = self
-                    .min_size(key, 0)
-                    .saturating_add(self.min_size(value, 0));
-                let len = fits(r, min)?;
+                let min = || {
+                    self.min_size(key, 0)
+                        .saturating_add(self.min_size(value, 0))
+                };
+                let len = fits(r, &min)?;
                 self.map(r, (key, value), len, scope, depth)?
             }
             _ => {
@@ -373,9 +413,7 @@ impl<'a> Decoder<'a> {
         scope: &Scope,
         depth: usize,
     ) -> Result<Value, DecodeError> {
-        if depth > MAX_DEPTH {
-            return Err(DecodeError::new(r.pos, DecodeErrorKind::TooDeep));
-        }
+        self.step(r.pos, depth)?;
         Ok(match ty {
             Type::Bool => {
                 let at = r.pos;
@@ -416,11 +454,11 @@ impl<'a> Decoder<'a> {
             }
             Type::Pubkey => Value::Pubkey(r.array()?),
             Type::Bytes => {
-                let len = r.len_prefix(1)?;
+                let len = r.len_prefix(|| 1)?;
                 Value::Bytes(r.take(len)?.to_vec())
             }
             Type::String => {
-                let len = r.len_prefix(1)?;
+                let len = r.len_prefix(|| 1)?;
                 let at = r.pos;
                 let bytes = r.take(len)?;
                 let s = std::str::from_utf8(bytes)
@@ -460,7 +498,7 @@ impl<'a> Decoder<'a> {
                         DecodeErrorKind::ZeroSizedItems(type_label(item)),
                     ));
                 }
-                let len = r.len_prefix(self.min_size(item, 0))?;
+                let len = r.len_prefix(|| self.min_size(item, 0))?;
                 self.list(r, item, Some(len), scope, depth)?
             }
             Type::Array(item, len) => {
@@ -469,7 +507,7 @@ impl<'a> Decoder<'a> {
                 // The length comes from the IDL; check it against the data before allocating.
                 // A short array is short data, as for a scalar: TooLong is for read lengths.
                 let remaining = r.remaining();
-                let min = self.min_size(item, 0);
+                let min = if len == 0 { 0 } else { self.min_size(item, 0) };
                 let fits = match min {
                     0 => len <= remaining,
                     min => len <= remaining / min,
@@ -498,9 +536,10 @@ impl<'a> Decoder<'a> {
                         )),
                     ));
                 }
-                let min = self
-                    .min_size(key, 0)
-                    .saturating_add(self.min_size(value, 0));
+                let min = || {
+                    self.min_size(key, 0)
+                        .saturating_add(self.min_size(value, 0))
+                };
                 let len = r.len_prefix(min)?;
                 self.map(r, (key, value), Some(len), scope, depth)?
             }

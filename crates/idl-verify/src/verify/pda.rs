@@ -1,6 +1,8 @@
 //! PDA check: derive each account address from the seeds in the IDL and compare it with the
 //! keys that the sample passes.
 
+use std::collections::BTreeMap;
+
 use idl_drift::model::{Account, Pda, Seed};
 use sha2::{Digest, Sha256};
 
@@ -33,20 +35,23 @@ impl Verifier<'_> {
             return;
         };
         let samples = &self.samples.instructions;
-        let all_keys: Vec<Vec<Option<Key>>> = outcomes
-            .iter()
-            .map(|(i, _)| {
-                let keys = &samples[*i].accounts;
-                match places.get(i) {
-                    // Line the keys up with the IDL, and drop a key whose account is not certain.
-                    Some(at) => at
-                        .iter()
-                        .map(|s| s.and_then(|s| keys.get(s)).and_then(|k| decode_key(k)))
-                        .collect(),
-                    None => keys.iter().map(|k| decode_key(k)).collect(),
-                }
-            })
-            .collect();
+        // Most samples pass the same keys, and a base58 decode costs more than a lookup.
+        let mut decoded: BTreeMap<&str, Option<Key>> = BTreeMap::new();
+        let mut all_keys: Vec<Vec<Option<Key>>> = Vec::with_capacity(outcomes.len());
+        for (i, _) in outcomes {
+            let keys = &samples[*i].accounts;
+            all_keys.push(match places.get(i) {
+                // Line the keys up with the IDL, and drop a key whose account is not certain.
+                Some(at) => at
+                    .iter()
+                    .map(|s| {
+                        s.and_then(|s| keys.get(s))
+                            .and_then(|k| cached_key(&mut decoded, k))
+                    })
+                    .collect(),
+                None => keys.iter().map(|k| cached_key(&mut decoded, k)).collect(),
+            });
+        }
         let mut findings = Vec::new();
         for (pos, account) in flat.iter().enumerate() {
             let Some(pda) = &account.pda else {
@@ -240,6 +245,10 @@ fn arg_bytes(value: &Value) -> Option<Vec<u8>> {
             .collect::<Option<Vec<u8>>>()?,
         _ => return None,
     })
+}
+
+fn cached_key<'k>(decoded: &mut BTreeMap<&'k str, Option<Key>>, key: &'k str) -> Option<Key> {
+    *decoded.entry(key).or_insert_with(|| decode_key(key))
 }
 
 fn decode_key(key: &str) -> Option<Key> {

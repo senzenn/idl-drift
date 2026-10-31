@@ -63,7 +63,10 @@ Each file can be one of these formats. The two files do not have to use the same
   must be `0.1.0`, the only spec that Anchor reads. Another spec stops the run (exit 2).
 - Legacy Anchor IDL (before 0.30). These IDLs have no discriminators. idl-drift calculates
   them from the names, as Anchor does: the first 8 bytes of
-  `sha256("global:<snake_case name>")`, `sha256("account:<Name>")` or `sha256("event:<Name>")`.
+  `sha256("global:<snake_case name>")`, `sha256("account:<Type>")` or `sha256("event:<Type>")`.
+  `<Type>` is the Rust type name, as in Shipstern. A name with a lowercase first letter,
+  such as Pyth's `priceUpdateV2`, gets an uppercase first letter, and a snake_case name with
+  no uppercase letter becomes PascalCase.
 - Codama `rootNode` JSON, the format that Shipstern's `include_shipstern_parser!` reads.
 
 idl-drift also accepts three Anchor shapes that are not in the spec structs: tuple struct
@@ -101,9 +104,12 @@ For every pair of files, idl-drift also does these steps, because the bytes are 
 
 - It compares `Vec<u8>` and `bytes` as the same type. Anchor and Shank write a Rust
   `Vec<u8>` as `bytes`, and codama-rs writes it as a u8 array with a u32 prefix.
-- It compares a link to a struct in a field, a variant payload or an alias with the same
-  struct written inline, as the same type. Codama inlines a type that has only one use.
-  Two links to types with different names stay different.
+- It compares a link to a struct in a field, a variant payload, an alias or an instruction
+  argument with the same struct written inline, as the same type. Codama inlines a type that
+  has only one use. Two links to structs with different names stay different.
+- It compares a link to a non-generic alias in the same places as the alias target, because
+  Shipstern writes the target in the generated type. Thus links to two aliases of `u64` are
+  the same type.
 - When the two files of one format nest the arguments of an instruction differently, but
   hold the same field types in the same order, it compares the arguments field by field.
   For example, Codama links a params type after it gets a second use. Other arguments stay
@@ -125,7 +131,9 @@ them must match. idl-drift compares each one: a change to a later discriminator 
 Shipstern dispatches on the first discriminator only, so the collision rules below use only
 the first one. An argument or field with `defaultValueStrategy: "omitted"` stays in the
 layout, because its bytes stay in the data. Only an omitted field that the discriminator
-bytes at the start hold is left out.
+bytes at the start hold is left out. A `shortU16` number discriminator below 0x80 is 1 byte,
+as Shipstern reads it. idl-drift does not read a larger one, because Shipstern cannot build a
+parser for it.
 
 Codama's `optionalAccountStrategy` is read but not compared, because Shipstern ignores it.
 
@@ -158,20 +166,25 @@ Two rules follow Shipstern's dispatch:
   discriminator offset, and a later constant in an event discriminator chain.
 - The start of an account's fields moved. A Codama number constant discriminator is also
   the first field, and a bytes constant comes before the fields, so a change from one to
-  the other moves each field (`account_discriminator_offset_changed`).
+  the other moves each field (`account_discriminator_offset_changed`). A renamed, added or
+  removed field does not hide the move. When the change only removes the field of the number
+  constant, or only adds it, no other field moves.
 - An instruction account moved, or an account was removed from the middle of the list.
 - An instruction argument was added, removed, retyped or moved.
 - Two instructions have the same discriminator, or the same Codama size discriminator, and
   the same account count.
-- Two account types have the same size discriminator. The parser decodes all of them as the
-  first one.
+- An instruction that shares a discriminator gets an account count that an old parser
+  routes to another instruction (`dispatch_order_changed`). The old parser takes the
+  highest old count at or below the number of accounts that only one instruction has.
+- Two account types have the same discriminator or the same size discriminator. The parser
+  decodes all of them as the first one.
+- Two event types have the same discriminator. Shipstern does not build the parser.
 - An account type or event type was removed.
 - An event envelope discriminator or the event payload offset changed.
-- The kind of a type changed, for example from struct to enum.
-- On a reachable type: a field was added, removed, retyped or moved; an enum variant was
-  inserted before the end, removed or moved; a variant tag value or payload changed; the
-  enum tag width changed; an alias target changed; or the type was removed while a parser
-  still reads it.
+- On a reachable type: the kind of the type changed, for example from struct to enum; a
+  field was added, removed, retyped or moved; an enum variant was inserted before the end,
+  removed or moved; a variant tag value or payload changed; the enum tag width changed; an
+  alias target changed; or the type was removed while a parser still reads it.
 - `serialization` or `repr` changed and a field of a zero-copy account moves, for example
   when a converter removes `bytemuckunsafe` from a padded type. The same applies when the
   layout of a zero-copy account cannot be calculated, for example when it holds an enum.
@@ -188,8 +201,8 @@ Two rules follow Shipstern's dispatch:
   idl-drift reports a move. This includes a field of an enum variant payload, and a payload
   that changes from named fields to a tuple of the same types (`field_renamed`).
 - A discriminator collision exists in both versions.
-- The set of account counts under a shared discriminator changed. This changes the
-  dispatch order.
+- The set of account counts under a shared discriminator changed, but an old parser still
+  routes each instruction to itself. This changes the dispatch order.
 - `serialization` or `repr` changed, no field moves, but the zero-copy size changes
   (trailing padding).
 - An error was removed or renumbered, or a new error name took an old code. An indexer
@@ -201,7 +214,7 @@ Two rules follow Shipstern's dispatch:
 
 ### Cosmetic
 
-- A field, variant, enum tag or alias change on a type that no parser reads.
+- A field, variant, enum tag, alias or kind change on a type that no parser reads.
 - A `serialization` or `repr` change that moves no zero-copy field. This includes a type
   that is only read as Borsh, and a nested type's own `serialization`, which no zero-copy
   read uses.
@@ -217,19 +230,22 @@ which can change.
 | Program | `program_address_changed` | Breaking |
 | | `program_renamed` | Dangerous |
 | Instructions | `instruction_removed`, `instruction_duplicate`, `instruction_name_collision`, `discriminator_reused`, `discriminator_changed`, `discriminator_offset_changed`, `collision` | Breaking |
-| | `collision_preexisting`, `dispatch_order_changed` | Dangerous |
+| | `collision_preexisting` | Dangerous |
+| | `dispatch_order_changed` | Breaking when an old parser routes an instruction to another one, else Dangerous |
 | | `instruction_added` | Additive |
 | Instruction accounts | `account_moved`, `account_removed` | Breaking |
 | | `account_added`, `optional_account_removed`, `account_renamed`, `account_flags_changed` | Dangerous |
 | Instruction arguments | `arg_added`, `arg_removed`, `arg_changed`, `arg_moved` | Breaking |
 | | `arg_renamed` | Dangerous |
-| Account types | `account_type_removed`, `account_discriminator_changed`, `account_discriminator_offset_changed` | Breaking |
+| Account types | `account_type_removed`, `account_discriminator_changed`, `account_discriminator_offset_changed`, `collision` | Breaking |
+| | `collision_preexisting` | Dangerous |
 | | `account_type_removed` when the type stays in `types`. Anchor 1.x lists only the accounts that the program owns. | Dangerous |
 | | `account_type_added` | Additive |
-| Events | `event_removed`, `event_discriminator_changed`, `event_envelope_changed`, `event_payload_offset_changed` | Breaking |
+| Events | `event_removed`, `event_discriminator_changed`, `event_envelope_changed`, `event_payload_offset_changed`, `collision` | Breaking |
+| | `collision_preexisting` | Dangerous |
 | | `event_added` | Additive |
-| Defined types | `type_kind_changed`, `type_removed`, `type_undefined` | Breaking |
-| | `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
+| Defined types | `type_removed`, `type_undefined` | Breaking |
+| | `type_kind_changed`, `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
 | | `field_renamed`, `variant_renamed`, `variant_appended` | Dangerous on a reachable type, else Cosmetic |
 | | `layout_changed` | Breaking, Dangerous or Cosmetic. See [Zero-copy types](#zero-copy-types). |
 | Errors | `error_removed`, `error_renumbered`, `error_code_reused` | Dangerous |
@@ -242,6 +258,7 @@ The `subject` names the item. A positional item has `#<position>`, counted from 
 | `swap` | The instruction, type or event `swap`. |
 | `swap#2` | Account or argument 2 of instruction `swap`. |
 | `size:4` | A collision on a Codama size discriminator of 4 bytes. |
+| `account:01` | A collision on the account discriminator `01`. `event:01` is the same for events. |
 | `Pool#1` | Field or variant 1 of type `Pool`. |
 
 ## Allow file
@@ -321,6 +338,11 @@ The message also goes to stderr.
 the IDL uses but does not define. A change to such a field cannot be classified, and
 `idl-verify` cannot decode it. Run `inspect` on a new IDL
 before you trust a `diff` of it.
+
+An account or event that has no type in `types` is an undefined type, because Shipstern and
+Codama need that type to read it. `diff` reports it as `type_undefined`. An array length that
+names no const parameter of its type, such as `{"generic": "N"}` in a type without a const
+`N`, is an unresolved field.
 
 idl-drift cannot resolve these Codama nodes, and `inspect` lists them:
 
@@ -602,10 +624,21 @@ pass, it must check `SourceReport::nothing_to_compare`, as the CLI does.
   encoding. A change only to its docs is not reported. Run `inspect` to see these fields.
   idl-drift reads some other nodes in a simpler form, and does not report them. Both lists
   are in [inspect](#inspect).
-- **Collisions use the first discriminator only.** Instructions that share the first
-  discriminator are reported as a collision, as in Shipstern, also when a later
-  discriminator tells them apart. In the Token-2022 IDL these collisions are real for a
-  Shipstern parser.
+- **Collisions use the first discriminator only.** Instructions, account types or event
+  types that share the first discriminator are reported as a collision, as in Shipstern, also
+  when a later discriminator tells them apart. In the Token-2022 IDL these collisions are real
+  for a Shipstern parser.
+- **Collisions need equal bytes.** Shipstern compares only as many bytes as a discriminator
+  has. Thus an account type with discriminator `01` before a type with `0102` at the same
+  offset also decodes the data of the second type. idl-drift does not report this case.
+- **Legacy instruction names with an acronym.** Anchor 0.29 writes the function `set_a_b` as
+  `setAB` and hashes `global:set_a_b`, as Shipstern does. idl-drift hashes `global:set_ab`,
+  so its discriminator is wrong.
 - **Codama spec 1.x only.** Codama spec 2.x, which is still in development, renames the
   `name` key of each node to `identifier`. idl-drift stops with "Codama spec 2.0.0 is not
   supported; only spec 1.x can be read" (exit 2).
+- **No Quasar IDLs.** A Quasar IDL uses another schema: a type definition has a top-level
+  `kind`, and a field can have a `codec`. An IDL with a top-level `spec`, for example
+  `quasar-idl/1.0.0`, stops `diff` and `inspect` with
+  "IDL spec quasar-idl/1.0.0 is not supported; only Anchor, Shank and Codama IDLs can be read"
+  (exit 2). `source` still reads its `address`.
