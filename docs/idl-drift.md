@@ -456,29 +456,39 @@ places, the *legs*:
 
 | Leg | JSON `leg` | Where |
 |---|---|---|
-| `declare_id!` | `declare_id` | The crate root of each `programs/*/` crate: the `[lib] path` in its `Cargo.toml`, else `src/lib.rs`. A crate root that does not exist gives no leg. The program name is the `[lib] name`, else the `[package] name` with `_` for `-`. A `Cargo.toml` that is not valid TOML or has no `[package]` stops the run (exit 2). |
+| `declare_id!` | `declare_id` | The crate root of each `programs/*/` crate: the `[lib] path` in its `Cargo.toml`, else `src/lib.rs`. Also the file of a root `mod <name>;` that the crate root takes `ID` from, such as `src/id.rs`. A crate root that does not exist gives no leg. The program name is the `[lib] name`, else the `[package] name` with `_` for `-`. A `Cargo.toml` that is not valid TOML or has no `[package]` stops the run (exit 2). |
 | Anchor.toml | `anchor_toml` | Each program of each cluster under `programs`: `name = "<ID>"` or `name = { address = "<ID>" }`. Every TOML form counts: `[programs.<cluster>]` tables, dotted keys such as `programs.localnet.amm = "<ID>"`, and inline tables. An entry of another shape, or a file that is not valid TOML, stops the run (exit 2). |
-| IDL address | `idl_address` | Each `target/idl/*.json`, and each IDL given with `--idl`. For Anchor, the id is `address`, else `metadata.address` (legacy Anchor), and the program name is `metadata.name`, else the top-level `name`. For Codama (`rootNode`), only `program.publicKey` and `program.name` count, as in the Codama tools. The first id key that is there gives the id: when its value is empty or not a string, the finding is `invalid_id`, and `source` does not read the next key. |
+| IDL address | `idl_address` | Each `target/idl/*.json`, and each IDL given with `--idl`. For Anchor, the id is `address`, else `metadata.address` (legacy Anchor), and the program name is `metadata.name`, else the top-level `name`. Anchor writes the name of the `#[program] mod` there. The next paragraph says how an IDL name finds its crate. A file given again with `--idl` is read one time. For Codama (`rootNode`), only `program.publicKey` and `program.name` count, as in the Codama tools. The first id key that is there gives the id: when its value is empty or not a string, the finding is `invalid_id`, and `source` does not read the next key. |
 | On chain | `onchain` | Only with `--onchain`. See [Chain check](#chain-check). |
 
 `declare_id!` is the reference, because the program accepts only the id that it was built
 with. Each other leg is compared with it. When a program has no `declare_id!`, its IDL
-address must match one of its Anchor.toml ids. Program names match in `snake_case`, so the
-Codama name `orderEngine` and the key `order-engine` are the crate `order_engine`. The crates
-`a_mm` and `am_m` stay two programs.
+address must match one of its Anchor.toml ids. With neither, its IDL addresses must match
+each other. Program names match in `snake_case`, so the Codama name `orderEngine` and the key
+`order-engine` are the crate `order_engine`. The crates `a_mm` and `am_m` stay two programs,
+and so do `pool_2` and `pool2`. When no lib has the name of an IDL, the IDL gets the lib name
+of the one crate whose lib name or root `#[program] mod` name it is, with no `_` before a
+digit. So the Codama name `limitOrder2` is the crate `limit_order_2`, and an Anchor IDL named
+`amm_program` is the crate with `#[program] mod amm_program`. When two crates fit, the IDL
+keeps its name.
 
 A `declare_id!` counts when rustc compiles it into the crate's `ID`:
 
 - At the crate root.
 - Directly in a branch block of `cfg_if! { .. }` (also `cfg_if::cfg_if! { .. }`), not in a
-  `mod` or `fn` in it. Another macro can drop or change its input, so a `declare_id!` in it
-  does not count. A `mod` or a `use` in a branch block counts as one at the crate root.
+  `mod` or `fn` in it. Another macro can drop or change its input, so a `declare_id!` in it,
+  as in `name! { .. }`, `name!(..)` or `name![..]`, does not count. A `mod` or a `use` in a
+  branch block counts as one at the crate root.
 - In a module at the crate root that the crate root imports with `use <module>::ID` or
   `use <module>::{ID, ..}`, `pub` or not. A nested module, or a renamed import such as
-  `use keys::ID as KEY`, does not count.
-- In a module that the crate root imports with `use <module>::*`, only when there is no
-  `declare_id!` at the crate root or in a `cfg_if!` branch, and no `use` that names `ID`.
-  As in rustc, the `ID` that the crate defines or names shadows the glob.
+  `use keys::ID as KEY`, does not count. A root `mod <module>;` counts in the same way: its
+  file is `<module>.rs` or `<module>/mod.rs` next to the crate root. Anchor's `keys sync` also
+  writes the id in `src/id.rs`.
+- In a module that the crate root imports with `use <module>::*`, only when no `declare_id!`
+  at the crate root and no `use` that names `ID` is always there. One with a `#[cfg(..)]`, or
+  one in a `cfg_if!` branch, is not always there. A `cfg_if!` chain that ends in `else` and
+  has such an `ID` in each branch is always there. As in rustc, the `ID` that the crate defines
+  or names shadows the glob, so the glob counts only when a cfg can remove that `ID`.
 
 One in a comment, a string, a function or another module (such as
 `mod jupiter { declare_id!(..) }` for a CPI target) does not count. `source` does not
@@ -488,10 +498,11 @@ evaluate `#[cfg(..)]`, so a `declare_id!` under a cfg that is never true still c
 program. A missing file is not an error, because a CI job often has only some of the
 files. A program is compared when it has a valid `declare_id!` and one more valid id (the
 chain included), or, with no valid `declare_id!`, a valid IDL address and a valid
-Anchor.toml id. Two Anchor.toml clusters alone do not count, because no rule compares one
-cluster with another. When no program is compared and there is no finding, `source` has
-nothing to compare, and the run stops (exit 2). For example, ROOT holds no program id, only
-a library crate, or only Anchor.toml.
+Anchor.toml id, or, with neither, two valid IDL addresses. Two Anchor.toml clusters alone do
+not count, because no rule compares one cluster with another. When no program is compared and
+no finding is above Cosmetic, `source` has nothing to compare, and the run stops (exit 2). For
+example, ROOT holds no program id, only a library crate, or only Anchor.toml and a `lib.rs`
+with no `declare_id!`.
 
 `source` reads only regular files under ROOT. A symlink that points out of ROOT, a path
 that is not a regular file, a `[lib] path` that resolves out of ROOT, or a file over 16 MiB
@@ -501,7 +512,7 @@ type and size rules apply to it.
 `source` reads the IDL name and address from the raw JSON, not with the IDL model of
 `diff`. So an IDL of any format gives its id, also an IDL that `diff` cannot load. This is
 also true for the on-chain IDL with `--onchain`. A file that is not JSON, or an IDL with no
-name, stops the run (exit 2).
+name, stops the run (exit 2). An on-chain IDL needs no name: its address is enough.
 
 ### Findings
 
@@ -513,10 +524,10 @@ Additive findings.
 | `kind` | Tier | Why |
 |---|---|---|
 | `anchor_toml_mismatch` | Breaking | The id in `[programs.<cluster>]` is not the `declare_id!`. Anchor's tools use that id on that cluster. For example, `anchor test` loads the program at the `[programs.localnet]` id, where the program rejects each instruction. |
-| `idl_address_mismatch` | Breaking | The IDL address is not the `declare_id!`. Clients and indexers built from the IDL use the wrong program. |
+| `idl_address_mismatch` | Breaking | The IDL address is not the `declare_id!`. With no `declare_id!`, it is not an Anchor.toml id, or with neither, it is not the address of the first IDL of the program. Clients and indexers built from the IDL use the wrong program. |
 | `invalid_id` | Breaking | An id is not base58 of 32 bytes. This includes an IDL `address` that is empty or not a string. |
 | `onchain_missing` | Breaking | With `--onchain`: no `declare_id!` value of the program is a deployed program. Each value has no account, or an account that is not executable. |
-| `onchain_mismatch` | Breaking | With `--onchain`: the IDL that the program publishes on chain gives another address, or no address that can be read. A legacy IDL has no address key, so the program is its address. |
+| `onchain_mismatch` | Breaking | With `--onchain`: the IDL that the program publishes on chain gives another address, or no address that can be read. A legacy IDL has no address key, so the program is its address. An IDL with neither an address nor a name has no address that can be read. |
 | `onchain_idl_missing` | Dangerous | With `--onchain`: the program is deployed, but it has no on-chain IDL account. A client cannot read its IDL from chain. |
 | `declare_id_duplicate` | Dangerous | The crate root has more than one `declare_id!` value, so the program picks its id with `cfg`, for example one for each feature. An id that matches any one of the values passes, so a wrong id for one build is not found. This finding lists the values. Use `--fail-on dangerous` to fail on it. More than 16 values is Breaking, and the chain check skips them, because a `cfg` set needs far fewer. |
 | `declare_id_missing` | Cosmetic | The `lib.rs` of a program that Anchor.toml or an IDL names has no `declare_id!` at the crate root, so its other ids cannot be checked. A crate that nothing else names is a library, and a program with no crate in `programs/` has its source elsewhere. Neither one is a finding. |
@@ -602,8 +613,10 @@ The `idl_drift` crate exposes the same functions as the CLI. An example is in th
 [crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
 both tools use. `idl_drift::layout` calculates zero-copy layouts. `idl_drift::inspect` holds
 the functions behind `inspect`. `idl_drift::source` holds the functions behind `source`:
-`discover`, `read_idl`, `check` and `check_onchain`. Before a caller takes a report as a
-pass, it must check `SourceReport::nothing_to_compare`, as the CLI does.
+`discover`, `discover_with_idls`, `read_idl`, `check` and `check_onchain`. Use
+`discover_with_idls` for IDLs outside `target/idl`, so that an IDL name finds its crate as
+the CLI does. Before a caller takes a
+report as a pass, it must check `SourceReport::nothing_to_compare`, as the CLI does.
 
 ## Limitations
 
@@ -613,7 +626,10 @@ pass, it must check `SourceReport::nothing_to_compare`, as the CLI does.
   apart is not found. A Shank `vec` with a `size` does not load (exit 2).
 - **source: the Anchor layout only.** `source` reads `programs/*/` and `target/idl/` under
   ROOT. For another layout, give each IDL with `--idl`. It does not find a `declare_id!`
-  outside the crate root of a `programs/*/` crate.
+  outside the crate root of a `programs/*/` crate and the files of its root `mod <name>;`
+  items. It does not read a `mod` with `#[path = ..]`. It does not read
+  `#[cfg_attr(.., program)]` as the `#[program] mod`, so an IDL with that module name does not
+  find its crate.
 - **IDL against IDL only.** idl-drift compares IDLs, also with `--onchain`. It cannot see a
   program that was upgraded on chain with no IDL update. Use [idl-verify](idl-verify.md) to
   check an IDL against real data.

@@ -1,7 +1,7 @@
 //! `source`: the program id in `declare_id!`, `Anchor.toml` and the IDL must agree.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -9,8 +9,8 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use idl_drift::onchain;
 use idl_drift::source::{
-    check, check_onchain, discover, read_idl, FindingKind, Leg, ProgramId, SourceError,
-    SourceReport,
+    check, check_onchain, discover, discover_with_idls, read_idl, FindingKind, Leg, ProgramId,
+    SourceError, SourceReport,
 };
 use idl_drift::Severity;
 use serde_json::{json, Value};
@@ -134,12 +134,44 @@ fn a_codama_camel_case_name_is_the_same_program_as_its_crate() {
 }
 
 #[test]
+fn a_codama_name_with_a_digit_word_is_the_same_program_as_its_crate() {
+    let codama = format!(
+        r#"{{"kind":"rootNode","program":{{"kind":"programNode","name":"limitOrder2","publicKey":"{OTHER}"}}}}"#
+    );
+    let root = temp_workspace(
+        "digit-word",
+        &[
+            ("programs/limit-order-2/Cargo.toml", cargo("limit-order-2")),
+            (
+                "programs/limit-order-2/src/lib.rs",
+                format!("declare_id!(\"{ID}\");"),
+            ),
+            ("idls/limit_order_2.json", codama),
+        ],
+    );
+    let report = discovered(&root, &[root.join("idls/limit_order_2.json")]);
+    assert_eq!(
+        rules(&report),
+        [(
+            FindingKind::IdlAddressMismatch,
+            Severity::Breaking,
+            "limit_order_2"
+        )]
+    );
+}
+
+#[test]
 fn crates_whose_names_differ_only_by_underscore_stay_apart() {
     let report = check(vec![
         id("a_mm", declare("a_mm"), ID),
         id("am_m", declare("am_m"), OTHER),
         id("a_mm", toml("mainnet"), OTHER),
         id("am_m", toml("mainnet"), ID),
+        // An `_` before a digit also counts.
+        id("pool_2", declare("pool_2"), ID),
+        id("pool2", declare("pool2"), OTHER),
+        id("pool_2", toml("mainnet"), ID),
+        id("pool2", toml("mainnet"), ID),
     ]);
     assert_eq!(
         rules(&report),
@@ -154,6 +186,11 @@ fn crates_whose_names_differ_only_by_underscore_stay_apart() {
                 Severity::Breaking,
                 "am_m@mainnet"
             ),
+            (
+                FindingKind::AnchorTomlMismatch,
+                Severity::Breaking,
+                "pool2@mainnet"
+            ),
         ]
     );
 }
@@ -167,6 +204,29 @@ fn with_no_declare_id_the_idl_must_match_anchor_toml() {
         ]
     };
     assert_eq!(rules(&check(ids(ID))), []);
+    assert_eq!(
+        rules(&check(ids(OTHER))),
+        [(FindingKind::IdlAddressMismatch, Severity::Breaking, "amm")]
+    );
+}
+
+#[test]
+fn with_no_declare_id_or_anchor_toml_id_two_idls_must_agree() {
+    let ids = |copy| {
+        vec![
+            id("amm", idl("amm"), ID),
+            id(
+                "amm",
+                Leg::IdlAddress {
+                    path: "idls/amm.json".into(),
+                },
+                copy,
+            ),
+        ]
+    };
+    let same = check(ids(ID));
+    assert_eq!(rules(&same), []);
+    assert!(same.compared());
     assert_eq!(
         rules(&check(ids(OTHER))),
         [(FindingKind::IdlAddressMismatch, Severity::Breaking, "amm")]
@@ -213,6 +273,12 @@ fn a_report_that_compared_nothing_and_found_nothing_is_not_a_pass() {
     assert!(check(Vec::new()).nothing_to_compare());
     // A finding is a result, also when no id was compared.
     assert!(!check(vec![id("amm", toml("mainnet"), "abc")]).nothing_to_compare());
+    // A Cosmetic finding says only that an id cannot be checked.
+    assert!(check(vec![
+        id("amm", declare("amm"), ""),
+        id("amm", toml("mainnet"), ID)
+    ])
+    .nothing_to_compare());
 }
 
 #[test]
@@ -448,6 +514,17 @@ fn onchain_idl_with_no_readable_address_is_breaking() {
 }
 
 #[test]
+fn onchain_idl_with_an_address_and_no_name_gives_its_address() {
+    let no_name = format!(r#"{{"address":"{ID}","instructions":[]}}"#);
+    let report = onchain_report(
+        vec![id("amm", declare("amm"), ID)],
+        chain(&[ID], &[(ID, no_name)]),
+    );
+    assert_eq!(rules(&report), []);
+    assert_eq!(report.ids.last().map(|i| i.id.as_str()), Some(ID));
+}
+
+#[test]
 fn one_deployed_cfg_id_is_enough() {
     let ids = vec![
         id("amm", declare("amm"), ID),
@@ -596,6 +673,127 @@ fn the_crate_root_is_the_lib_path_that_cargo_builds() {
     let report = check(ids.unwrap());
     assert_eq!(rules(&report), []);
     assert!(report.compared());
+}
+
+/// A temporary workspace that holds each `(path, text)` of `files`.
+#[allow(clippy::unwrap_used)]
+fn temp_workspace(tag: &str, files: &[(&str, String)]) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("idl-drift-source-{tag}-{}", std::process::id()));
+    for (path, text) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    root
+}
+
+fn cargo(name: &str) -> String {
+    format!("[package]\nname = \"{name}\"\n")
+}
+
+/// The report on the workspace at `root` and the IDLs at `paths`. The workspace is removed.
+#[allow(clippy::unwrap_used)]
+fn discovered(root: &Path, paths: &[PathBuf]) -> SourceReport {
+    let ids = discover_with_idls(root, paths);
+    std::fs::remove_dir_all(root).unwrap();
+    check(ids.unwrap())
+}
+
+#[test]
+fn a_declare_id_in_the_root_module_that_gives_id_counts() {
+    // Anchor's `keys sync` writes the id in `src/lib.rs` or `src/id.rs`.
+    let root = temp_workspace(
+        "id-rs",
+        &[
+            (
+                "Anchor.toml",
+                format!("[programs.mainnet]\namm = \"{OTHER}\"\n"),
+            ),
+            ("programs/amm/Cargo.toml", cargo("amm")),
+            (
+                "programs/amm/src/lib.rs",
+                "mod id;\npub use id::ID;\n".into(),
+            ),
+            (
+                "programs/amm/src/id.rs",
+                format!("anchor_lang::declare_id!(\"{ID}\");\n"),
+            ),
+        ],
+    );
+    assert_eq!(
+        rules(&discovered(&root, &[])),
+        [(
+            FindingKind::AnchorTomlMismatch,
+            Severity::Breaking,
+            "amm@mainnet"
+        )]
+    );
+}
+
+#[test]
+fn an_anchor_idl_named_by_its_program_module_is_compared_with_the_crate() {
+    // Anchor writes the `#[program] mod` name in `metadata.name` and in the file name.
+    let lib =
+        format!("declare_id!(\"{ID}\");\n#[program]\npub mod amm_program {{ use super::*; }}\n");
+    let idl = idl_json(OTHER).replace(r#""name":"amm""#, r#""name":"amm_program""#);
+    let root = temp_workspace(
+        "mod-name",
+        &[
+            ("programs/amm/Cargo.toml", cargo("amm")),
+            ("programs/amm/src/lib.rs", lib),
+            ("target/idl/amm_program.json", idl),
+        ],
+    );
+    assert_eq!(
+        rules(&discovered(&root, &[])),
+        [(FindingKind::IdlAddressMismatch, Severity::Breaking, "amm")]
+    );
+}
+
+#[test]
+fn an_idl_gets_a_lib_name_only_when_one_other_crate_fits() {
+    // `vault` is a lib name, and two crates have the `#[program] mod shared`.
+    let lib = |id: &str, module: &str| {
+        format!("declare_id!(\"{id}\");\n#[program] pub mod {module} {{}}")
+    };
+    let idl = |id: &str, name: &str| {
+        idl_json(id).replace(r#""name":"amm""#, &format!(r#""name":"{name}""#))
+    };
+    let root = temp_workspace(
+        "rename-guards",
+        &[
+            ("programs/amm/Cargo.toml", cargo("amm")),
+            ("programs/amm/src/lib.rs", lib(ID, "vault")),
+            ("programs/vault/Cargo.toml", cargo("vault")),
+            (
+                "programs/vault/src/lib.rs",
+                format!("declare_id!(\"{OTHER}\");"),
+            ),
+            ("target/idl/vault.json", idl(OTHER, "vault")),
+            ("programs/a/Cargo.toml", cargo("a")),
+            ("programs/a/src/lib.rs", lib(ID, "shared")),
+            ("programs/b/Cargo.toml", cargo("b")),
+            ("programs/b/src/lib.rs", lib(OTHER, "shared")),
+            ("target/idl/shared.json", idl(ID, "shared")),
+        ],
+    );
+    let report = discovered(&root, &[]);
+    assert_eq!(rules(&report), []);
+    let idls: Vec<&str> = report
+        .ids
+        .iter()
+        .filter(|i| matches!(i.leg, Leg::IdlAddress { .. }))
+        .map(|i| i.program.as_str())
+        .collect();
+    assert_eq!(idls, ["shared", "vault"]);
+}
+
+#[test]
+fn an_idl_given_again_with_idl_is_read_one_time() {
+    let root = temp_workspace("idl-twice", &[("target/idl/amm.json", idl_json(ID))]);
+    let report = discovered(&root, &[root.join("target/idl/amm.json")]);
+    assert_eq!(report.ids.len(), 1);
+    assert!(report.nothing_to_compare());
 }
 
 #[cfg(unix)]

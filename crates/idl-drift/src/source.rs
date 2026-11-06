@@ -39,7 +39,8 @@ pub const MAX_FILE_BYTES: usize = 16 << 20;
 #[serde(tag = "leg", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Leg {
-    /// A `declare_id!` in the crate root of the program: its `[lib] path`, else `src/lib.rs`.
+    /// A `declare_id!` in the crate root of the program (its `[lib] path`, else `src/lib.rs`),
+    /// or in the file of a root `mod <name>;` that the crate root takes `ID` from.
     DeclareId { path: String },
     /// An entry of a `[programs.<cluster>]` table.
     AnchorToml { path: String, cluster: String },
@@ -53,7 +54,8 @@ pub enum Leg {
 /// One program id and where it was read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProgramId {
-    /// The program name as its source writes it.
+    /// The program name as its source writes it. For an IDL named after a crate's
+    /// `#[program] mod`, [`discover_with_idls`] sets the lib name.
     pub program: String,
     #[serde(flatten)]
     pub leg: Leg,
@@ -108,29 +110,35 @@ impl SourceReport {
 
     /// `true` when a rule compared two valid ids of a program: its `declare_id!` with an id in
     /// another place, the chain included, or with no `declare_id!`, its IDL address with
-    /// `Anchor.toml`. No rule compares two clusters, or two cfg values, with each other.
+    /// `Anchor.toml`, or with neither, two IDL addresses. No rule compares two clusters, or two
+    /// cfg values, with each other.
     #[must_use]
     pub fn compared(&self) -> bool {
-        // (declare_id!, Anchor.toml, IDL or chain) for each program.
-        let mut found: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+        // (declare_id!, Anchor.toml, IDL or chain legs) for each program.
+        let mut found: BTreeMap<String, (bool, bool, usize)> = BTreeMap::new();
         for id in self.ids.iter().filter(|id| is_program_id(&id.id)) {
             let legs = found.entry(program_key(&id.program)).or_default();
             match id.leg {
                 Leg::DeclareId { .. } => legs.0 = true,
                 Leg::AnchorToml { .. } => legs.1 = true,
-                Leg::IdlAddress { .. } | Leg::Onchain { .. } => legs.2 = true,
+                Leg::IdlAddress { .. } | Leg::Onchain { .. } => legs.2 += 1,
             }
         }
-        found
-            .values()
-            .any(|&(declared, toml, idl)| (declared && (toml || idl)) || (toml && idl))
+        found.values().any(|&(declared, toml, idls)| {
+            (declared && (toml || idls > 0)) || (toml && idls > 0) || idls > 1
+        })
     }
 
-    /// `true` when the report compared no id and found nothing, as for a wrong ROOT or files
-    /// that hold no id. A caller must not treat such a report as a pass.
+    /// `true` when the report compared no id and has no finding above Cosmetic, as for a wrong
+    /// ROOT or files that hold no id. A caller must not treat such a report as a pass.
     #[must_use]
     pub fn nothing_to_compare(&self) -> bool {
-        !self.compared() && self.findings.is_empty()
+        // A Cosmetic finding says only that an id cannot be checked.
+        !self.compared()
+            && self
+                .findings
+                .iter()
+                .all(|f| f.severity == Severity::Cosmetic)
     }
 
     /// The number of findings per tier: `(breaking, dangerous, additive, cosmetic)`.
@@ -196,34 +204,38 @@ impl std::error::Error for SourceError {
 ///
 /// These are the ones at the crate root or in a `cfg_if!` branch, and the ones in a root
 /// module that a root `use` imports `ID` from, as `use keys::ID` or `use keys::{ID, id}`. A
-/// local or imported `ID` shadows a glob, so `use <module>::*` counts only when there is
-/// neither. A `use` in a `cfg_if!` branch is a root `use`. Another block, such as
+/// local or imported `ID` that is always there (no `#[cfg]`, not in a `cfg_if!` branch, or in
+/// each branch of a chain that ends in `else`) shadows a glob, so `use <module>::*` counts only
+/// when there is neither. A `use` in a `cfg_if!` branch
+/// is a root `use`. Another block, such as
 /// `mod jupiter { .. }`, a function body or the body of another macro, is not the root. A cfg
 /// is not evaluated, so the id of a cfg that is never true, such as `#[cfg(any())]`, still
 /// counts as one of the cfg values.
 fn declare_ids(rust: &str) -> Vec<String> {
-    let tokens = rust_tokens(rust);
-    let (imports, at_root) = root_imports(&tokens);
-    let explicit: BTreeSet<&str> = imports
+    root_ids(&rust_tokens(rust)).0
+}
+
+/// The [`declare_ids`] of a crate root, and the root `mod <name>;` items that `ID` can come
+/// from. Their files are not in `tokens`, so the caller reads them.
+fn root_ids<'a>(tokens: &[Token<'a>]) -> (Vec<String>, BTreeSet<&'a str>) {
+    let (imports, at_root, files) = root_imports(tokens);
+    // A `#[cfg]` can remove the `ID` that shadows the glob, so then the glob counts too.
+    let shadowed = at_root || imports.iter().any(|&(_, glob, cfg)| !glob && !cfg);
+    let modules: BTreeSet<&str> = imports
         .iter()
-        .filter(|(_, glob)| !glob)
-        .map(|(module, _)| *module)
+        .filter(|&&(_, glob, _)| !glob || !shadowed)
+        .map(|&(module, _, _)| module)
         .collect();
-    let modules = if at_root || !explicit.is_empty() {
-        explicit
-    } else {
-        imports.iter().map(|(module, _)| *module).collect()
-    };
     let mut blocks = Blocks::default();
     let mut ids: Vec<String> = Vec::new();
     for i in 0..tokens.len() {
-        blocks.step(&tokens, i);
+        blocks.step(tokens, i);
         let sets_id = match blocks.scope() {
             Scope::Root => true,
             Scope::Module(module) => modules.contains(module),
             Scope::Other => false,
         };
-        let Some(id) = declared_at(&tokens, i).filter(|_| sets_id) else {
+        let Some(id) = declared_at(tokens, i).filter(|_| sets_id) else {
             continue;
         };
         if !ids.iter().any(|seen| seen == id) {
@@ -234,7 +246,46 @@ fn declare_ids(rust: &str) -> Vec<String> {
             }
         }
     }
-    ids
+    let files = files.into_iter().filter(|f| modules.contains(f)).collect();
+    (ids, files)
+}
+
+/// The name of the root `#[program] mod`. Anchor writes it as the IDL name, and it can differ
+/// from the lib name.
+fn program_module<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    let mut blocks = Blocks::default();
+    // The end of the last item searched. A later attribute of that item gives the same result.
+    let mut searched = 0;
+    for i in 0..tokens.len() {
+        blocks.step(tokens, i);
+        // `#[program]` or a path that ends in it, such as `#[anchor_lang::program]`.
+        let attribute = matches!(
+            &tokens[i.saturating_sub(1)..],
+            [
+                Token::Punct(b'[' | b':'),
+                Token::Ident("program"),
+                Token::Punct(b']'),
+                ..
+            ]
+        );
+        if !attribute || i < searched || blocks.scope() != Scope::Root {
+            continue;
+        }
+        // The item ends at its `{` or `;`. `pub`, `pub(crate)` or another attribute can come
+        // before `mod <name>`.
+        searched = tokens[i..]
+            .iter()
+            .position(|t| matches!(t, Token::Punct(b'{' | b';')))
+            .map_or(tokens.len(), |end| i + end);
+        let module = tokens[i..searched].windows(2).find_map(|pair| match pair {
+            [Token::Ident("mod"), Token::Ident(name)] => Some(*name),
+            _ => None,
+        });
+        if module.is_some() {
+            return module;
+        }
+    }
+    None
 }
 
 /// The string of the `declare_id!("...")` that starts at `tokens[i]`.
@@ -247,37 +298,120 @@ fn declared_at<'a>(tokens: &[Token<'a>], i: usize) -> Option<&'a str> {
     }
 }
 
-/// The `(module, glob)` of each `<module>::ID` and `<module>::*` that a root `use` imports, and
-/// whether a `declare_id!` is at the root.
-fn root_imports<'a>(tokens: &[Token<'a>]) -> (Vec<(&'a str, bool)>, bool) {
+/// The `(module, glob, cfg)` of a `<module>::ID` or `<module>::*` that a root `use` imports.
+type Import<'a> = (&'a str, bool, bool);
+
+/// A root `cfg_if!` chain, for the `ID` that each build gets.
+struct Chain {
+    /// Each closed branch gives `ID`, and no `#[cfg]` is on the `cfg_if!`.
+    every: bool,
+    /// The open branch gives `ID`.
+    branch: bool,
+    /// The open branch is the `else` branch.
+    is_else: bool,
+}
+
+/// Each [`Import`], whether a root `ID` is in each build, and the name of each root
+/// `mod <name>;` with no `#[path]`. A `declare_id!` with no `#[cfg]`, or a `cfg_if!` chain that
+/// ends in `else` with an `ID` in each branch, gives `ID` in each build.
+fn root_imports<'a>(tokens: &[Token<'a>]) -> (Vec<Import<'a>>, bool, BTreeSet<&'a str>) {
     let mut imports = Vec::new();
     let mut at_root = false;
+    let mut files = BTreeSet::new();
     let mut blocks = Blocks::default();
     let mut statement = None;
-    for (i, token) in tokens.iter().enumerate() {
+    let mut chains: Vec<Chain> = Vec::new();
+    // A `#[cfg(..)]` or a `#[path = ..]` is on the root item that starts next.
+    let (mut cfg, mut path) = (false, false);
+    for i in 0..tokens.len() {
+        let closed = (tokens[i] == Token::Punct(b'}'))
+            .then(|| blocks.stack.last().copied())
+            .flatten();
         blocks.step(tokens, i);
         if blocks.scope() != Scope::Root {
             continue;
         }
-        match token {
-            // In a return type, `use<..>` captures lifetimes and imports nothing.
-            Token::Ident("use") if tokens.get(i + 1) != Some(&Token::Punct(b'<')) => {
-                statement = Some(i + 1);
-            }
-            Token::Punct(b';') => {
-                if let Some(start) = statement.take() {
-                    use_tree(&tokens[start..i], &mut imports);
+        match (closed, &tokens[i], blocks.stack.last()) {
+            (None, Token::Punct(b'{'), Some(Block::CfgIf)) => chains.push(Chain {
+                every: !cfg,
+                branch: false,
+                is_else: false,
+            }),
+            (None, Token::Punct(b'{'), Some(Block::Branch)) => {
+                // The `#[cfg]` before a branch is its condition, not an item attribute.
+                cfg = false;
+                if let Some(chain) = chains.last_mut() {
+                    chain.branch = false;
+                    chain.is_else = tokens.get(i.wrapping_sub(1)) == Some(&Token::Ident("else"));
                 }
             }
-            _ => at_root |= declared_at(tokens, i).is_some(),
+            (Some(Block::Branch), ..) => {
+                if let Some(chain) = chains.last_mut() {
+                    chain.every &= chain.branch;
+                }
+            }
+            (Some(Block::CfgIf), ..) => {
+                if let Some(Chain {
+                    every: true,
+                    is_else: true,
+                    ..
+                }) = chains.pop()
+                {
+                    match chains.last_mut() {
+                        Some(outer) => outer.branch = true,
+                        None => at_root = true,
+                    }
+                }
+            }
+            _ => {}
+        }
+        // A `cfg_if!` branch can be off, so each item in it is conditional.
+        let conditional = cfg || blocks.branches > 0;
+        // The item at `tokens[i]` gives `ID` when its branch is on.
+        let mut gives_id = false;
+        match &tokens[i..] {
+            [Token::Punct(b'#'), Token::Punct(b'['), Token::Ident("cfg"), Token::Punct(b'('), ..] =>
+            {
+                cfg = true;
+            }
+            // rustc reads a `#[path]` module from another file, so `source` does not read it.
+            [Token::Punct(b'#'), Token::Punct(b'['), Token::Ident("path"), Token::Punct(b'='), ..] =>
+            {
+                path = true;
+            }
+            // In a return type, `use<..>` captures lifetimes and imports nothing.
+            [Token::Ident("use"), rest @ ..] if rest.first() != Some(&Token::Punct(b'<')) => {
+                statement = Some(i + 1);
+            }
+            [Token::Ident("mod"), Token::Ident(name), Token::Punct(b';'), ..] if !path => {
+                files.insert(*name);
+            }
+            [Token::Punct(b';'), ..] => {
+                if let Some(start) = statement.take() {
+                    let before = imports.len();
+                    use_tree(&tokens[start..i], conditional, &mut imports);
+                    gives_id = !cfg && imports[before..].iter().any(|&(_, glob, _)| !glob);
+                }
+                (cfg, path) = (false, false);
+            }
+            // The `}` of a `use` group does not end the `use`.
+            [Token::Punct(b'}'), ..] if statement.is_none() => (cfg, path) = (false, false),
+            _ if declared_at(tokens, i).is_some() => {
+                at_root |= !conditional;
+                gives_id = !cfg;
+            }
+            _ => {}
+        }
+        if let (true, true, Some(chain)) = (gives_id, blocks.branches > 0, chains.last_mut()) {
+            chain.branch = true;
         }
     }
-    (imports, at_root)
+    (imports, at_root, files)
 }
 
-/// Push `(module, glob)` for each `<module>::ID` and `<module>::*` in the tree of a `use`. A
-/// renamed `ID`, as in `keys::ID as KEY`, does not set the crate's `ID`.
-fn use_tree<'a>(tree: &[Token<'a>], imports: &mut Vec<(&'a str, bool)>) {
+/// Push `(module, glob, cfg)` for each `<module>::ID` and `<module>::*` in the tree of a
+/// `use`. A renamed `ID`, as in `keys::ID as KEY`, does not set the crate's `ID`.
+fn use_tree<'a>(tree: &[Token<'a>], cfg: bool, imports: &mut Vec<Import<'a>>) {
     // The last path segment before each open `{` group.
     let mut groups: Vec<Option<&'a str>> = Vec::new();
     let (mut module, mut leaf, mut renamed) = (None, None, false);
@@ -287,13 +421,13 @@ fn use_tree<'a>(tree: &[Token<'a>], imports: &mut Vec<(&'a str, bool)>) {
             Token::Ident(name) if !renamed => (module, leaf) = (leaf, Some(*name)),
             Token::Punct(b'*') => {
                 if let Some(module) = leaf.take() {
-                    imports.push((module, true));
+                    imports.push((module, true, cfg));
                 }
             }
             Token::Punct(b'{') => groups.push(leaf),
             Token::Punct(b',' | b'}') => {
                 if let (false, Some("ID"), Some(module)) = (renamed, leaf, module) {
-                    imports.push((module, false));
+                    imports.push((module, false, cfg));
                 }
                 if *token == Token::Punct(b'}') {
                     groups.pop();
@@ -305,7 +439,7 @@ fn use_tree<'a>(tree: &[Token<'a>], imports: &mut Vec<(&'a str, bool)>) {
     }
 }
 
-/// What a `{` block is, for the crate root.
+/// What a `{..}`, `(..)` or `[..]` group is, for the crate root.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Block<'a> {
     /// The body of a `cfg_if!`. Its direct blocks are its branches.
@@ -314,6 +448,8 @@ enum Block<'a> {
     Branch,
     /// A `mod <name>` at the crate root.
     Module(&'a str),
+    /// A `(..)` or `[..]` that is not a macro body, such as an attribute. It keeps the scope.
+    Group,
     /// Any other block, such as a function body or the body of another macro.
     Other,
 }
@@ -332,16 +468,21 @@ struct Blocks<'a> {
     stack: Vec<Block<'a>>,
     /// The `Other` blocks in `stack`. The count keeps each step O(1) on a deep nest.
     other: usize,
+    /// The `Branch` blocks in `stack`.
+    branches: usize,
     /// The root module that holds the token.
     module: Option<&'a str>,
 }
 
 impl<'a> Blocks<'a> {
-    /// Open or close a block when `tokens[i]` is a brace.
+    /// Open or close a block when `tokens[i]` is a delimiter.
     fn step(&mut self, tokens: &[Token<'a>], i: usize) {
         match tokens[i] {
-            Token::Punct(b'{') => {
+            Token::Punct(open @ (b'{' | b'(' | b'[')) => {
                 let block = match (self.stack.last(), &tokens[..i]) {
+                    // Another macro can drop or change its input, also in `name!(..)`.
+                    (_, [.., Token::Ident(_), Token::Punct(b'!')]) if open != b'{' => Block::Other,
+                    _ if open != b'{' => Block::Group,
                     (Some(Block::CfgIf), _) => Block::Branch,
                     _ if self.other > 0 => Block::Other,
                     // `cfg_if!` or a path that ends in it, such as `cfg_if::cfg_if!`.
@@ -353,15 +494,17 @@ impl<'a> Blocks<'a> {
                 };
                 match block {
                     Block::Other => self.other += 1,
+                    Block::Branch => self.branches += 1,
                     Block::Module(name) => self.module = Some(name),
-                    Block::CfgIf | Block::Branch => {}
+                    Block::CfgIf | Block::Group => {}
                 }
                 self.stack.push(block);
             }
-            Token::Punct(b'}') => match self.stack.pop() {
+            Token::Punct(b'}' | b')' | b']') => match self.stack.pop() {
                 Some(Block::Other) => self.other -= 1,
+                Some(Block::Branch) => self.branches -= 1,
                 Some(Block::Module(_)) => self.module = None,
-                Some(Block::CfgIf | Block::Branch) | None => {}
+                Some(Block::CfgIf | Block::Group) | None => {}
             },
             _ => {}
         }
@@ -381,6 +524,14 @@ impl<'a> Blocks<'a> {
 /// address key, and the JSON text of the value when that is not a non-empty string.
 fn idl_address(json: &str) -> Result<(String, Option<String>), String> {
     let value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let (name, address) = idl_keys(&value);
+    let name = name.ok_or("the IDL has no program name")?;
+    Ok((name.to_string(), address))
+}
+
+/// The program name and `address` of an IDL, as [`idl_address`] reads them. Each one is `None`
+/// when the IDL does not have it.
+fn idl_keys(value: &Value) -> (Option<&str>, Option<String>) {
     // Codama tools read only `program`, so another `address` key must not hide its id.
     let (names, addresses): (&[&str], &[&str]) =
         if value.get("kind").and_then(Value::as_str) == Some("rootNode") {
@@ -392,15 +543,12 @@ fn idl_address(json: &str) -> Result<(String, Option<String>), String> {
                 &["/address", "/metadata/address"],
             )
         };
-    let name = names
-        .iter()
-        .find_map(|p| {
-            value
-                .pointer(p)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
-        .ok_or("the IDL has no program name")?;
+    let name = names.iter().find_map(|p| {
+        value
+            .pointer(p)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    });
     // A client reads the first key that is there, so a bad value must not fall back.
     let address = addresses
         .iter()
@@ -409,19 +557,32 @@ fn idl_address(json: &str) -> Result<(String, Option<String>), String> {
             Some(text) if !text.is_empty() => text.to_string(),
             _ => v.to_string(),
         });
-    Ok((name.to_string(), address))
+    (name, address)
 }
 
 /// Read every program id in the Anchor workspace at `root`: `Anchor.toml`, the crate root of
-/// each `programs/*` crate (its `[lib] path`, else `src/lib.rs`) and `target/idl/*.json`. A
-/// missing file or directory is not an error, because CI often has only some of them.
+/// each `programs/*` crate (its `[lib] path`, else `src/lib.rs`), the files of its root
+/// `mod <name>;` items that give `ID`, and `target/idl/*.json`. A missing file or directory is
+/// not an error, because CI often has only some of them.
 pub fn discover(root: &Path) -> Result<Vec<ProgramId>, SourceError> {
+    discover_with_idls::<&Path>(root, &[])
+}
+
+/// [`discover`], then the [`read_idl`] leg of each path in `idl_paths` that is not read yet.
+/// When no lib has the name of an IDL, the IDL gets the lib name of the one crate whose lib
+/// name or `#[program] mod` name it is, with no `_` before a digit.
+pub fn discover_with_idls<P: AsRef<Path>>(
+    root: &Path,
+    idl_paths: &[P],
+) -> Result<Vec<ProgramId>, SourceError> {
     let real_root = root.canonicalize().map_err(|source| SourceError::Read {
         path: root.display().to_string(),
         source,
     })?;
     let read = |path: &str| read_optional(root, &real_root, path);
     let mut ids = Vec::new();
+    // The lib name and the `#[program] mod` name of each crate.
+    let mut crates: Vec<(String, Option<String>)> = Vec::new();
 
     let toml_path = "Anchor.toml";
     if let Some(text) = read(toml_path)? {
@@ -456,21 +617,21 @@ pub fn discover(root: &Path) -> Result<Vec<ProgramId>, SourceError> {
             format!("programs/{dir}/{path}")
         };
         let Some(lib) = read(&lib_path)? else {
+            crates.push((program, None));
             continue;
         };
-        let mut found = declare_ids(&lib);
-        // An empty id tells `check` that the crate root was read and declares no id.
-        if found.is_empty() {
-            found.push(String::new());
-        }
-        ids.extend(found.into_iter().map(|id| ProgramId {
+        let tokens = rust_tokens(&lib);
+        let module = program_module(&tokens).map(str::to_string);
+        let found = crate_ids(&tokens, &lib_path, read)?;
+        ids.extend(found.into_iter().map(|(path, id)| ProgramId {
             program: program.clone(),
-            leg: Leg::DeclareId {
-                path: lib_path.clone(),
-            },
+            leg: Leg::DeclareId { path },
             id,
         }));
+        crates.push((program, module));
     }
+    // A file given again with `--idl` is not a second IDL.
+    let mut idl_files = BTreeSet::new();
 
     for file in list_dir(root, &real_root, "target/idl", false)? {
         if Path::new(&file).extension().is_none_or(|ext| ext != "json") {
@@ -481,17 +642,99 @@ pub fn discover(root: &Path) -> Result<Vec<ProgramId>, SourceError> {
             continue;
         };
         let (program, address) = idl_address(&json).map_err(|m| parse_error(root, &path, m))?;
+        idl_files.extend(root.join(&path).canonicalize().ok());
         ids.push(ProgramId {
             program,
             leg: Leg::IdlAddress { path },
             id: address.unwrap_or_default(),
         });
     }
+    for path in idl_paths.iter().map(AsRef::as_ref) {
+        if path
+            .canonicalize()
+            .is_ok_and(|real| !idl_files.insert(real))
+        {
+            continue;
+        }
+        ids.push(read_idl(path)?);
+    }
+    name_idls_by_crate(&mut ids, &crates);
     Ok(ids)
 }
 
+/// Give an IDL leg the lib name of the one crate that it names in another way, when no lib
+/// has its name. Anchor names the IDL after the `#[program] mod`, and Codama writes
+/// `limitOrder2` for `limit_order_2`, so the names match with no `_` before a digit.
+fn name_idls_by_crate(ids: &mut [ProgramId], crates: &[(String, Option<String>)]) {
+    let libs: BTreeSet<String> = crates.iter().map(|(lib, _)| program_key(lib)).collect();
+    // The lib for each key, or `None` when two crates have the key.
+    let mut owners: BTreeMap<String, Option<&str>> = BTreeMap::new();
+    for (lib, module) in crates {
+        let keys: BTreeSet<String> = std::iter::once(lib)
+            .chain(module)
+            .map(|n| digit_key(n))
+            .collect();
+        for key in keys {
+            owners
+                .entry(key)
+                .and_modify(|owner| *owner = owner.filter(|other| other == lib))
+                .or_insert(Some(lib));
+        }
+    }
+    for id in ids.iter_mut() {
+        if !matches!(id.leg, Leg::IdlAddress { .. }) || libs.contains(&program_key(&id.program)) {
+            continue;
+        }
+        if let Some(Some(lib)) = owners.get(&digit_key(&id.program)) {
+            (*lib).clone_into(&mut id.program);
+        }
+    }
+}
+
+/// [`program_key`] with no `_` before a digit: `limit_order2` for `limit_order_2`.
+fn digit_key(name: &str) -> String {
+    let snake = program_key(name);
+    snake
+        .char_indices()
+        .filter(|&(i, c)| c != '_' || !snake[i + 1..].starts_with(|d: char| d.is_ascii_digit()))
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// The `(path, id)` of each `declare_id!` that can set the `ID` of the crate root at
+/// `lib_path`. Anchor's `keys sync` also reads `src/id.rs`, so the file of a root `mod id;`
+/// counts.
+fn crate_ids(
+    tokens: &[Token<'_>],
+    lib_path: &str,
+    read: impl Fn(&str) -> Result<Option<String>, SourceError>,
+) -> Result<Vec<(String, String)>, SourceError> {
+    let (declared, files) = root_ids(tokens);
+    let mut found: Vec<(String, String)> = declared
+        .into_iter()
+        .map(|id| (lib_path.to_string(), id))
+        .collect();
+    for module in files {
+        for file in [format!("{module}.rs"), format!("{module}/mod.rs")] {
+            let file = Path::new(lib_path)
+                .with_file_name(file)
+                .display()
+                .to_string();
+            if let Some(text) = read(&file)? {
+                found.extend(declare_ids(&text).into_iter().map(|id| (file.clone(), id)));
+                break;
+            }
+        }
+    }
+    // An empty id tells `check` that the crate root was read and declares no id.
+    if found.is_empty() {
+        found.push((lib_path.to_string(), String::new()));
+    }
+    Ok(found)
+}
+
 /// The `address` leg of the IDL at `path`, such as one outside `target/idl`. The leg path is
-/// `path` as given.
+/// `path` as given. Its program is the IDL name: [`discover_with_idls`] can set a lib name.
 pub fn read_idl(path: &Path) -> Result<ProgramId, SourceError> {
     let shown = path.display().to_string();
     let json = read_capped(path, &shown)?;
@@ -627,10 +870,14 @@ pub fn check_onchain(
 }
 
 /// The address of an on-chain IDL, read as for the file legs. A legacy IDL has no address
-/// key, so its program is its address. `None` when the IDL has no name.
+/// key, so its program is its address. `None` when the IDL has neither an address nor a name.
 fn onchain_address(text: &str, program: &str) -> Option<String> {
-    let (_, address) = idl_address(text).ok()?;
-    Some(address.unwrap_or_else(|| program.to_string()))
+    let value: Value = serde_json::from_str(text).ok()?;
+    match idl_keys(&value) {
+        (_, Some(address)) => Some(address),
+        (Some(_), None) => Some(program.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Why no program is at `id`, or `None` when an executable account is there.
@@ -735,6 +982,11 @@ fn check_program(program: &str, legs: &[&ProgramId], out: &mut Vec<Finding>) {
         .filter(|l| matches!(l.leg, Leg::AnchorToml { .. }) && is_program_id(&l.id))
         .map(|l| l.id.as_str())
         .collect();
+    // With neither, the IDLs can still disagree with each other.
+    let first_idl = legs.iter().find_map(|l| match &l.leg {
+        Leg::IdlAddress { path } if is_program_id(&l.id) => Some((path, l.id.as_str())),
+        _ => None,
+    });
     let mut push = |severity, kind, subject, message| {
         out.push(finding(severity, kind, program, subject, message));
     };
@@ -802,6 +1054,20 @@ fn check_program(program: &str, legs: &[&ProgramId], out: &mut Vec<Finding>) {
                     "{path} address is {}, and Anchor.toml gives {}: no declare_id! was found, and clients and IDL lookups use one of them wrongly",
                     leg.id,
                     toml_ids.join(" or ")
+                ),
+            );
+        } else if let (true, true, Some((first_path, first))) = (
+            declared.is_empty(),
+            toml_ids.is_empty(),
+            first_idl.filter(|&(_, first)| first != leg.id),
+        ) {
+            push(
+                Severity::Breaking,
+                FindingKind::IdlAddressMismatch,
+                program.to_string(),
+                format!(
+                    "{path} address is {}, and {first_path} gives {first}: no declare_id! or Anchor.toml id was found, and clients and IDL lookups use one of them wrongly",
+                    leg.id
                 ),
             );
         }
@@ -1185,6 +1451,15 @@ mod jupiter {{ use anchor_lang::declare_id; declare_id!("Cpi111"); }}
     }
 
     #[test]
+    fn a_declare_id_in_a_paren_or_bracket_macro_body_does_not_count() {
+        let src = r#"macro_rules! unused { ($($t:tt)*) => {}; }
+            unused!(declare_id!("Paren111"););
+            unused![f(declare_id!("Bracket111"))];
+            declare_id!("Root111");"#;
+        assert_eq!(declare_ids(src), ["Root111"]);
+    }
+
+    #[test]
     fn an_explicit_id_import_wins_over_a_glob() {
         let group = r#"mod program_id { declare_id!("Glob111"); }
             mod keys { declare_id!("Keys111"); }
@@ -1211,6 +1486,104 @@ mod jupiter {{ use anchor_lang::declare_id; declare_id!("Cpi111"); }}
             fn f() { use program_id::*; }
             declare_id!("Root111");"#;
         assert_eq!(declare_ids(unused), ["Root111"]);
+    }
+
+    #[test]
+    fn a_glob_counts_when_the_id_that_shadows_it_has_a_cfg() {
+        // With the feature off, the glob gives `ID`.
+        let root = r#"#[cfg(feature = "devnet")] mod devnet_id { declare_id!("Glob111"); }
+            #[cfg(feature = "devnet")] pub use devnet_id::*;
+            #[cfg(not(feature = "devnet"))] declare_id!("Root111");"#;
+        assert_eq!(declare_ids(root), ["Glob111", "Root111"]);
+        let import = r#"mod program_id { declare_id!("Glob111"); }
+            mod keys { declare_id!("Keys111"); }
+            pub use program_id::*;
+            #[cfg(feature = "keys")] pub use keys::{ID, id};"#;
+        assert_eq!(declare_ids(import), ["Glob111", "Keys111"]);
+    }
+
+    #[test]
+    fn each_item_in_a_cfg_if_branch_is_conditional() {
+        // A branch can be off, so its `ID` does not shadow the glob, also after another item.
+        let after_use = r#"mod program_id { declare_id!("Glob111"); }
+            pub use program_id::*;
+            cfg_if::cfg_if! { if #[cfg(feature = "devnet")] { use x::y; declare_id!("Dev111"); } }"#;
+        assert_eq!(declare_ids(after_use), ["Glob111", "Dev111"]);
+        let in_else = r#"mod devnet { declare_id!("Glob111"); }
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "devnet")] { pub use devnet::*; }
+                else { declare_id!("Main111"); }
+            }"#;
+        assert_eq!(declare_ids(in_else), ["Glob111", "Main111"]);
+    }
+
+    #[test]
+    fn a_cfg_if_chain_with_an_id_in_each_branch_and_an_else_shadows_a_glob() {
+        // Each build has one of the branch ids, so no build uses the glob.
+        let declared = r#"mod jupiter { declare_id!("Jup111"); }
+            pub use jupiter::*;
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "devnet")] { declare_id!("Dev111"); }
+                else { declare_id!("Main111"); }
+            }"#;
+        assert_eq!(declare_ids(declared), ["Dev111", "Main111"]);
+        let imported = r#"mod jupiter { declare_id!("Jup111"); }
+            mod devnet { declare_id!("Dev111"); }
+            mod mainnet { declare_id!("Main111"); }
+            pub use jupiter::*;
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "devnet")] { pub use devnet::ID; }
+                else { pub use mainnet::ID; }
+            }"#;
+        assert_eq!(declare_ids(imported), ["Dev111", "Main111"]);
+    }
+
+    #[test]
+    fn name_idls_by_crate_reads_each_crate_name_one_time() {
+        let crates: Vec<(String, Option<String>)> = (0..2_000)
+            .map(|i| (format!("crate_{i}"), Some(format!("program_{i}"))))
+            .collect();
+        let mut ids: Vec<ProgramId> = (0..2_000)
+            .map(|i| ProgramId {
+                program: format!("program{i}"),
+                leg: Leg::IdlAddress {
+                    path: format!("{i}.json"),
+                },
+                id: String::new(),
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        name_idls_by_crate(&mut ids, &crates);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(ids[7].program, "crate_7");
+    }
+
+    fn module_files(src: &str) -> Vec<&str> {
+        root_ids(&rust_tokens(src)).1.into_iter().collect()
+    }
+
+    #[test]
+    fn a_repeated_root_module_is_read_one_time() {
+        let src = "#[cfg(a)] mod id;\n#[cfg(not(a))] mod id;\npub use id::ID;";
+        assert_eq!(module_files(src), ["id"]);
+    }
+
+    #[test]
+    fn a_root_module_with_a_path_attribute_is_not_read() {
+        let src = "#[path = \"keys.rs\"] mod id;\npub use id::ID;";
+        assert_eq!(module_files(src), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn program_module_reads_a_long_run_of_attributes_in_linear_time() {
+        // Each `#[program]` that is not on a `mod` searched to the end of the item again.
+        let src = format!(
+            "{}fn f() {{}}\n#[program]\npub mod amm {{}}",
+            "#[program]\n".repeat(20_000)
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(program_module(&rust_tokens(&src)), Some("amm"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

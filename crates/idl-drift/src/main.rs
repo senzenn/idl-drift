@@ -760,10 +760,7 @@ fn run_source(args: &SourceCheckArgs, rpc_flag: bool, format: Format) -> Result<
         )));
     }
     let input = |e: source::SourceError| Failure::Input(e.to_string());
-    let mut ids = source::discover(root).map_err(input)?;
-    for path in &args.idl {
-        ids.push(source::read_idl(path).map_err(input)?);
-    }
+    let ids = source::discover_with_idls(root, &args.idl).map_err(input)?;
     let mut report = source::check(ids);
     if let Some(url) = url {
         let agent = idl_drift::rpc::agent();
