@@ -73,6 +73,15 @@ idl-drift also accepts three Anchor shapes that are not in the spec structs: tup
 fields written as bare types, the pre-0.30 `{"kind": "alias"}` type, and
 `"serialization": {"custom": ...}`. A custom serialization has an unknown layout.
 
+Two types, two accounts or two events with the same name stop the run (exit 2) with
+"type `Pool` is defined more than once", or `account` or `event` for those. Shipstern and
+Codama read the first one or reject the IDL. Two cases are accepted, as in Shipstern:
+
+- Two types with the name of an account or event and with the same body, such as a legacy
+  account body and a type of the same name. When the bodies differ, the error names the
+  account or event.
+- In a Codama IDL, an account and a defined type of the same name. The account body is used.
+
 ## How idl-drift compares two IDLs
 
 A generated parser reads bytes by position and routes them by discriminator. idl-drift
@@ -93,9 +102,15 @@ When the two files use different formats, idl-drift first does these steps:
 - It compares names in camelCase, as Codama writes them. So `deposit_vault` and
   `depositVault` are the same instruction.
 - It compares an instruction argument that holds a struct, linked or inline, field by
-  field at each depth, and an argument that links an alias as the alias target. Codama
-  inlines a type that has only one use, and Borsh writes a struct as its fields, so the
-  bytes are the same.
+  field, and an argument that links an alias as the alias target. Codama inlines a type
+  that has only one use, Shipstern's converter inlines it one level, and Borsh writes a
+  struct as its fields, so the bytes are the same. The arguments pair one by one, and an
+  argument is inlined only where its type differs from the other side. So a renamed field
+  keeps its name, and a struct that both sides link stays a link: a change inside it shows
+  on the type.
+- It writes each `repr(C)` gap of a zero-copy type as a `[u8; n]` field, named
+  `padding_before_<field>` or `padding_end`, when the Codama type has these fields.
+  Shipstern's converter writes the gaps this way, so Borsh reads the same bytes.
 - It writes each use of a generic struct or alias as its body with the arguments filled in,
   as Codama converters do.
 - It compares a tuple struct and a tuple alias as the same type.
@@ -120,8 +135,10 @@ For every pair of files, idl-drift also does these steps, because the bytes are 
 `serialization` and `repr` changes follow Shipstern's converter. Only accounts are cast from
 memory. Instruction arguments and events are always Borsh. idl-drift lays out each zero-copy
 account two times, with the old and with the new `serialization` and `repr`, and compares
-the field offsets. Thus changes that cancel out are Cosmetic, for example a converter that
-removes `packed` from an account and from each type in it.
+the field offsets and the array sizes. An array whose item size changes moves each later
+item, so it is Breaking also when the array is the last field. Changes that cancel out are
+Cosmetic, for example a converter that removes `packed` from an account and from each type
+in it.
 
 ### Discriminator dispatch
 
@@ -376,6 +393,7 @@ unmapped (Generic) fields: 1
 UNMAPPED: ix:ping.n -> Generic("hiddenPrefixTypeNode")
 undefined types: 0
 padded zero-copy types also read as Borsh: 0
+zero-copy accounts with an unknown layout: 0
 instructions that Shipstern cannot tell apart: 0
 account types that Shipstern skips: 0
 ```
@@ -387,6 +405,20 @@ reads. A type inside a `bytemuckunsafe` account sits at `repr(C)` offsets, with 
 padding. When an instruction argument, an event or a Borsh account reaches the same type,
 Borsh reads it without the padding. One type definition cannot describe both reads.
 Shipstern's converter rejects this case as `PaddedBorshType`.
+
+### Zero-copy accounts with an unknown layout
+
+`inspect` also lists, on an `UNKNOWN LAYOUT:` line, each `bytemuck` or `bytemuckunsafe`
+account whose field offsets idl-drift cannot compute, with the reason. A parser casts such an
+account from memory, so a wrong offset misreads each field after it. An example is an enum
+field: the IDL does not keep the enum `repr`, so the size of the tag is not known.
+
+```text
+UNKNOWN LAYOUT: Bank: `config.operational_state`: `BankOperationalState` is an enum, which has no defined zero-copy layout
+```
+
+Shipstern's converter rejects these IDLs as `UnknownLayout`, and `idl-verify` gives a
+`layout` warning: not verifiable. These lines set exit code 1.
 
 ### Shipstern warnings
 
@@ -418,6 +450,7 @@ instructions: 28  accounts: 6  events: 26  types: 44
 unmapped (Generic) fields: 0
 undefined types: 0
 padded zero-copy types also read as Borsh: 0
+zero-copy accounts with an unknown layout: 0
 instructions that Shipstern cannot tell apart: 0
 account types that Shipstern skips: 0
 zero-copy types: 13

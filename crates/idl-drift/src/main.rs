@@ -24,8 +24,8 @@ use serde::Serialize;
   0  diff: no change at or above --fail-on; source: no finding at or above --fail-on;
      inspect: every field resolved
   1  diff: at least one change at or above --fail-on; source: at least one finding at or
-     above --fail-on; inspect: unmapped fields, an undefined type, or a padded zero-copy
-     type that Borsh also reads
+     above --fail-on; inspect: unmapped fields, an undefined type, a padded zero-copy
+     type that Borsh also reads, or a zero-copy account with an unknown layout
   2  idl-drift could not run: a file could not be read or parsed, an option is
      wrong, or the on-chain IDL or program account could not be fetched or read")]
 struct Cli {
@@ -385,6 +385,12 @@ fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
     let (src, idl) = load_with_text(path)?;
     let report = coverage(&idl);
     let shared = shared_types(&idl);
+    let types = layouts(&idl);
+    // A parser casts an account from memory, so it misreads each field after an unknown offset.
+    let unknown: Vec<&TypeLayout> = types
+        .iter()
+        .filter(|t| t.layout.is_err() && idl.accounts.iter().any(|a| a.name == t.name))
+        .collect();
     // Only a Codama IDL has account nodes to read, so do not parse an Anchor IDL again.
     let skipped = if idl.format == idl_drift::model::Format::Codama {
         shipstern::skipped_accounts(&src)
@@ -392,16 +398,18 @@ fn run_inspect(path: &Path, layout: bool) -> Result<u8, Failure> {
     } else {
         Vec::new()
     };
-    written(print_coverage(&report, &shared))?;
+    written(print_coverage(&report, &shared, &unknown))?;
     written(print_shipstern(
         &shipstern::ambiguous_instructions(&idl),
         &skipped,
     ))?;
     if layout {
-        written(print_layouts(&layouts(&idl)))?;
+        written(print_layouts(&types))?;
     }
     // Shipstern warnings leave the exit code as it is: other parsers read these IDLs.
-    Ok(u8::from(!report.fully_mapped() || !shared.is_empty()))
+    Ok(u8::from(
+        !report.fully_mapped() || !shared.is_empty() || !unknown.is_empty(),
+    ))
 }
 
 fn print_shipstern(ambiguous: &[String], skipped: &[(String, &str)]) -> io::Result<()> {
@@ -473,7 +481,11 @@ fn print_layouts(types: &[TypeLayout]) -> io::Result<()> {
     Ok(())
 }
 
-fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<()> {
+fn print_coverage(
+    report: &CoverageReport,
+    shared: &[SharedType],
+    unknown: &[&TypeLayout],
+) -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(
         out,
@@ -502,6 +514,17 @@ fn print_coverage(report: &CoverageReport, shared: &[SharedType]) -> io::Result<
             escape_control(&t.name),
             escape_control(&gaps.join(", "))
         )?;
+    }
+    writeln!(
+        out,
+        "zero-copy accounts with an unknown layout: {}",
+        unknown.len()
+    )?;
+    for t in unknown {
+        if let Err(e) = &t.layout {
+            let (name, why) = (escape_control(&t.name), escape_control(&e.to_string()));
+            writeln!(out, "UNKNOWN LAYOUT: {name}: {why}")?;
+        }
     }
     Ok(())
 }

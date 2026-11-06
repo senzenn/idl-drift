@@ -95,13 +95,15 @@ instructions: 28  accounts: 6  events: 26  types: 44
 unmapped (Generic) fields: 0
 undefined types: 0
 padded zero-copy types also read as Borsh: 0
+zero-copy accounts with an unknown layout: 0
 instructions that Shipstern cannot tell apart: 0
 account types that Shipstern skips: 0
 ```
 
 An `UNMAPPED:` line names a field that neither tool can check. An `UNDEFINED:` line names a
-type that the IDL uses but does not define. A `SHIPSTERN:` line names instructions or account
-types that Shipstern's generated parser cannot use, although the IDL is valid.
+type that the IDL uses but does not define. An `UNKNOWN LAYOUT:` line names a zero-copy
+account whose field offsets cannot be computed. A `SHIPSTERN:` line names instructions or
+account types that Shipstern's generated parser cannot use, although the IDL is valid.
 
 ### 2. Compare two versions of an IDL
 
@@ -195,7 +197,7 @@ Both tools use the same exit codes:
 | Code | Meaning |
 |---|---|
 | `0` | No finding at or above `--fail-on`. |
-| `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, or a padded zero-copy type that Borsh also reads. |
+| `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, a padded zero-copy type that Borsh also reads, or a zero-copy account whose layout cannot be computed. |
 | `2` | The tool could not run: a file could not be read or parsed, an option is wrong, an RPC request failed (`diff --onchain`, `source --onchain`, idl-verify), (`source`) the workspace has nothing to compare, or (idl-verify) the decoder failed or nothing was sampled. |
 
 ## Use it in CI

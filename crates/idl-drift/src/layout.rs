@@ -60,7 +60,8 @@ impl<'a> TypeIndex<'a> {
     }
 
     /// Every primitive and array in `td`, flattened with its offset under `reading`. Arrays
-    /// list their first element too, so a stride change shows up as a moved leaf.
+    /// list their first element and the start of the last one too, so a stride change shows
+    /// up as a moved leaf.
     ///
     /// # Errors
     ///
@@ -201,12 +202,26 @@ impl<'i, 'a> Walk<'i, 'a> {
             offset: at,
             size,
         });
-        match ty {
-            Type::Array(item, _) => {
-                self.type_leaves(item, reading, &format!("{path}[0]"), at, depth + 1, out)
+        let Type::Array(item, len) = ty else {
+            return Ok(());
+        };
+        self.type_leaves(item, reading, &format!("{path}[0]"), at, depth + 1, out)?;
+        // A stride change moves only the later items, also when the array is the last field.
+        // The start of the last item shows it, and a walk into it would double the work.
+        if let ArrayLen::Value(n) = len {
+            if let Some(last) = n.checked_sub(1).filter(|last| *last > 0) {
+                let stride = size / n;
+                out.push(Leaf {
+                    path: format!("{path}[{last}]"),
+                    offset: stride
+                        .checked_mul(last)
+                        .and_then(|o| o.checked_add(at))
+                        .ok_or(LayoutError::Overflow)?,
+                    size: stride,
+                });
             }
-            _ => Ok(()),
         }
+        Ok(())
     }
 
     /// Spends one node of the work for this call. Each recursive walk passes here.
@@ -878,7 +893,10 @@ mod tests {
             let leaves = index.leaves(o, reading).unwrap();
             leaves.into_iter().map(|l| (l.path, l.offset)).collect()
         };
-        let expect = |i| vec![("a".into(), 0), ("i".into(), i), ("i[0].v".into(), i)];
+        let expect = |i| {
+            let at = |path: &str, offset| (path.to_string(), offset);
+            vec![at("a", 0), at("i", i), at("i[0].v", i), at("i[1]", i + 8)]
+        };
         assert_eq!(at(Reading::Borsh), expect(1));
         assert_eq!(at(Reading::ZeroCopy), expect(8));
     }
