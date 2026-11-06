@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use idl_drift::model::{Idl, TypeDef};
-use serde_json::{Map, Value as Json};
+use serde_json::{json, Map, Value as Json};
 
 use super::{Outcomes, Verifier};
 use crate::decode::{DecodeError, DecodeErrorKind, Decoded, Value};
@@ -67,11 +67,7 @@ pub fn verify_upgrade(
     v.check_program_id();
     let accounts = v.check_accounts();
     let types = v.upgrade.take().unwrap_or_default();
-    let unknown = samples
-        .accounts
-        .iter()
-        .filter(|a| !a.data.is_empty() && v.classifier.account(&a.data).is_none())
-        .count();
+    let unknown = v.unknown_accounts;
     let (rent_source, lamports_per_byte, minimums) = match cluster_rent {
         Some(rent) => (RentSource::Rpc, None, minimums(&types, samples, rent)?),
         None => (
@@ -398,9 +394,10 @@ fn broken(e: &DecodeError) -> Class {
     }
 }
 
-/// `ours` and `theirs` cut down to the struct fields that both IDLs name and the list items
-/// that both read, also inside a present option or the same enum variant. So a new field, or
-/// a reserved array that gives bytes to one, is not a difference. Other values compare whole.
+/// `ours` and `theirs` cut down to the struct fields that both IDLs name and the list, tuple
+/// and map items that both read, also inside a present option or the same enum variant. So a
+/// new field, or a reserved array that gives bytes to one, is not a difference. Other values
+/// compare whole.
 fn shared_fields(ours: &Value, theirs: &Json) -> (Json, Json) {
     match (ours, theirs) {
         (Value::Struct(fields), Json::Object(map)) => {
@@ -423,6 +420,34 @@ fn shared_fields(ours: &Value, theirs: &Json) -> (Json, Json) {
                 .iter()
                 .zip(list)
                 .map(|(x, y)| shared_fields(x, y))
+                .unzip();
+            (Json::Array(a), Json::Array(b))
+        }
+        // `to_json` writes a tuple as an object keyed by the index.
+        (Value::Tuple(items), Json::Object(map)) => {
+            let (mut a, mut b) = (Map::new(), Map::new());
+            for (i, item) in items.iter().enumerate() {
+                let key = i.to_string();
+                if let Some(v) = map.get(&key) {
+                    let (x, y) = shared_fields(item, v);
+                    a.insert(key.clone(), x);
+                    b.insert(key, y);
+                }
+            }
+            (Json::Object(a), Json::Object(b))
+        }
+        // And a map as a list of `[key, value]` pairs.
+        (Value::Map(entries), Json::Array(list)) => {
+            let (a, b) = entries
+                .iter()
+                .zip(list)
+                .map(|((k, v), pair)| match pair.as_array().map(Vec::as_slice) {
+                    Some([pk, pv]) => {
+                        let ((k1, k2), (v1, v2)) = (shared_fields(k, pk), shared_fields(v, pv));
+                        (json!([k1, v1]), json!([k2, v2]))
+                    }
+                    _ => (json!([to_json(k), to_json(v)]), pair.clone()),
+                })
                 .unzip();
             (Json::Array(a), Json::Array(b))
         }
@@ -658,6 +683,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_fields_look_inside_a_tuple_and_a_map() {
+        // `Fee::Fixed(Cfg)` and a map of `Cfg`, where the new `Cfg` adds `b`.
+        let tuple = Value::Enum {
+            variant: "Fixed".into(),
+            value: Box::new(Value::Tuple(vec![with_new_field()])),
+        };
+        let (a, b) = shared_fields(&tuple, &json!({"Fixed": {"0": {"a": 5}}}));
+        assert_eq!(first_difference(&a, &b), None, "{a} vs {b}");
+        let map = Value::Map(vec![(Value::U8(1), with_new_field())]);
+        let (a, b) = shared_fields(&map, &json!([[1, {"a": 5}]]));
+        assert_eq!(first_difference(&a, &b), None, "{a} vs {b}");
+        // A changed tuple item or map key is still a difference.
+        let (a, b) = shared_fields(&tuple, &json!({"Fixed": {"0": {"a": 6}}}));
+        assert!(first_difference(&a, &b).is_some(), "{a} vs {b}");
+        let (a, b) = shared_fields(&map, &json!([[2, {"a": 5}]]));
+        assert!(first_difference(&a, &b).is_some(), "{a} vs {b}");
+    }
+
+    #[test]
     fn an_unknown_discriminator_is_broken() {
         let mut samples = accounts(&[&[1, 0, 0, 0]]);
         samples.accounts[0].data[0] = 9;
@@ -665,6 +709,19 @@ mod tests {
         let impact = report.upgrade_impact.as_ref().unwrap();
         assert_eq!((impact.unknown, impact.totals.broken), (1, 1));
         assert_eq!(crate::testing::only(&report).check, Check::Discriminator);
+    }
+
+    #[test]
+    fn an_account_that_is_not_checked_is_not_broken() {
+        // Anchor's IdlAccount gets a note and no check.
+        let mut samples = accounts(&[&[1, 0, 0, 0]]);
+        samples.accounts.push(AccountSample {
+            address: "idl".into(),
+            data: [&crate::classify::IDL_ACCOUNT_DISCRIMINATOR[..], &[0; 4]].concat(),
+        });
+        let report = impact(&account_idl(U32), None, &samples);
+        let impact = report.upgrade_impact.as_ref().unwrap();
+        assert_eq!((impact.unknown, impact.totals.broken), (0, 0));
     }
 
     #[test]

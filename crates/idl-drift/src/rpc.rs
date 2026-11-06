@@ -17,20 +17,27 @@ const MAX_RETRY_AFTER: Duration = Duration::from_mins(1);
 const MAX_RESPONSE_BYTES: u64 = 32 << 20;
 /// The largest error body to read for its message.
 const MAX_ERROR_BYTES: u64 = 64 << 10;
+/// The public mainnet RPC took 49 s to list 10 signatures of a program with little traffic.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
+/// A host that does not accept the connection in this time is likely down.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// An HTTP agent for [`call`]: a 30 s limit per request, and HTTP errors as responses.
+/// An HTTP agent for [`call`]: a 10 s limit to connect, a 2 min limit per request, and HTTP
+/// errors as responses.
 #[must_use]
 pub fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .timeout_connect(Some(CONNECT_TIMEOUT))
             .http_status_as_error(false)
             .build(),
     )
 }
 
 /// Send one JSON-RPC request and return its `result`. A 429, a 5xx, a lost connection and
-/// a cut-off answer are tried again, up to 5 tries in total.
+/// a cut-off answer are tried again, up to 5 tries in total. A timeout is tried again only
+/// one time.
 ///
 /// # Errors
 ///
@@ -39,13 +46,15 @@ pub fn call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
     let fail = |detail: String| format!("{method}: {detail}");
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let mut last = String::new();
+    let mut timed_out = false;
     for attempt in 0..ATTEMPTS {
         let wait = match agent.post(url).send_json(&body) {
-            Err(e) if retryable(&e) => {
+            Err(e) if retryable(&e, timed_out) => {
+                timed_out |= matches!(e, ureq::Error::Timeout(_));
                 last = transport_text(&e);
                 backoff(attempt)
             }
-            Err(e) => return Err(fail(transport_text(&e))),
+            Err(e) => return Err(fail(stop_text(&e, attempt))),
             Ok(mut response) => match response.status().as_u16() {
                 429 => {
                     let retry_after = response
@@ -53,11 +62,11 @@ pub fn call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
-                    last = format!("HTTP 429{}", error_message(&mut response));
+                    last = error_text(&mut response, &mut timed_out, attempt).map_err(fail)?;
                     rate_limit_wait(retry_after.as_deref())
                 }
-                status @ 500.. => {
-                    last = format!("HTTP {status}{}", error_message(&mut response));
+                500.. => {
+                    last = error_text(&mut response, &mut timed_out, attempt).map_err(fail)?;
                     backoff(attempt)
                 }
                 200 => {
@@ -80,11 +89,12 @@ pub fn call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
                                 .map(|fields| fields.remove("result").unwrap_or(Value::Null))
                                 .ok_or_else(|| fail("the answer is not a JSON-RPC object".into()));
                         }
-                        Err(e) if retryable(&e) => {
+                        Err(e) if retryable(&e, timed_out) => {
+                            timed_out |= matches!(e, ureq::Error::Timeout(_));
                             last = transport_text(&e);
                             backoff(attempt)
                         }
-                        Err(e) => return Err(fail(transport_text(&e))),
+                        Err(e) => return Err(fail(stop_text(&e, attempt))),
                     }
                 }
                 status => return Err(fail(format!("HTTP {status}"))),
@@ -99,11 +109,21 @@ pub fn call(agent: &ureq::Agent, url: &str, method: &str, params: &Value) -> Res
 
 /// A lost connection or a cut-off answer can succeed on the next try. A wrong host, a port
 /// where nothing listens, or an answer over the size limit cannot.
-fn retryable(e: &ureq::Error) -> bool {
+fn retryable(e: &ureq::Error, timed_out: bool) -> bool {
     match e {
         ureq::Error::Io(io) => io.kind() != std::io::ErrorKind::ConnectionRefused,
-        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::Json(_) => true,
+        // Each try can wait the full timeout, and a host that timed out two times is likely down.
+        ureq::Error::Timeout(_) => !timed_out,
+        ureq::Error::ConnectionFailed | ureq::Error::Json(_) => true,
         _ => false,
+    }
+}
+
+/// The text of `e` when it stops the request at try `attempt`, counted from 0.
+fn stop_text(e: &ureq::Error, attempt: u32) -> String {
+    match attempt {
+        0 => transport_text(e),
+        n => format!("{}, after {} tries", transport_text(e), n + 1),
     }
 }
 
@@ -133,18 +153,35 @@ fn rate_limit_wait(retry_after: Option<&str>) -> Duration {
         })
 }
 
-/// `: <message>` from a JSON-RPC error body, such as Helius's "credits exhausted", or nothing.
-fn error_message(response: &mut ureq::http::Response<ureq::Body>) -> String {
-    response
+/// `HTTP <status>`, and `: <message>` from a JSON-RPC error body, such as Helius's "credits
+/// exhausted". A timeout while it reads the body is a timeout of the try too.
+fn error_text(
+    response: &mut ureq::http::Response<ureq::Body>,
+    timed_out: &mut bool,
+    attempt: u32,
+) -> Result<String, String> {
+    let status = response.status().as_u16();
+    let body = response
         .body_mut()
         .with_config()
         .limit(MAX_ERROR_BYTES)
-        .read_json::<Value>()
-        .ok()
-        .and_then(|v| v.pointer("/error/message").cloned())
-        .map_or_else(String::new, |m| {
-            format!(": {}", escape_control(&m.to_string()))
-        })
+        .read_json::<Value>();
+    match body {
+        Err(e @ ureq::Error::Timeout(_)) if *timed_out => {
+            Err(format!("HTTP {status}, then {}", stop_text(&e, attempt)))
+        }
+        Err(e @ ureq::Error::Timeout(_)) => {
+            *timed_out = true;
+            Ok(format!("HTTP {status}, then {}", transport_text(&e)))
+        }
+        body => Ok(body
+            .ok()
+            .and_then(|v| v.pointer("/error/message").cloned())
+            .map_or_else(
+                || format!("HTTP {status}"),
+                |m| format!("HTTP {status}: {}", escape_control(&m.to_string())),
+            )),
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +277,54 @@ mod tests {
             call(&agent(), &url, "getSlot", &json!([])).unwrap_err(),
             r#"getSlot: {"message":"\u{9b}2J\u{7f}"}"#
         );
+    }
+
+    #[test]
+    fn a_timeout_is_tried_again_only_one_time() {
+        // The listener never accepts, so each connection waits in the backlog for an answer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let quick = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_millis(200)))
+                .build(),
+        );
+        assert_eq!(
+            call(&quick, &url, "getSlot", &json!([])),
+            Err("getSlot: timeout: global, after 2 tries".into())
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(std::iter::from_fn(|| listener.accept().ok()).count(), 2);
+    }
+
+    #[test]
+    fn a_timeout_in_the_body_of_an_error_answer_is_a_timeout() {
+        // The server sends the head of a 503 and never the body that it announces.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let tries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = tries.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n\r\n";
+                stream.write_all(head.as_bytes()).unwrap();
+                open.push(stream);
+            }
+        });
+        let quick = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_millis(200)))
+                .http_status_as_error(false)
+                .build(),
+        );
+        assert_eq!(
+            call(&quick, &url, "getSlot", &json!([])),
+            Err("getSlot: HTTP 503, then timeout: global, after 2 tries".into())
+        );
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub struct Limits {
     /// Successful transactions to read at most; failed ones are skipped unread.
     pub max_transactions: usize,
     /// Stop after this many successful transactions in a row bring no new instruction or
-    /// event kind.
+    /// event kind (a pruned one counts too), or this many pages hold only failed ones.
     pub stall: usize,
     /// Samples per instruction discriminator, per event discriminator, and per unknown prefix.
     pub per_instruction: usize,
@@ -50,7 +50,8 @@ impl Default for Limits {
 pub enum StopReason {
     /// Every IDL instruction with a discriminator has its quota of samples.
     Quota,
-    /// `stall` transactions in a row brought no new instruction or event kind.
+    /// `stall` transactions in a row brought no new instruction or event kind, or `stall`
+    /// pages of signatures in a row held only failed transactions.
     Stall,
     /// `max_transactions` successful transactions were read.
     MaxTransactions,
@@ -64,7 +65,9 @@ impl std::fmt::Display for StopReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Quota => "every IDL instruction has its quota of samples",
-            Self::Stall => "the last --stall transactions brought no new kind",
+            Self::Stall => {
+                "the last --stall transactions brought no new kind, or the last --stall pages held only failed transactions"
+            }
             Self::MaxTransactions => "--max-tx transactions were read",
             Self::History => "the program has no older transactions",
             Self::Upgrade(slot) => {
@@ -93,6 +96,8 @@ pub struct Sampled {
 /// # Errors
 ///
 /// When a request fails, so that a run never passes on samples it could not fetch.
+// Each stop rule reads the state of the page loop, so the rules stay in this one function.
+#[allow(clippy::too_many_lines)]
 pub fn sample(
     mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
     idl: &Idl,
@@ -110,6 +115,7 @@ pub fn sample(
     let mut seen = HashSet::new();
     let mut read = 0usize;
     let mut quiet = 0usize;
+    let mut failed_pages = 0usize;
     let mut before: Option<String> = None;
 
     let stop_reason = 'pages: loop {
@@ -131,51 +137,58 @@ pub fn sample(
             _ => break StopReason::History,
         }
 
-        // Failed transactions can carry data the program rejected, which is not a fault of the IDL.
-        for info in page.iter().filter(|s| s.err.is_none()) {
-            // Agave runs new code from the slot after its deploy.
+        failed_pages += 1;
+        for info in &page {
+            // Agave runs new code from the slot after its deploy. A failed transaction ran it too.
             if let (Some(slot), Some(deployed)) = (info.slot, deployed) {
                 if slot <= deployed {
                     break 'pages StopReason::Upgrade(deployed);
                 }
             }
+            // Failed transactions can carry data the program rejected, which is not a fault of the IDL.
+            if info.err.is_some() {
+                continue;
+            }
+            failed_pages = 0;
             // The highest version this parser reads; the RPC refuses newer ones with an error.
             let tx = rpc(
                 "getTransaction",
                 json!([info.signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
             )?;
-            // A node that no longer keeps the transaction returns null.
-            if tx.is_null() {
-                continue;
-            }
-            read += 1;
-            let found = samples_from_transaction(idl, program_id, &tx)?;
-            let mut new = false;
-            for ix in found.instructions {
-                for key in &ix.accounts {
-                    if seen.insert(key.clone()) {
-                        keys.push(key.clone());
+            // A node that no longer keeps the transaction returns null: a request with nothing new.
+            let new = if tx.is_null() {
+                false
+            } else {
+                read += 1;
+                let found = samples_from_transaction(idl, program_id, &tx)?;
+                let mut new = false;
+                for ix in found.instructions {
+                    for key in &ix.accounts {
+                        if seen.insert(key.clone()) {
+                            keys.push(key.clone());
+                        }
+                    }
+                    let (keep, fresh) = quota.take(Group::Instruction, &ix.data);
+                    new |= fresh;
+                    if keep {
+                        instructions.push(ix);
                     }
                 }
-                let (keep, fresh) = quota.take(Group::Instruction, &ix.data);
-                new |= fresh;
-                if keep {
-                    instructions.push(ix);
+                for event in found.events {
+                    let (keep, fresh) = match event.source {
+                        EventSource::Log => quota.take(Group::LogEvent, &event.data),
+                        EventSource::Cpi => quota.take(
+                            Group::CpiEvent,
+                            event_body(&event, &cpi).unwrap_or_default(),
+                        ),
+                    };
+                    new |= fresh;
+                    if keep {
+                        events.push(event);
+                    }
                 }
-            }
-            for event in found.events {
-                let (keep, fresh) = match event.source {
-                    EventSource::Log => quota.take(Group::LogEvent, &event.data),
-                    EventSource::Cpi => quota.take(
-                        Group::CpiEvent,
-                        event_body(&event, &cpi).unwrap_or_default(),
-                    ),
-                };
-                new |= fresh;
-                if keep {
-                    events.push(event);
-                }
-            }
+                new
+            };
             quiet = if new { 0 } else { quiet + 1 };
             if quota.filled() {
                 break 'pages StopReason::Quota;
@@ -186,6 +199,10 @@ pub fn sample(
             if read >= limits.max_transactions {
                 break 'pages StopReason::MaxTransactions;
             }
+        }
+        // Failed signatures cost no request, so `quiet` does not count them; count their pages.
+        if failed_pages >= limits.stall {
+            break StopReason::Stall;
         }
     };
 
@@ -716,7 +733,8 @@ mod tests {
                 "getSignaturesForAddress" => json!([
                     { "signature": "S1", "err": null, "slot": 102 },
                     { "signature": "S2", "err": null, "slot": 101 },
-                    { "signature": "S3", "err": null, "slot": 100 },
+                    // A failed transaction in the deploy slot ran the old code too.
+                    { "signature": "S3", "err": { "InstructionError": [0, "Custom"] }, "slot": 100 },
                 ]),
                 "getTransaction" => {
                     fetched.push(params[0].clone());
@@ -920,6 +938,44 @@ mod tests {
         let sampled = sample(history(vec![1; 30]), &idl_ab(), "Prog", &limits).unwrap();
         assert_eq!(sampled.transactions, 4);
         assert_eq!(sampled.stop_reason, StopReason::Stall);
+    }
+
+    #[test]
+    fn stops_after_stall_pruned_transactions_or_pages_of_failed_ones() {
+        // Each page holds new signatures that all failed, or whose transactions are pruned.
+        for (failed, pages_and_requests) in [(true, (3, 0)), (false, (1, 3))] {
+            let (mut pages, mut requests) = (0, 0);
+            let rpc = |method: &str, _: Value| {
+                if method == "getTransaction" {
+                    requests += 1;
+                }
+                if method != "getSignaturesForAddress" {
+                    return Ok(Value::Null);
+                }
+                pages += 1;
+                if pages > 10 {
+                    return Err(Error::RpcResponse("no stop after 10 pages".into()));
+                }
+                let err = if failed {
+                    json!({ "InstructionError": [0, "Custom"] })
+                } else {
+                    Value::Null
+                };
+                Ok(json!((0..SIGNATURES_PER_PAGE)
+                    .map(|i| json!({ "signature": format!("S{pages}-{i}"), "err": err }))
+                    .collect::<Vec<_>>()))
+            };
+            let limits = Limits {
+                stall: 3,
+                ..Limits::default()
+            };
+            let sampled = sample(no_program(rpc), &idl_ab(), "Prog", &limits).unwrap();
+            assert_eq!(
+                (sampled.transactions, sampled.stop_reason),
+                (0, StopReason::Stall)
+            );
+            assert_eq!((pages, requests), pages_and_requests);
+        }
     }
 
     #[test]

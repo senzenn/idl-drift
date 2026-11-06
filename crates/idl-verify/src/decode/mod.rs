@@ -9,16 +9,18 @@ mod reader;
 mod size;
 mod zero_copy;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use idl_drift::model::{Count, EnumFields, Field, GenericArg, OptionTag, Type, TypeDef, TypeDefTy};
 
 use error::type_label;
 pub use error::{DecodeError, DecodeErrorKind};
-use generics::{bind, resolve_len, subst, Scope};
+use generics::{resolve_len, Scope};
 use reader::{repeat, Reader};
 
-use crate::layout::{TypeIndex, MAX_DEPTH, MAX_WORK};
+use crate::layout::{StructLayout, TypeIndex, MAX_DEPTH, MAX_WORK};
 
 /// A decoded value.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,16 +126,20 @@ impl<'a> Decoder<'a> {
 struct Call<'c, 'a> {
     types: &'c TypeIndex<'a>,
     work: Cell<usize>,
+    /// The zero-copy layout of each struct type, by the address of its definition.
+    layouts: RefCell<HashMap<*const TypeDef, Rc<StructLayout>>>,
 }
 
 impl<'c, 'a> Call<'c, 'a> {
     /// A value that holds data takes at least one byte and has at most [`MAX_DEPTH`] nodes
     /// above it. [`MAX_WORK`] is for the nodes that hold no data. The smallest-size walk runs
-    /// only for a collection with items, so the bytes of the items pay for it.
+    /// only for a collection with items, so the bytes of the items pay for it. The layout of
+    /// a zero-copy type is walked once for each call, so its values do not pay for it again.
     fn new(types: &'c TypeIndex<'a>, data: &[u8]) -> Self {
         Self {
             types,
             work: Cell::new(MAX_WORK.saturating_add(data.len().saturating_mul(MAX_DEPTH))),
+            layouts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -142,6 +148,11 @@ impl<'c, 'a> Call<'c, 'a> {
         if depth > MAX_DEPTH {
             return Err(DecodeError::new(at, DecodeErrorKind::TooDeep));
         }
+        self.spend(at)
+    }
+
+    /// Spends one node of the work with no depth check: the nesting of the IDL bounds a copy.
+    fn spend(&self, at: usize) -> Result<(), DecodeError> {
         let left = self.work.get().checked_sub(1);
         let left = left.ok_or_else(|| DecodeError::new(at, DecodeErrorKind::TooLarge))?;
         self.work.set(left);
@@ -394,8 +405,8 @@ impl<'c, 'a> Call<'c, 'a> {
         what: &str,
     ) -> Result<usize, DecodeError> {
         self.types
-            .borsh_size(&subst(ty, scope))
-            .map_err(|e| DecodeError::new(at, DecodeErrorKind::Layout(e)))?
+            .borsh_size_within(&self.subst(ty, scope, at)?, &self.work)
+            .map_err(|e| DecodeError::layout(at, e))?
             .ok_or_else(|| {
                 DecodeError::new(
                     at,
@@ -546,7 +557,7 @@ impl<'c, 'a> Call<'c, 'a> {
             Type::Tuple(items) => self.tuple(r, items, scope, depth)?,
             Type::Defined { name, generics } => {
                 let td = self.lookup(name, r.pos)?;
-                let inner = bind(td, generics, scope).map_err(|k| DecodeError::new(r.pos, k))?;
+                let inner = self.bind(td, generics, scope, r.pos)?;
                 self.def_body(r, td, &inner, depth + 1)?
             }
             Type::Generic(name) => match scope.get(name) {

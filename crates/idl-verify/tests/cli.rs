@@ -359,6 +359,36 @@ fn upgrade_impact_adds_its_json_object() {
 }
 
 #[test]
+fn upgrade_impact_with_a_shank_idl_exits_2() {
+    // idl-verify checks no Shank account, so a Shank upgrade run has nothing to check.
+    let dir = std::env::temp_dir().join(format!("idl-verify-shank-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shank = dir.join("shank.json");
+    std::fs::write(
+        &shank,
+        r#"{"version":"1","name":"t","metadata":{"origin":"shank","address":"P"},"instructions":[],
+        "accounts":[{"name":"A","type":{"kind":"struct","fields":[{"name":"v","type":"u32"}]}}]}"#,
+    )
+    .unwrap();
+    let accounts = dir.join("samples.json");
+    std::fs::write(
+        &accounts,
+        r#"{"accounts":[{"address":"X","data":"AQIDBA=="}]}"#,
+    )
+    .unwrap();
+    let out = idl_verify(&[
+        "--idl",
+        shank.to_str().unwrap(),
+        "--samples",
+        accounts.to_str().unwrap(),
+        "--upgrade-impact",
+    ]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("Shank"), "{stderr}");
+}
+
+#[test]
 fn allow_file_allows_a_finding_and_rejects_a_typo() {
     let allow = std::env::temp_dir().join("idl-verify-allow.txt");
     let run = |text: &str| {

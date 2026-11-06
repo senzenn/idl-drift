@@ -6,7 +6,7 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use idl_drift::allow::AllowList;
 use idl_drift::markdown::{escape, escape_control};
-use idl_drift::model::Idl;
+use idl_drift::model::{Format, Idl};
 use idl_verify::report::Check;
 use idl_verify::rpc::{rent_exempt_minimum, sample, Limits, StopReason};
 use idl_verify::{
@@ -53,7 +53,8 @@ struct Cli {
         default_value_t = Limits::default().max_transactions)]
     max_tx: usize,
     /// With --rpc: stop after this many successful transactions in a row bring no new
-    /// instruction or event kind.
+    /// instruction or event kind (a pruned one counts too), or this many pages of signatures
+    /// in a row hold only failed transactions.
     #[arg(long, value_name = "N", value_parser = at_least_one(),
         default_value_t = Limits::default().stall)]
     stall: usize,
@@ -203,6 +204,12 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<u8, Error> {
     // Before any RPC request, so that a typo in the allow file costs nothing.
     let allow = cli.allow.as_deref().map(read_allow).transpose()?;
     let idl = read_idl(&cli.idl)?;
+    // Before any RPC request: idl-verify checks no Shank account, so such a run checks nothing.
+    if cli.upgrade_impact && idl.format == Format::Shank {
+        return Err(Error::NothingSampled(
+            "--upgrade-impact checks accounts only, and idl-verify does not check the accounts of a Shank IDL".into(),
+        ));
+    }
     let (samples, live) = if let Some(path) = &cli.samples {
         let samples = Samples::from_json(&read(path)?)?;
         if nothing_to_check(&samples, cli.upgrade_impact) {

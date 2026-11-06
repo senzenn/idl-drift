@@ -3,7 +3,7 @@
 
 use idl_drift::model::{ArrayLen, Count, EnumFields, GenericArg, OptionTag, Type, TypeDefTy};
 
-use super::generics::{bind, Scope};
+use super::generics::Scope;
 use super::Call;
 
 // Both functions give only a bound. A walk that runs out of depth or work gives the weakest.
@@ -26,7 +26,7 @@ impl Call<'_, '_> {
                 let Some(td) = self.types.get(name) else {
                     return false;
                 };
-                let Ok(inner) = bind(td, generics, scope) else {
+                let Ok(inner) = self.bind(td, generics, scope, 0) else {
                     return false;
                 };
                 match &td.ty {
