@@ -4,20 +4,19 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::normalize::{body_types, each_child_mut, rename_generics};
+use super::normalize::{body_types, each_child_mut, rename_generics, Reached};
 use super::text::{
     field_change, field_str, has_unreadable, payload_str, type_change, unreadable_change,
 };
 use super::{names, zero_copy, ChangeKind, FieldEdit, Report, Severity};
 use crate::model::{EnumFields, EnumVariant, Field, GenericParam, Idl, Type, TypeDef, TypeDefTy};
 
-pub(super) fn diff_types(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Report) {
+pub(super) fn diff_types(old: &Idl, new: &Idl, (old_reached, reached): &Reached, r: &mut Report) {
     let om = old.type_map();
     let nm = new.type_map();
     let defs = Defs::new(&om, &nm);
     // An old parser reads a type only when the old IDL reaches it too.
-    let old_reached = super::reachable_types(old);
-    let read_by_both: BTreeSet<String> = reached.intersection(&old_reached).cloned().collect();
+    let read_by_both: BTreeSet<String> = reached.intersection(old_reached).cloned().collect();
     let attrs_changed =
         |ot: &TypeDef, nt: &TypeDef| ot.serialization != nt.serialization || ot.repr != nt.repr;
     let roots = if nm

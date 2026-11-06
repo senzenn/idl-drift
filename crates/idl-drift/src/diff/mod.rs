@@ -30,22 +30,20 @@ pub use report::{Change, ChangeKind, Report, Severity};
 /// compared in camelCase, so `deposit_vault` and `depositVault` are the same instruction.
 #[must_use]
 pub fn diff(old: &Idl, new: &Idl) -> Report {
-    let (old_form, new_form) = if old.format == new.format {
+    let (old_form, new_form, reached) = if old.format == new.format {
         normalize::same_format_form(old, new)
     } else {
         normalize::common_form(old, new)
     };
-    let mut r = diff_names_as_given(&old_form, &new_form);
+    let mut r = diff_names_as_given(&old_form, &new_form, &reached);
     // On the names as written: the camelCase step above can split names that collide.
     program::report_generated_name_collisions(&new.instructions, &mut r);
     program::diff_program(old, new, &mut r);
     r
 }
 
-fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
+fn diff_names_as_given(old: &Idl, new: &Idl, reached: &normalize::Reached) -> Report {
     let mut r = Report::default();
-    // Layout changes only matter on types a parser actually reads.
-    let reached = reachable_types(new);
     instructions::report_duplicate_names(&new.instructions, &mut r);
     instructions::diff_instructions(old, new, &mut r);
     collisions::diff_discriminator_collisions(old, new, &mut r);
@@ -53,7 +51,8 @@ fn diff_names_as_given(old: &Idl, new: &Idl) -> Report {
     accounts::diff_account_types(&old.accounts, &new.accounts, &old.types, &new.types, &mut r);
     events::diff_events(&old.events, &new.events, &mut r);
     errors::diff_errors(&old.errors, &new.errors, &mut r);
-    types::diff_types(old, new, &reached, &mut r);
+    // Layout changes only matter on types a parser actually reads.
+    types::diff_types(old, new, reached, &mut r);
     r
 }
 

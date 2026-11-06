@@ -82,6 +82,45 @@ fn repr_change_on_nested_type_that_moves_outer_fields_is_breaking() {
 }
 
 #[test]
+fn item_size_change_in_a_last_array_field_is_breaking() {
+    // `items` is the last field, so no field after it shows that `items[1].x` moves.
+    let pool = |pool_attrs: &str, inner_attrs: &str, len: usize| {
+        format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"0","spec":"0.1.0"}},
+  "accounts":[{{"name":"Pool","discriminator":[1,2,3,4,5,6,7,8]}}],
+  "types":[{{"name":"Pool",{pool_attrs}"type":{{"kind":"struct","fields":[
+      {{"name":"a","type":"u64"}},{{"name":"items","type":{{"array":[{{"defined":{{"name":"Inner"}}}},{len}]}}}}]}}}},
+    {{"name":"Inner",{inner_attrs}"type":{{"kind":"struct","fields":[
+      {{"name":"x","type":"u64"}},{{"name":"y","type":"u8"}}]}}}}]}}"#
+        )
+    };
+    let zc = r#""serialization":"bytemuckunsafe","repr":{"kind":"c"},"#;
+    let packed = r#""serialization":"bytemuckunsafe","repr":{"kind":"c","packed":true},"#;
+    // The item stride goes from 16 to 9 bytes, and from Borsh 9 to repr(C) 16.
+    assert_eq!(
+        max_sev(&pool(zc, zc, 4), &pool(zc, packed, 4)),
+        Some(Severity::Breaking)
+    );
+    assert_eq!(
+        max_sev(&pool("", "", 4), &pool(zc, zc, 4)),
+        Some(Severity::Breaking)
+    );
+    // With one item, `x` and `y` keep their offsets and `Pool` keeps its size.
+    assert_eq!(
+        max_sev(&pool(zc, zc, 1), &pool(zc, packed, 1)),
+        Some(Severity::Cosmetic)
+    );
+    // 14 nested arrays of 2 items: a walk into each last item would pass the work limit.
+    let grid = (0..14).fold(r#""u64""#.to_string(), |ty, _| {
+        format!(r#"{{"array":[{ty},2]}}"#)
+    });
+    assert_eq!(
+        borsh_to_bytemuck(&format!(r#"{{"name":"grid","type":{grid}}}"#)),
+        Some(Severity::Cosmetic)
+    );
+}
+
+#[test]
 fn repr_change_on_borsh_only_type_is_cosmetic() {
     // Only an instruction arg holds `Inner`, and Borsh ignores repr.
     let old = r#"{
@@ -191,6 +230,57 @@ fn codama_conversion_that_drops_zero_copy_layout_is_flagged() {
     );
     assert_eq!(at(Severity::Cosmetic).len(), 11);
     assert_eq!(report.changes.len(), 13);
+}
+
+#[test]
+fn shipstern_padding_fields_are_the_same_bytes() {
+    // Shipstern's converter writes each repr(C) gap of a zero-copy type as a u8 array field.
+    let receipt = |attrs: &str, fields: &str| {
+        format!(
+            r#"{{"address":"P","metadata":{{"name":"p","version":"0.1.0","spec":"0.1.0"}},
+      "accounts":[{{"name":"Receipt","discriminator":[1,2,3,4,5,6,7,8]}}],
+      "types":[{{"name":"Receipt",{attrs}"type":{{"kind":"struct","fields":[{fields}]}}}}]}}"#
+        )
+    };
+    let zero_copy = r#""serialization":"bytemuckunsafe","repr":{"kind":"c"},"#;
+    let anchor = parse(&receipt(
+        zero_copy,
+        r#"{"name":"bump","type":"u8"},{"name":"epoch","type":"u64"},{"name":"flag","type":"u8"}"#,
+    ));
+    let codama = |fields: &str| {
+        let mut codama = parse(&receipt("", fields));
+        codama.format = Format::Codama;
+        codama
+    };
+    let shipstern = |gap: usize| {
+        codama(&format!(
+            r#"{{"name":"bump","type":"u8"}},{{"name":"padding_before_epoch","type":{{"array":["u8",{gap}]}}}},
+            {{"name":"epoch","type":"u64"}},{{"name":"flag","type":"u8"}},{{"name":"padding_end","type":{{"array":["u8",7]}}}}"#
+        ))
+    };
+    let report = diff(&anchor, &shipstern(7));
+    assert_eq!(report.counts(), (0, 0, 0, 1), "{:?}", report.changes);
+    // A gap of another size moves `epoch`.
+    assert_eq!(
+        diff(&anchor, &shipstern(6))
+            .changes
+            .iter()
+            .map(|c| c.severity)
+            .max(),
+        Some(Severity::Breaking)
+    );
+    // A real field with the padding name keeps it, so the gap is `paddingBeforeEpoch2`.
+    let taken = r#"{"name":"padding_before_epoch","type":"u8"},"#;
+    let report = diff(
+        &parse(&receipt(
+            zero_copy,
+            &format!(r#"{taken}{{"name":"epoch","type":"u64"}}"#),
+        )),
+        &codama(&format!(
+            r#"{taken}{{"name":"padding_before_epoch_2","type":{{"array":["u8",7]}}}},{{"name":"epoch","type":"u64"}}"#
+        )),
+    );
+    assert_eq!(report.counts(), (0, 0, 0, 1), "{:?}", report.changes);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 mod common;
 
 use common::{fixture, fixture_text, idl_kinds, messages, parse};
-use idl_drift::model::{AccountItem, Format};
+use idl_drift::model::{AccountItem, Format, Type, TypeDefTy};
 use idl_drift::{diff, ChangeKind, Severity};
 
 #[test]
@@ -130,6 +130,36 @@ fn anchor_and_its_codama_conversion_read_the_same_args() {
 }
 
 #[test]
+fn a_rename_inside_a_struct_arg_that_shipstern_flattens_is_dangerous() {
+    // Shipstern's converter writes the fields of `Meta`, which has one use, as the args. `B` has
+    // two uses, so it stays a link.
+    let b = r#"{"name":"b","type":{"defined":{"name":"B"}}}"#;
+    let idl = |set_args: &str, types: &str| {
+        parse(&format!(
+            r#"{{"address":"P","metadata":{{"name":"p","version":"1","spec":"0.1.0"}},
+      "instructions":[{{"name":"set","discriminator":[1],"accounts":[],"args":[{set_args},{b}]}},
+        {{"name":"other","discriminator":[2],"accounts":[],"args":[{b}]}}],
+      "types":[{types}
+        {{"name":"Info","type":{{"kind":"struct","fields":[{{"name":"a","type":"u64"}}]}}}},
+        {{"name":"B","type":{{"kind":"struct","fields":[{{"name":"y","type":"u64"}}]}}}}]}}"#
+        ))
+    };
+    let anchor = idl(
+        r#"{"name":"meta","type":{"defined":{"name":"Meta"}}}"#,
+        r#"{"name":"Meta","type":{"kind":"struct","fields":[{"name":"info","type":{"defined":{"name":"Info"}}},{"name":"x","type":"u8"}]}},"#,
+    );
+    let mut shipstern = idl(
+        r#"{"name":"info_v2","type":{"defined":{"name":"Info"}}},{"name":"x","type":"u8"}"#,
+        "",
+    );
+    shipstern.format = Format::Codama;
+    assert_eq!(
+        messages(&anchor, &shipstern),
+        ["arg changed (set#0): info renamed to infoV2 (info)"]
+    );
+}
+
+#[test]
 fn a_struct_arg_that_holds_itself_does_not_grow_without_bound() {
     // 64 fields of its own type: 16 rounds of inlining would make 64^16 args.
     let fields: Vec<String> = (0..64)
@@ -144,6 +174,28 @@ fn a_struct_arg_that_holds_itself_does_not_grow_without_bound() {
     let mut new = old.clone();
     new.format = Format::Codama;
     assert!(!diff(&old, &new).has_breaking());
+    // Against a u8, inlining stops at 1024 new args, as in v0.3.0.
+    new.instructions[0].args[0].ty = Type::U8;
+    let changes = diff(&old, &new).changes.len();
+    assert!(changes <= 1025, "{changes} changes");
+    // An arg left over is still inlined where it does not grow: an empty struct is no bytes.
+    let mut empty = old.clone();
+    empty.types[0].ty = TypeDefTy::Struct { fields: Vec::new() };
+    let mut no_args = empty.clone();
+    no_args.format = Format::Codama;
+    no_args.instructions[0].args.clear();
+    assert!(diff(&empty, &no_args).changes.is_empty());
+    // A struct of two empty structs is no bytes too.
+    let pair = parse(
+        r#"{"address":"P","metadata":{"name":"p","version":"1","spec":"0.1.0"},
+        "instructions":[{"name":"go","discriminator":[1],"accounts":[],"args":[{"name":"p","type":{"defined":{"name":"Pair"}}}]}],
+        "types":[{"name":"Pair","type":{"kind":"struct","fields":[{"name":"e","type":{"defined":{"name":"E"}}},{"name":"z","type":{"defined":{"name":"E"}}}]}},
+          {"name":"E","type":{"kind":"struct","fields":[]}}]}"#,
+    );
+    let mut pair_none = pair.clone();
+    pair_none.format = Format::Codama;
+    pair_none.instructions[0].args.clear();
+    assert!(diff(&pair, &pair_none).changes.is_empty());
 }
 
 /// A Codama instruction `go` with discriminator 1 and the given args.
@@ -384,12 +436,9 @@ fn generic_type_matches_the_codama_body_written_at_each_use() {
     };
     let report = diff(&anchor, &codama("i64"));
     assert!(report.changes.is_empty(), "{:#?}", report.changes);
-    // `cfg` is inlined into the args, so no parser reads `config` itself.
+    // Both sides link `config`, so the change shows once, on the type.
     assert_eq!(
         messages(&anchor, &codama("i32")),
-        [
-            "arg changed (go#4): signers: [{ key: pubkey, expiresAt: i64 }; 2] -> [{ key: pubkey, expiresAt: i32 }; 2] (Borsh layout)",
-            "field changed in UNREACHED type (config#0): dead code",
-        ]
+        ["FIELD changed (config#0) via reachable type: signers: [{ key: pubkey, expiresAt: i64 }; 2] -> [{ key: pubkey, expiresAt: i32 }; 2] (Borsh layout)"]
     );
 }

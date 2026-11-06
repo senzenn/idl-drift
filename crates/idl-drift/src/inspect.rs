@@ -1,6 +1,8 @@
 //! Find fields whose layout the converter could not resolve (`Type::Generic`), lay out
 //! every zero-copy type field by field, and find padded zero-copy types Borsh also reads.
 
+use std::collections::BTreeSet;
+
 use crate::layout::{LayoutError, Padding, Reading, StructLayout, TypeIndex};
 use crate::model::{ArrayLen, EnumFields, GenericParam, Idl, Repr, Type, TypeDef, TypeDefTy};
 use crate::reach::{push_defined, reachable, reachable_types, undefined_types};
@@ -195,6 +197,27 @@ pub struct SharedType {
 #[must_use]
 pub fn shared_types(idl: &Idl) -> Vec<SharedType> {
     let index = TypeIndex::new(idl);
+    let (in_zero_copy, borsh) = zero_copy_and_borsh(idl, &index);
+    idl.types
+        .iter()
+        .filter(|t| in_zero_copy.contains(t.name.as_str()) && borsh.contains(t.name.as_str()))
+        .filter_map(|t| {
+            let layout = index.struct_layout(t).ok()?;
+            // Shipstern pads each struct on its own, so a nested struct's gaps are its own entry.
+            (!layout.padding.is_empty()).then(|| SharedType {
+                name: t.name.clone(),
+                padding: layout.padding,
+            })
+        })
+        .collect()
+}
+
+/// The types that zero-copy accounts hold, and the types that Borsh reads, as Shipstern's
+/// converter finds them.
+pub(crate) fn zero_copy_and_borsh<'a>(
+    idl: &'a Idl,
+    index: &TypeIndex<'a>,
+) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
     let accounts: Vec<&TypeDef> = idl
         .accounts
         .iter()
@@ -209,7 +232,7 @@ pub fn shared_types(idl: &Idl) -> Vec<SharedType> {
             .collect()
     };
     // A `bytemuck` derive checks only its own fields, so an unsafe struct inside it is a root.
-    let in_bytemuck = reachable(&index, names("bytemuck"));
+    let in_bytemuck = reachable(index, names("bytemuck"));
     let roots = names("bytemuckunsafe")
         .into_iter()
         .chain(in_bytemuck.into_iter().filter(|name| {
@@ -218,27 +241,14 @@ pub fn shared_types(idl: &Idl) -> Vec<SharedType> {
                 .is_some_and(|t| t.serialization == "bytemuckunsafe" && t.generics.is_empty())
         }))
         .collect();
-    let in_zero_copy = reachable(&index, roots);
+    let in_zero_copy = reachable(index, roots);
 
     let mut borsh_roots = names("borsh");
     for arg in idl.instructions.iter().flat_map(|ix| &ix.args) {
         push_defined(&arg.ty, &mut borsh_roots);
     }
     borsh_roots.extend(idl.events.iter().map(|e| e.name.as_str()));
-    let borsh = reachable(&index, borsh_roots);
-
-    idl.types
-        .iter()
-        .filter(|t| in_zero_copy.contains(t.name.as_str()) && borsh.contains(t.name.as_str()))
-        .filter_map(|t| {
-            let layout = index.struct_layout(t).ok()?;
-            // Shipstern pads each struct on its own, so a nested struct's gaps are its own entry.
-            (!layout.padding.is_empty()).then(|| SharedType {
-                name: t.name.clone(),
-                padding: layout.padding,
-            })
-        })
-        .collect()
+    (in_zero_copy, reachable(index, borsh_roots))
 }
 
 #[cfg(test)]

@@ -191,6 +191,51 @@ fn quasar_idl_fails_with_its_spec() {
 }
 
 #[test]
+fn a_name_defined_twice_stops_the_run() {
+    // Shipstern reads the first `Pool` or rejects the IDL, but a lookup by name finds the last.
+    let err = |text: &str| Idl::from_json(text).unwrap_err().to_string();
+    let pool = |ty: &str| {
+        format!(
+            r#"{{"name":"Pool","type":{{"kind":"struct","fields":[{{"name":"a","type":"{ty}"}}]}}}}"#
+        )
+    };
+    assert_eq!(
+        err(&format!(
+            r#"{{"address":"A","metadata":{{"name":"t","version":"1","spec":"0.1.0"}},"types":[{},{}]}}"#,
+            pool("u64"),
+            pool("u64")
+        )),
+        "type `Pool` is defined more than once"
+    );
+
+    // A legacy account body joins `types`. Shipstern accepts a type of the same name only when
+    // it has the same body.
+    let legacy = |ty: &str| {
+        format!(
+            r#"{{"version":"0.1.0","name":"t","metadata":{{"address":"A"}},
+            "accounts":[{}],"types":[{}]}}"#,
+            pool("u64"),
+            pool(ty)
+        )
+    };
+    assert!(Idl::from_json(&legacy("u64")).is_ok());
+    assert_eq!(
+        err(&legacy("u32")),
+        "account `Pool` is defined more than once"
+    );
+
+    // A Codama account body replaces a defined type of the same name, as Shipstern renders it.
+    assert!(Idl::from_json(
+        r#"{"kind":"rootNode","standard":"codama","version":"1.0.0","additionalPrograms":[],
+        "program":{"kind":"programNode","name":"t","publicKey":"A","version":"0",
+          "instructions":[],"pdas":[],"errors":[],
+          "definedTypes":[{"kind":"definedTypeNode","name":"pool","type":{"kind":"structTypeNode","fields":[]}}],
+          "accounts":[{"kind":"accountNode","name":"pool","data":{"kind":"structTypeNode","fields":[]}}]}}"#
+    )
+    .is_ok());
+}
+
+#[test]
 fn legacy_idl_with_address_only_metadata_parses() {
     let idl = parse(
         r#"{"version":"0.1.0","name":"counter","metadata":{"address":"Count111"},

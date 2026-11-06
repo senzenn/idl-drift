@@ -1,10 +1,13 @@
 //! Bring two IDLs from different formats into one form, so that only real changes differ.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::inspect::zero_copy_and_borsh;
+use crate::layout::TypeIndex;
 use crate::model::{
-    ArrayLen, EnumFields, Field, Format, GenericArg, GenericParam, Idl, Type, TypeDefTy,
+    camel, ArrayLen, EnumFields, Field, Format, GenericArg, GenericParam, Idl, Type, TypeDefTy,
 };
+use crate::reach::reachable_types;
 
 /// An IDL can make a type hold itself, or nest wide structs, so inlining stops at this depth.
 const MAX_INLINE_DEPTH: usize = 16;
@@ -25,15 +28,24 @@ struct Allowance {
     work: usize,
 }
 
+/// The types that the old and the new IDL reach before their args are inlined.
+pub(super) type Reached = (BTreeSet<String>, BTreeSet<String>);
+
 /// Copies of `old` and `new` with camelCase names, tuple structs, generic types expanded at
 /// each use and inlined struct args.
-pub(super) fn common_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
+pub(super) fn common_form(old: &Idl, new: &Idl) -> (Idl, Idl, Reached) {
     let mut old_form = with_tuple_structs(old).with_camel_case_names();
     let mut new_form = with_tuple_structs(new).with_camel_case_names();
+    if new.format == Format::Codama {
+        with_explicit_padding(&mut old_form, &new_form);
+    } else if old.format == Format::Codama {
+        with_explicit_padding(&mut new_form, &old_form);
+    }
     expand_generic_uses(&mut old_form);
     expand_generic_uses(&mut new_form);
-    inline_struct_args(&mut old_form);
-    inline_struct_args(&mut new_form);
+    // A parser still reads a type that an arg names after the arg is inlined.
+    let reached = (reachable_types(&old_form), reachable_types(&new_form));
+    inline_struct_args(&mut old_form, &mut new_form);
     u8_vecs_as_bytes(&mut old_form);
     u8_vecs_as_bytes(&mut new_form);
     // Anchor IDLs can't describe an event envelope, so there is nothing to compare.
@@ -41,12 +53,13 @@ pub(super) fn common_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
         clear_envelopes(&mut old_form);
         clear_envelopes(&mut new_form);
     }
-    (old_form, new_form)
+    (old_form, new_form, reached)
 }
 
 /// Copies of two IDLs of one format, with `Vec<u8>` as bytes and struct args inlined where
 /// only the nesting differs. Other args keep their names, so a real change names them.
-pub(super) fn same_format_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
+pub(super) fn same_format_form(old: &Idl, new: &Idl) -> (Idl, Idl, Reached) {
+    let reached = (reachable_types(old), reachable_types(new));
     let (mut old_form, mut new_form) = (old.clone(), new.clone());
     u8_vecs_as_bytes(&mut old_form);
     u8_vecs_as_bytes(&mut new_form);
@@ -73,7 +86,7 @@ pub(super) fn same_format_form(old: &Idl, new: &Idl) -> (Idl, Idl) {
             (oi.args, ni.args) = (old_args, new_args);
         }
     }
-    (old_form, new_form)
+    (old_form, new_form, reached)
 }
 
 /// `Vec<u8>` and bytes are the same Borsh bytes, a length and then the bytes. Anchor and Shank
@@ -134,14 +147,125 @@ fn with_tuple_structs(idl: &Idl) -> Idl {
     idl
 }
 
-/// Replace each arg that holds a struct (linked or inline) with the struct's fields, and each
-/// arg that links an alias with the alias target, until no such arg is left. Borsh writes a
-/// struct as its fields. Converters inline to different depths: Codama inlines only a type
-/// with one use, and Shipstern flattens only one level.
-fn inline_struct_args(idl: &mut Idl) {
-    let bodies = ArgBodies::of(idl);
-    for ix in &mut idl.instructions {
-        bodies.inline(&mut ix.args);
+/// Shipstern's converter writes each `repr(C)` gap of a zero-copy type as a `[u8; n]` field, so
+/// Borsh reads the Codama type at the same offsets. Write the same fields in `idl` where the
+/// Codama type has them. A converter that drops the gaps still shows the moved fields.
+fn with_explicit_padding(idl: &mut Idl, codama: &Idl) {
+    let index = TypeIndex::new(idl);
+    let (in_zero_copy, borsh) = zero_copy_and_borsh(idl, &index);
+    let codama_types = codama.type_map();
+    let mut padded: BTreeMap<String, Vec<Field>> = BTreeMap::new();
+    // As Shipstern does: only types in zero-copy memory that Borsh does not also read.
+    let zero_copy_only = idl
+        .types
+        .iter()
+        .filter(|td| in_zero_copy.contains(td.name.as_str()) && !borsh.contains(td.name.as_str()));
+    for td in zero_copy_only {
+        let (TypeDefTy::Struct { fields }, Some(TypeDefTy::Struct { fields: theirs }), Ok(layout)) = (
+            &td.ty,
+            codama_types.get(&td.name).map(|t| &t.ty),
+            index.struct_layout(td),
+        ) else {
+            continue;
+        };
+        // The names of codama-from-anchor `padded_fields`, with `_2` and up on a clash.
+        let mut taken: BTreeSet<String> = fields.iter().map(|f| f.name.clone()).collect();
+        let mut pads = Vec::new();
+        let mut gap = |base: String, len: usize| {
+            let (mut pad, mut n) = (camel(&base), 2);
+            while !taken.insert(pad.clone()) {
+                pad = camel(&format!("{base}_{n}"));
+                n += 1;
+            }
+            pads.push(pad.clone());
+            Field {
+                name: pad,
+                ty: Type::Array(Box::new(Type::U8), ArrayLen::Value(len)),
+            }
+        };
+        let (mut out, mut end) = (Vec::new(), 0);
+        for (field, at) in fields.iter().zip(&layout.fields) {
+            if at.offset > end {
+                out.push(gap(
+                    format!("padding_before_{}", field.name),
+                    at.offset - end,
+                ));
+            }
+            out.push(field.clone());
+            end = at.offset + at.size;
+        }
+        if layout.size > end {
+            out.push(gap("padding_end".to_string(), layout.size - end));
+        }
+        if !pads.is_empty() && pads.iter().all(|pad| theirs.iter().any(|f| f.name == *pad)) {
+            padded.insert(td.name.clone(), out);
+        }
+    }
+    for td in &mut idl.types {
+        if let Some(fields) = padded.remove(&td.name) {
+            td.ty = TypeDefTy::Struct { fields };
+        }
+    }
+}
+
+/// Pair the args of an instruction in both IDLs one by one, and inline an arg only where the
+/// two types differ. Borsh writes a struct as its fields and an alias as its target. Codama
+/// inlines a struct with one use, and Shipstern's converter flattens such a struct one level
+/// but keeps a shared one as a link. So a renamed field keeps its name at the depth that pairs.
+fn inline_struct_args(old: &mut Idl, new: &mut Idl) {
+    let bodies = [ArgBodies::of(old), ArgBodies::of(new)];
+    for ni in &mut new.instructions {
+        let Some(oi) = old.instructions.iter_mut().find(|oi| oi.name == ni.name) else {
+            continue;
+        };
+        // Stacks with the next arg last, each arg with its inline depth.
+        let mut todo = [&oi.args, &ni.args].map(|args| {
+            args.iter()
+                .rev()
+                .map(|f| (f.clone(), 0))
+                .collect::<Vec<_>>()
+        });
+        let mut done = [Vec::new(), Vec::new()];
+        // A struct that holds itself stops when a side has made this many fields.
+        let mut budget = [MAX_INLINED_ARGS; 2];
+        while todo.iter().any(|side| !side.is_empty()) {
+            let head = |s: usize| todo[s].last();
+            let mut parts: [Option<Vec<Field>>; 2] = std::array::from_fn(|s| {
+                let (arg, _) = head(s).filter(|(_, depth)| *depth < MAX_INLINE_DEPTH)?;
+                let parts = bodies[s].parts(arg)?;
+                (parts.len() <= budget[s]).then_some(parts)
+            });
+            let ty = |s: usize| head(s).map(|(arg, _)| &arg.ty);
+            let first: [_; 2] =
+                std::array::from_fn(|s| parts[s].as_ref().map(|p| p.first().map(|f| &f.ty)));
+            // Inline one side when its fields start with the other arg, as one level of
+            // flattening gives. Else inline each side that holds a struct.
+            let inline = if ty(0) == ty(1) {
+                [false, false]
+            } else if first[0] == Some(ty(1)) {
+                [true, false]
+            } else if first[1] == Some(ty(0)) {
+                [false, true]
+            } else {
+                [parts[0].is_some(), parts[1].is_some()]
+            };
+            let mut grew = false;
+            for s in 0..2 {
+                let Some(fields) = parts[s].take().filter(|_| inline[s]) else {
+                    continue;
+                };
+                let depth = todo[s].pop().map_or(0, |(_, depth)| depth + 1);
+                budget[s] -= fields.len();
+                todo[s].extend(fields.into_iter().rev().map(|f| (f, depth)));
+                grew = true;
+            }
+            if !grew {
+                for s in 0..2 {
+                    done[s].extend(todo[s].pop().map(|(arg, _)| arg));
+                }
+            }
+        }
+        [oi.args, ni.args] = done;
     }
 }
 

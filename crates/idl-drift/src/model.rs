@@ -688,6 +688,15 @@ impl Idl {
             }
             crate::codama_convert::fix_string_error_codes(&mut value);
             let root: codama_nodes::RootNode = serde_json::from_value(value)?;
+            // Account and event bodies join `types` later. There an account body replaces a
+            // defined type of the same name, as Shipstern renders it, so check each kind alone.
+            let program = &root.program;
+            no_duplicates(
+                "type",
+                program.defined_types.iter().map(|t| t.name.as_str()),
+            )?;
+            no_duplicates("account", program.accounts.iter().map(|a| a.name.as_str()))?;
+            no_duplicates("event", program.events.iter().map(|e| e.name.as_str()))?;
             Ok(crate::codama_convert::from_codama(root))
         } else {
             // Anchor puts spec in metadata. A top-level spec is another format, for example Quasar.
@@ -716,6 +725,9 @@ impl Idl {
             } else if legacy {
                 idl.format = Format::LegacyAnchor;
             }
+            no_duplicates("account", idl.accounts.iter().map(|a| a.name.as_str()))?;
+            no_duplicates("event", idl.events.iter().map(|e| e.name.as_str()))?;
+            idl.no_duplicate_types()?;
             Ok(idl)
         }
     }
@@ -758,11 +770,50 @@ impl Idl {
         idl
     }
 
+    /// A legacy IDL adds its account and event bodies to `types`. Shipstern's converter accepts
+    /// a second body of one name only when it is the same (codama-from-anchor `check_shadowed_fields`).
+    fn no_duplicate_types(&self) -> Result<(), serde_json::Error> {
+        let mut first: BTreeMap<&str, &TypeDefTy> = BTreeMap::new();
+        for td in &self.types {
+            let Some(body) = first.insert(&td.name, &td.ty) else {
+                continue;
+            };
+            let kind = if self.accounts.iter().any(|a| a.name == td.name) {
+                "account"
+            } else if self.events.iter().any(|e| e.name == td.name) {
+                "event"
+            } else {
+                "type"
+            };
+            if kind == "type" || *body != td.ty {
+                return Err(defined_twice(kind, &td.name));
+            }
+        }
+        Ok(())
+    }
+
     /// `types`, indexed by name.
     #[must_use]
     pub fn type_map(&self) -> BTreeMap<String, &TypeDef> {
         self.types.iter().map(|t| (t.name.clone(), t)).collect()
     }
+}
+
+/// Shipstern and Codama read the first of two items with one name, or reject the IDL. A lookup
+/// by name here finds the last one, so a diff would compare another body.
+fn no_duplicates<'a>(
+    kind: &str,
+    mut names: impl Iterator<Item = &'a str>,
+) -> Result<(), serde_json::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    match names.find(|name| !seen.insert(*name)) {
+        Some(name) => Err(defined_twice(kind, name)),
+        None => Ok(()),
+    }
+}
+
+fn defined_twice(kind: &str, name: &str) -> serde_json::Error {
+    serde::de::Error::custom(format!("{kind} `{name}` is defined more than once"))
 }
 
 /// Codama's `camelCase`, which differs from heck on acronyms (`AMMConfig` is `aMMConfig`).

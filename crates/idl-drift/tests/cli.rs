@@ -228,6 +228,29 @@ fn markdown_report_counts_changes_and_keeps_allowed_ones_apart() {
 }
 
 #[test]
+fn inspect_fails_on_a_zero_copy_account_with_an_unknown_layout() {
+    // The IDL drops the enum `repr`, so no field offset after `status` is known.
+    let path = std::env::temp_dir().join(format!("idl-drift-unknown-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"{"address":"A","metadata":{"name":"t","version":"1","spec":"0.1.0"},
+        "accounts":[{"name":"Bank","discriminator":[1,1,1,1,1,1,1,1]}],
+        "types":[{"name":"Bank","serialization":"bytemuck","repr":{"kind":"c"},"type":{"kind":"struct","fields":[
+            {"name":"status","type":{"defined":{"name":"Status"}}},{"name":"amount","type":"u64"}]}},
+          {"name":"Status","type":{"kind":"enum","variants":[{"name":"Open"},{"name":"Closed"}]}}]}"#,
+    )
+    .unwrap();
+    let out = drift().arg("inspect").arg(&path).output().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("UNKNOWN LAYOUT: Bank: `status`: `Status` is an enum, which has no defined zero-copy layout\n"),
+        "{text}"
+    );
+}
+
+#[test]
 fn control_characters_in_idl_names_are_escaped() {
     // An IDL from another repo or from chain is untrusted; U+009B starts a terminal sequence.
     let dir = std::env::temp_dir().join(format!("idl-drift-escape-{}", std::process::id()));
