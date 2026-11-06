@@ -363,3 +363,59 @@ fn a_type_tree_that_doubles_at_each_level_stops_the_size_walks() {
     let data = [0, 0, 0, 0, 1, 0, 0, 0, 5];
     assert_eq!(decode(&u8_leaf, "T", &data).map(|d| d.len), Ok(9));
 }
+
+#[test]
+fn a_zero_copy_layout_is_walked_once_for_each_type() {
+    // 20000 items of a chain of 7 one-field structs: a valid account of 20000 bytes.
+    let zc = r#""serialization":"bytemuck","repr":{"kind":"c"},"#;
+    let decoded = |field: &dyn Fn(&str) -> String| {
+        let mut types = chain(6, zc, field, r#"[{"name":"v","type":"u8"}]"#);
+        types.push(format!(
+            r#"{{"name":"T",{zc}"type":{{"kind":"struct","fields":[
+            {{"name":"items","type":{{"array":[{{"defined":{{"name":"S0"}}}},20000]}}}}]}}}}"#
+        ));
+        let idl = idl(&format!("[{}]", types.join(",")));
+        decode(&idl, "T", &vec![0; 20000]).map(|d| d.len)
+    };
+    let one = |next: &str| format!(r#"[{{"name":"v","type":{next}}}]"#);
+    assert_eq!(decoded(&one), Ok(20000));
+    // An array of one struct needs the size of the struct, from the same layouts.
+    let array_of_one = |next: &str| format!(r#"[{{"name":"v","type":{{"array":[{next},1]}}}}]"#);
+    assert_eq!(decoded(&array_of_one), Ok(20000));
+}
+
+#[test]
+fn option_size_walks_and_generic_arguments_spend_the_decode_work() {
+    // Each absent COption walks the Borsh size of its item, here 2^15 - 1 type nodes.
+    let two =
+        |next: &str| format!(r#"[{{"name":"a","type":{next}}},{{"name":"b","type":{next}}}]"#);
+    let mut types = chain(14, "", two, "[]");
+    types.push(
+        r#"{"name":"T","type":{"kind":"struct","fields":[
+            {"name":"v","type":{"array":[{"coption":{"defined":{"name":"S0"}}},4]}}]}}"#
+            .to_string(),
+    );
+    let coption = idl(&format!("[{}]", types.join(",")));
+    assert_eq!(
+        decode(&coption, "T", &[0; 16]).unwrap_err().kind,
+        DecodeErrorKind::TooLarge
+    );
+    // Each use of `G<T>` copies `T`, a 201-node tuple, and passes it 100 times to `H`.
+    let params: Vec<String> = (0..100)
+        .map(|i| format!(r#"{{"kind":"type","name":"P{i}"}}"#))
+        .collect();
+    let forward = vec![r#"{"kind":"type","type":{"generic":"T"}}"#; 100].join(",");
+    let tuple = format!(r#"{{"tuple":[{}]}}"#, vec![r#""u8""#; 200].join(","));
+    let generic = idl(&format!(
+        r#"[{{"name":"H","generics":[{}],"type":{{"kind":"struct","fields":[]}}}},
+            {{"name":"G","generics":[{{"kind":"type","name":"T"}}],"type":{{"kind":"struct",
+            "fields":[{{"name":"h","type":{{"defined":{{"name":"H","generics":[{forward}]}}}}}}]}}}},
+            {{"name":"T","type":{{"kind":"struct","fields":[{{"name":"v","type":{{"array":[
+            {{"defined":{{"name":"G","generics":[{{"kind":"type","type":{tuple}}}]}}}},4]}}}}]}}}}]"#,
+        params.join(",")
+    ));
+    assert_eq!(
+        decode(&generic, "T", &[0; 4]).unwrap_err().kind,
+        DecodeErrorKind::TooLarge
+    );
+}

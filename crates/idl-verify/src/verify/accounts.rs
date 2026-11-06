@@ -5,12 +5,15 @@ use std::fmt::Write as _;
 
 use idl_drift::model::{Format, Idl, NamedDisc, Type, TypeDef};
 
-use super::{bytes_used, missing_field_hint, size_counts, Groups, Outcomes, Verifier};
+use super::{
+    bytes_used, missing_field_hint, sample_count, size_counts, Groups, Outcomes, Verifier,
+};
 use crate::classify::{has_byte_discriminator, IDL_ACCOUNT_DISCRIMINATOR};
 use crate::decode::Value;
 use crate::layout::StructLayout;
 use crate::reference::Outcome;
 use crate::report::{AccountSummary, Check, Coverage, Range, Severity};
+use crate::samples::AccountSample;
 use crate::text::{bytes, of_samples, plural, prefix_hex};
 
 enum AccountLayout {
@@ -86,6 +89,7 @@ impl Verifier<'_> {
             && !idl.accounts.is_empty()
             && !shank;
         let hint = unknown_account_hint(idl, &self.classifier.sized, by_size);
+        self.unknown_accounts = sample_count(&unknown);
         self.report_unclassified(
             "account",
             &unknown,
@@ -354,6 +358,7 @@ impl Verifier<'_> {
         }
         let total = outcomes.len();
         let missing_field = missing_field_hint(outcomes, |i| accounts[i].data.as_slice());
+        let same_tail = same_tail(outcomes, accounts);
         for ((size, used), idxs) in classes {
             let unused = size - used;
             let count = of_samples(idxs.len(), total);
@@ -375,12 +380,21 @@ impl Verifier<'_> {
                 .flatten()
                 .filter(|l| {
                     l.padding_len() > 0
-                        && (!zeros
-                            || l.padding.iter().any(|p| p.before.is_some())
-                            || l.fields.iter().any(|f| f.padding > 0))
+                        && (!zeros || moves_a_field(l))
                         && disc.checked_add(l.size) == Some(size)
                 });
-            let (severity, message, hint) = if let Some(layout) = padded {
+            // The same bytes in each sample after padding that moves no field are more likely a field.
+            let end_padding_only = padded.as_ref().is_some_and(|l| !moves_a_field(l));
+            let (severity, message, hint) = if let Some(hint) = missing_field
+                .clone()
+                .filter(|_| end_padding_only && same_tail)
+            {
+                (
+                    Severity::Error,
+                    format!("{unused} of {size} bytes unused in {count}"),
+                    hint,
+                )
+            } else if let Some(layout) = padded {
                 // Name the field after the first gap, unless an earlier field has a gap inside.
                 let first = layout.padding.first().filter(|p| {
                     !layout
@@ -564,6 +578,20 @@ fn padding_list(layout: &StructLayout) -> String {
     parts.sort_by_key(|(offset, _)| *offset);
     let parts: Vec<String> = parts.into_iter().map(|(_, part)| part).collect();
     parts.join(", ")
+}
+
+/// Whether each decoded sample ends in the same bytes after the data.
+fn same_tail(outcomes: &Outcomes, accounts: &[AccountSample]) -> bool {
+    let mut tails = outcomes
+        .iter()
+        .filter_map(|(i, r)| accounts[*i].data.get(r.as_ref().ok()?.1..));
+    let first = tails.next();
+    tails.all(|t| Some(t) == first)
+}
+
+/// Whether the `repr(C)` padding moves a field: a gap before a field, or one inside a field.
+fn moves_a_field(layout: &StructLayout) -> bool {
+    layout.padding.iter().any(|p| p.before.is_some()) || layout.fields.iter().any(|f| f.padding > 0)
 }
 
 fn round_up_8(n: usize) -> Option<usize> {
@@ -800,6 +828,18 @@ mod tests {
         let report = verify(&account_idl(borsh), &accounts(&[&[1, 0, 2, 0, 3, 9]]), None);
         let f = only(&report);
         assert_eq!((f.severity, f.check), (Severity::Error, Check::BytesUsed));
+        assert_eq!(
+            f.hint.as_deref(),
+            Some("the same 1 byte follows in every sample: the IDL is likely missing a 1-byte field at the end")
+        );
+        // Other bytes in each sample can be padding that the program does not zero.
+        let report = verify(
+            &account_idl(borsh),
+            &accounts(&[&[1, 0, 2, 0, 3, 9], &[1, 0, 2, 0, 3, 8]]),
+            None,
+        );
+        let hint = only(&report).hint.clone().unwrap_or_default();
+        assert!(hint.contains("repr(C) layout"), "{hint}");
     }
 
     #[test]

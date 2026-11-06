@@ -47,7 +47,18 @@ impl<'a> TypeIndex<'a> {
     /// `repr(Rust)` (except packed with no bool), undefined types, overflowing sizes or
     /// recursive types.
     pub fn struct_layout(&self, td: &TypeDef) -> Result<StructLayout, LayoutError> {
-        Walk::new(self).struct_layout_at(td, 0)
+        Walk::new(self, &Cell::new(MAX_WORK)).struct_layout_at(td, 0)
+    }
+
+    /// For idl-verify, not a stable API: [`Self::struct_layout`], where each node spends `work`.
+    #[doc(hidden)]
+    #[allow(clippy::missing_errors_doc)]
+    pub fn struct_layout_within(
+        &self,
+        td: &TypeDef,
+        work: &Cell<usize>,
+    ) -> Result<StructLayout, LayoutError> {
+        Walk::new(self, work).struct_layout_at(td, 0).map_err(spent)
     }
 
     /// Size and alignment of `ty` inside zero-copy memory.
@@ -56,7 +67,18 @@ impl<'a> TypeIndex<'a> {
     ///
     /// As [`Self::struct_layout`].
     pub fn size_align(&self, ty: &Type) -> Result<(usize, usize), LayoutError> {
-        Walk::new(self).size_align_at(ty, 0)
+        Walk::new(self, &Cell::new(MAX_WORK)).size_align_at(ty, 0)
+    }
+
+    /// For idl-verify, not a stable API: [`Self::size_align`], where each node spends `work`.
+    #[doc(hidden)]
+    #[allow(clippy::missing_errors_doc)]
+    pub fn size_align_within(
+        &self,
+        ty: &Type,
+        work: &Cell<usize>,
+    ) -> Result<(usize, usize), LayoutError> {
+        Walk::new(self, work).size_align_at(ty, 0).map_err(spent)
     }
 
     /// Every primitive and array in `td`, flattened with its offset under `reading`. Arrays
@@ -68,7 +90,7 @@ impl<'a> TypeIndex<'a> {
     /// As [`Self::struct_layout`] for zero-copy, or when a Borsh size varies.
     pub fn leaves(&self, td: &TypeDef, reading: Reading) -> Result<Vec<Leaf>, LayoutError> {
         let mut out = Vec::new();
-        Walk::new(self).def_leaves(td, reading, "", 0, 0, &mut out)?;
+        Walk::new(self, &Cell::new(MAX_WORK)).def_leaves(td, reading, "", 0, 0, &mut out)?;
         Ok(out)
     }
 
@@ -78,7 +100,7 @@ impl<'a> TypeIndex<'a> {
     ///
     /// As [`Self::leaves`].
     pub fn reading_size(&self, ty: &Type, reading: Reading) -> Result<usize, LayoutError> {
-        Walk::new(self).reading_size_at(ty, reading, 0)
+        Walk::new(self, &Cell::new(MAX_WORK)).reading_size_at(ty, reading, 0)
     }
 
     /// Borsh size of `ty` when every value has the same size, `None` when it varies.
@@ -87,7 +109,26 @@ impl<'a> TypeIndex<'a> {
     ///
     /// On undefined types, overflowing sizes or recursive types.
     pub fn borsh_size(&self, ty: &Type) -> Result<Option<usize>, LayoutError> {
-        Walk::new(self).borsh_size_at(ty, 0)
+        Walk::new(self, &Cell::new(MAX_WORK)).borsh_size_at(ty, 0)
+    }
+
+    /// For idl-verify, not a stable API: [`Self::borsh_size`], where each node spends `work`.
+    #[doc(hidden)]
+    #[allow(clippy::missing_errors_doc)]
+    pub fn borsh_size_within(
+        &self,
+        ty: &Type,
+        work: &Cell<usize>,
+    ) -> Result<Option<usize>, LayoutError> {
+        Walk::new(self, work).borsh_size_at(ty, 0).map_err(spent)
+    }
+}
+
+/// A walk on the caller's budget runs out of that budget, not of [`MAX_WORK`].
+fn spent(e: LayoutError) -> LayoutError {
+    match e {
+        LayoutError::TooLarge => LayoutError::OutOfWork,
+        e => e,
     }
 }
 
@@ -95,15 +136,12 @@ impl<'a> TypeIndex<'a> {
 /// no state, so it stays `Sync`.
 struct Walk<'i, 'a> {
     index: &'i TypeIndex<'a>,
-    work: Cell<usize>,
+    work: &'i Cell<usize>,
 }
 
 impl<'i, 'a> Walk<'i, 'a> {
-    fn new(index: &'i TypeIndex<'a>) -> Self {
-        Self {
-            index,
-            work: Cell::new(MAX_WORK),
-        }
+    fn new(index: &'i TypeIndex<'a>, work: &'i Cell<usize>) -> Self {
+        Self { index, work }
     }
 
     fn reading_size_at(
@@ -628,6 +666,9 @@ pub enum LayoutError {
     TooDeep,
     /// The type tree has more than [`MAX_WORK`] nodes.
     TooLarge,
+    /// A walk spent all the work that its caller gave it.
+    #[doc(hidden)]
+    OutOfWork,
 }
 
 impl LayoutError {
@@ -658,6 +699,7 @@ impl fmt::Display for LayoutError {
             Self::Overflow => f.write_str("size overflows"),
             Self::TooDeep => write!(f, "types nest deeper than {MAX_DEPTH} levels"),
             Self::TooLarge => write!(f, "the type tree has more than {MAX_WORK} nodes"),
+            Self::OutOfWork => f.write_str("the walk used all the work that its caller allows"),
         }
     }
 }
@@ -880,6 +922,12 @@ mod tests {
         assert_eq!(index.struct_layout(s0), Err(LayoutError::TooLarge));
         assert_eq!(index.leaves(s0, Reading::Borsh), Err(LayoutError::TooLarge));
         assert_eq!(index.borsh_size(&ty), Err(LayoutError::TooLarge));
+        // A budget that the caller gives does not name MAX_WORK when it runs out.
+        let spent = index.borsh_size_within(&ty, &Cell::new(1)).unwrap_err();
+        assert_eq!(
+            spent.to_string(),
+            "the walk used all the work that its caller allows"
+        );
     }
 
     #[test]

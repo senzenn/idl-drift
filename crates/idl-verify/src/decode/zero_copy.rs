@@ -1,19 +1,18 @@
 //! Zero-copy types: fields read at their `repr(C)` offsets, the way the program casts them.
 
+use std::rc::Rc;
+
 use idl_drift::model::{ArrayLen, Type, TypeDef, TypeDefTy};
 
 use super::generics::Scope;
 use super::reader::Reader;
 use super::{Call, DecodeError, DecodeErrorKind, Decoded, Value};
-use crate::layout::LayoutError;
+use crate::layout::{LayoutError, StructLayout};
 
 impl Call<'_, '_> {
     pub(super) fn zero_copy(&self, td: &TypeDef, data: &[u8]) -> Result<Decoded, DecodeError> {
-        let layout = self
-            .types
-            .struct_layout(td)
-            .map_err(|e| DecodeError::new(0, DecodeErrorKind::Layout(e)))?;
         let value = self.zc_struct(td, data, 0, 0)?;
+        let layout = self.layout(td, 0)?;
         if data.len() < layout.size {
             // Every field fit, so only trailing padding is missing.
             return Err(DecodeError::new(
@@ -37,8 +36,8 @@ impl Call<'_, '_> {
         base: usize,
         depth: usize,
     ) -> Result<Value, DecodeError> {
-        let layout_err = |e| DecodeError::new(base, DecodeErrorKind::Layout(e));
-        let layout = self.types.struct_layout(td).map_err(layout_err)?;
+        let layout_err = |e| DecodeError::layout(base, e);
+        let layout = self.layout(td, base)?;
         let TypeDefTy::Struct { fields } = &td.ty else {
             return Err(layout_err(LayoutError::Unknown {
                 path: Vec::new(),
@@ -58,6 +57,21 @@ impl Call<'_, '_> {
         Ok(Value::Struct(out))
     }
 
+    /// The layout of `td`, walked only for its first value in this call.
+    fn layout(&self, td: &TypeDef, at: usize) -> Result<Rc<StructLayout>, DecodeError> {
+        let key = std::ptr::from_ref(td);
+        if let Some(layout) = self.layouts.borrow().get(&key) {
+            return Ok(Rc::clone(layout));
+        }
+        let layout = self
+            .types
+            .struct_layout_within(td, &self.work)
+            .map_err(|e| DecodeError::layout(at, e))?;
+        let layout = Rc::new(layout);
+        self.layouts.borrow_mut().insert(key, Rc::clone(&layout));
+        Ok(layout)
+    }
+
     fn zc_value(
         &self,
         ty: &Type,
@@ -66,7 +80,7 @@ impl Call<'_, '_> {
         depth: usize,
     ) -> Result<Value, DecodeError> {
         self.step(at, depth)?;
-        let layout_err = |e| DecodeError::new(at, DecodeErrorKind::Layout(e));
+        let layout_err = |e| DecodeError::layout(at, e);
         match ty {
             Type::Defined { name, .. } => {
                 let td = self.lookup(name, at)?;
@@ -76,7 +90,23 @@ impl Call<'_, '_> {
                 }
             }
             Type::Array(item, ArrayLen::Value(len)) => {
-                let (size, _) = self.types.size_align(item).map_err(layout_err)?;
+                // A struct item takes its size from the cache, so each array does not walk it again.
+                let cached = match &**item {
+                    Type::Defined { name, generics } if generics.is_empty() => self
+                        .types
+                        .get(name)
+                        .filter(|td| matches!(td.ty, TypeDefTy::Struct { .. })),
+                    _ => None,
+                };
+                let size = match cached {
+                    Some(td) => self.layout(td, at)?.size,
+                    None => {
+                        self.types
+                            .size_align_within(item, &self.work)
+                            .map_err(layout_err)?
+                            .0
+                    }
+                };
                 let remaining = data.len().saturating_sub(at);
                 let total = size.checked_mul(*len);
                 let fits = match size {

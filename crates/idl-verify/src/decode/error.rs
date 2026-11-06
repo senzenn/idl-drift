@@ -57,6 +57,15 @@ impl DecodeError {
         }
     }
 
+    /// The layout walks of a decode spend its work, so a walk that runs out is its `TooLarge`.
+    pub(super) fn layout(offset: usize, e: LayoutError) -> Self {
+        let kind = match e {
+            LayoutError::OutOfWork => DecodeErrorKind::TooLarge,
+            e => DecodeErrorKind::Layout(e),
+        };
+        Self::new(offset, kind)
+    }
+
     pub(super) fn within(mut self, segment: impl Into<String>) -> Self {
         self.path.push(segment.into());
         self

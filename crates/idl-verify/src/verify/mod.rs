@@ -50,6 +50,8 @@ struct Verifier<'a> {
     reference_summary: ReferenceSummary,
     /// The class of each account sample, only with `--upgrade-impact`.
     upgrade: Option<Vec<upgrade::TypeClasses>>,
+    /// Account samples that the `discriminator` check reports as errors.
+    unknown_accounts: usize,
 }
 
 /// Each sample's decode: the value and the bytes it used (discriminator included), or the error.
@@ -69,6 +71,7 @@ impl<'a> Verifier<'a> {
             findings: Vec::new(),
             reference_summary: ReferenceSummary::default(),
             upgrade: None,
+            unknown_accounts: 0,
         }
     }
 

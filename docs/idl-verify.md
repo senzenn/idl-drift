@@ -71,7 +71,7 @@ In the tables:
 | `--rpc <URL>` | Take samples from a live cluster over JSON-RPC. The env var `IDL_VERIFY_RPC_URL` sets the same value. Use the env var: `ps` and shell history show a URL on the command line. |
 | `--program <ID>` | With `--rpc`: the program to sample. Default: the IDL's `address`. |
 | `--max-tx <N>` | With `--rpc`: read at most N successful transactions. Default: 40. |
-| `--stall <N>` | With `--rpc`: stop after N successful transactions in a row bring no new instruction or event kind. Default: 40. It stops a run only when `--max-tx` is larger than N, so with the defaults `--max-tx` stops first. |
+| `--stall <N>` | With `--rpc`: stop after N successful transactions in a row bring no new instruction or event kind (a transaction that the RPC no longer keeps counts too), or after N pages of signatures in a row hold only failed transactions. Default: 40. A transaction that is read counts toward both limits, so with the defaults `--max-tx` usually stops first. A transaction that the RPC answers with `null` counts only toward N, so N such answers in a row stop the run before `--max-tx` does. |
 | `--save-samples <PATH>` | With `--rpc`: write the live samples to this file, in the samples format. |
 | `--reference <PATH>` | Compare values with the output of the reference decoder. See [reference decoder](#reference-decoder). |
 | `--decoder <CMD>` | Compare values with a decoder under test. See [decoder-protocol.md](decoder-protocol.md). |
@@ -154,6 +154,7 @@ When an account has more bytes than the IDL reads, idl-verify tries to explain t
   casts as `repr(C)`, and drops its implicit padding. Fields after the first gap are
   misread. Error, with the location of the padding. Padding only after the last field
   moves no field, so when the bytes after the data are zero, the rules below apply to it.
+  When they are not zero but the same bytes in each sample, the hint names a missing field.
 - **The size is the used size rounded up to 8, on a Borsh type.** This is a common pattern
   of spare allocation, but not proof. Warning: compare with the program source.
 - **Extra bytes that are all zero on a fixed-size Borsh type.** This is usually spare
@@ -226,8 +227,8 @@ serve `getAccountInfo`, `getSignaturesForAddress`, `getTransaction` and
 `getMultipleAccounts`, and with `--upgrade-impact` also `getMinimumBalanceForRentExemption`.
 
 - **Last deploy.** For a loader-v3 or loader-v4 program, idl-verify reads the slot of the
-  last deploy. A transaction in that slot or earlier ran the old code, so sampling stops
-  there.
+  last deploy. A transaction in that slot or earlier, failed or not, ran the old code, so
+  sampling stops there.
 
 - **Signatures.** From `getSignaturesForAddress`, 1000 at a time, back through history.
   idl-verify skips failed transactions, because they can hold data that the program
@@ -242,9 +243,10 @@ serve `getAccountInfo`, `getSignaturesForAddress`, `getTransaction` and
 - **Limits.** At most 5 samples for each instruction discriminator, each unknown prefix and
   each event kind.
 - **Stop.** Sampling stops when each IDL instruction has 5 samples, when `--stall`
-  transactions in a row bring no new instruction or event kind, after `--max-tx` successful
-  transactions, at the last deploy, or when the program has no older transactions. The
-  report gives the number of transactions read and the reason it stopped.
+  transactions in a row bring no new instruction or event kind (a `null` one counts too),
+  when `--stall` pages of signatures in a row hold only failed transactions, after
+  `--max-tx` successful transactions, at the last deploy, or when the program has no older
+  transactions. The report gives the number of transactions read and the reason it stopped.
 - **Accounts.** The accounts that those instructions pass and the program owns, from
   `getMultipleAccounts`, at most 5 for each account type. idl-verify first reads only the
   owner, the length and the first bytes of each account. Then it reads all the data of the
@@ -256,7 +258,15 @@ A run exits 2 when it finds nothing of the program, the URL is empty, the progra
 is not base58, or a request fails. So a typo does not look like a quiet program. idl-verify
 tries each request up to 5 times after a rate limit (HTTP 429), a server error, a lost
 connection or a cut-off answer. After a 429 it waits for the `Retry-After` time, up to 60 s,
-else 10 s. `idl-drift diff --onchain` uses the same rules.
+else 10 s. Each try waits up to 10 s for the connection and up to 2 min for the whole
+answer. A try that times out, also while it reads an error answer, is tried again only one
+time. So a host that does not accept the connection fails the request after 20.5 s (2 x
+10 s, and 0.5 s between the tries), and a request that times out fails after 240.5 s (2 x
+2 min + 0.5 s). The longest wait for one request is 14 min: 5 tries of up to 2 min each,
+and a 60 s `Retry-After` between them.
+`idl-drift diff --onchain` uses the same rules. The public mainnet RPC reads old transactions
+slowly: on a program with little traffic, a run of 40 transactions took 28 min. Use a lower
+`--max-tx` or a private RPC there.
 
 idl-verify never prints the URL, because providers put the API key in it.
 
@@ -340,7 +350,7 @@ account with it and puts the account in one class:
 Give the current IDL with `--compare-idl`. idl-verify then decodes each account with both
 IDLs and compares the fields that both IDLs name, with the same comparison as
 [compare two IDLs](#compare-two-idls). A field that only one IDL has is not a difference,
-also in a struct inside an option or an enum variant.
+also in a struct inside an option, an enum variant, a tuple or a map.
 Lists compare on the items that both IDLs read, so a reserved array that gives bytes to a
 new field is not a difference when the values stay the same. Without `--compare-idl`, a
 field that changes its type, or that moves, can show as ok, shorter or realloc.
@@ -389,7 +399,8 @@ The `u32` keeps its offset in the `repr(C)` layout, so without `--compare-idl` a
 
 The run checks accounts only. The instructions and events in the samples are for the
 current program, so idl-verify does not check them against the new IDL, and the report's
-`instructions` and `events` are empty. A run with no account data exits 2. The classes
+`instructions` and `events` are empty. A run with no account data exits 2, and so does a
+run with a Shank IDL, because idl-verify does not check Shank accounts. The classes
 replace the `decode`, `bytes_used`, `size_distribution` and `reference` checks on the
 accounts. The `discriminator`, `missing_type` and `layout` checks still run. When the new
 IDL has another address, such as a new deployment, give the sampled program with
@@ -442,7 +453,7 @@ error: event TradeEvent: 24 bytes after the payload in 10 of 10 samples
 | `events` | One entry for each event: `name`, `samples`, `sources` (`log`, `cpi`), `sizes`, `bytes_used`. Sizes include the discriminator and do not include a self-CPI envelope. |
 | `reference` | Only after a comparison: `accounts_compared`, `accounts_matched`, `instructions_compared`, `instructions_matched`, `events_compared`, `events_matched`, `skipped`. |
 | `sampling` | Only after a live run: `transactions` (successful transactions read) and `stop_reason`. |
-| `upgrade_impact` | Only with `--upgrade-impact`. `rent_source` (`rpc` or `formula`), `lamports_per_byte` (the offline rate, or `null` for `rpc`), `types`, `unknown` (accounts whose discriminator matches no account type, counted as broken) and `totals`. Each entry of `types` has `name`, `sampled`, `ok`, `shorter` (`count`, `bytes`), `realloc` (`count`, `bytes`, `rent_each`, `rent_total`) and `broken` (`count`, and `reasons`, each with `reason`, `count`, `detail` and `example`). `bytes` and `rent_each` are `min` and `max`, or `null` when `count` is 0. `totals` has `sampled`, `ok`, `shorter`, `realloc`, `broken` and `rent_total`. The counts are of the sample. Rent is in lamports. In this mode, `instructions` and `events` are empty. |
+| `upgrade_impact` | Only with `--upgrade-impact`. `rent_source` (`rpc` or `formula`), `lamports_per_byte` (the offline rate, or `null` for `rpc`), `types`, `unknown` (accounts that the `discriminator` check reports as errors, counted as broken) and `totals`. Each entry of `types` has `name`, `sampled`, `ok`, `shorter` (`count`, `bytes`), `realloc` (`count`, `bytes`, `rent_each`, `rent_total`) and `broken` (`count`, and `reasons`, each with `reason`, `count`, `detail` and `example`). `bytes` and `rent_each` are `min` and `max`, or `null` when `count` is 0. `totals` has `sampled`, `ok`, `shorter`, `realloc`, `broken` and `rent_total`. The counts are of the sample. Rent is in lamports. In this mode, `instructions` and `events` are empty. |
 | `findings` | Each finding: `severity`, `check`, `subject`, `message`, and when present `hint` and `example`. An allowed finding also has `"allowed": true`. |
 | `unused_allows` | Only with `--allow`: the entries that match no finding, each with `line`, `rule` and `subject`. |
 | `counts` | `errors`, `warnings`, `notes`, other than allowed findings, so that they agree with the exit code. |
@@ -476,7 +487,8 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
   from Metaplex or Phoenix) keeps each instruction tag in `discriminant`, and idl-verify
   reads it. A Shank program tells its account types apart by a field, such as a `key` enum,
   that the IDL does not map to each type. So idl-verify does not check Shank accounts, and
-  gives one note. A Shank `vec` with a `size` does not load (exit 2).
+  gives one note. With `--upgrade-impact`, which checks accounts only, a Shank IDL exits 2.
+  A Shank `vec` with a `size` does not load (exit 2).
 - **Live sampling sees recent activity only.** idl-verify does not check instructions and
   events that the sampled transactions do not use. The report lists them under "not
   sampled". Increase `--max-tx` and `--stall` to look further back. Set `--min-coverage` to
