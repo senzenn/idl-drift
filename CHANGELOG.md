@@ -5,6 +5,80 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-06
+
+### Added
+
+- Library: `idl_drift::source::discover_with_idls(root, idl_paths)` reads the workspace and
+  more IDL files in one call. An IDL named after a `#[program] mod` gets the lib name of its
+  crate. `idl-drift source --idl` uses it.
+
+### Changed
+
+- `idl-drift inspect` prints the line `zero-copy accounts with an unknown layout: N`.
+- `idl-drift diff` across formats: arguments pair one by one. A struct that both sides link
+  stays a link, so a change inside it is one `field_*` change on the type. Before, it was an
+  `arg_*` change on each instruction. An allow file must name the new change.
+- `idl-verify --rpc` and `idl-drift diff --onchain`: a try waits up to 10 s to connect and up
+  to 2 min for the answer. A timeout, also in the read of an error answer, is tried again only
+  one time. Before, a try waited at most 30 s, and a timeout was tried 5 times. The public
+  mainnet RPC can take more than 30 s to list the signatures of a program.
+
+### Fixed
+
+- `idl-drift diff`: in a zero-copy account, an array of 2 or more items whose item size
+  changes is Breaking, also when it is the last field. Before, it was Dangerous, because only
+  the first item was compared.
+- `idl-drift diff`, `idl-drift inspect` and `idl-verify` stop with exit 2 on an IDL with two
+  types, two accounts or two events of one name. Before, the last one was used. A legacy
+  account or event and a type of one name still load when their bodies are the same. In a
+  Codama IDL, an account and a defined type can still share a name.
+- `idl-drift inspect` lists each zero-copy account whose layout cannot be computed on an
+  `UNKNOWN LAYOUT:` line, and exits 1. Before, it printed nothing without `--layout` and
+  exited 0.
+- `idl-drift diff`: an Anchor IDL against the Codama IDL that Shipstern's converter writes
+  from it is no longer Breaking. idl-drift writes each `repr(C)` gap as the same `[u8; n]`
+  field.
+- `idl-drift diff`: across formats, a field renamed inside a struct argument that one side
+  inlines is Dangerous `arg_renamed`, and a type that only an argument names is reachable.
+  Before, the rename was not reported, and a change to such a type was Cosmetic.
+- `idl-drift source`: an Anchor IDL is compared with its crate also when the `#[program] mod`
+  name is not the lib name. Before, a wrong IDL address gave no finding.
+- `idl-drift source`: an IDL whose name no lib has is compared with the one crate whose lib
+  name or `#[program] mod` name is the same with no `_` before a digit, such as Codama
+  `limitOrder2` for `limit_order_2`. Before, a wrong address gave no finding.
+- `idl-drift source`: a run that compared no id and has only Cosmetic findings stops with
+  exit 2. It exited 0.
+- `idl-drift source` reads the `declare_id!` in the file of a root `mod <name>;`, such as
+  `src/id.rs`, when the crate root takes `ID` from it. It does not read a `mod` with
+  `#[path]`.
+- `idl-drift source --idl` reads a file in `target/idl` only one time.
+- `idl-drift source`: a glob import of `ID` counts when the id that shadows it has a `#[cfg]`
+  or is in a `cfg_if!` branch. Before, it gave a false Breaking finding. A `cfg_if!` chain
+  that ends in `else`, with an `ID` in each branch, still hides the glob.
+- `idl-drift source`: a `declare_id!` in a `name!(..)` or `name![..]` macro body no longer
+  counts.
+- `idl-drift source --onchain`: an on-chain IDL with an `address` and no name gives its
+  address. It was Breaking `onchain_mismatch`.
+- `idl-drift source`: two IDLs of a program with no `declare_id!` and no `Anchor.toml` id must
+  have the same address, else Breaking `idl_address_mismatch`.
+- `idl-verify`: the Borsh size walk of an absent `COption` or a Codama fixed or zeroable
+  option, the copies of generic arguments, and the zero-copy layout of each type spend the
+  decode budget. Before, a hostile IDL could make a decode run for minutes with no error.
+- `idl-verify --upgrade-impact --compare-idl`: a new field in a struct inside an enum tuple
+  variant, a tuple or a map is no longer a difference. Before, it broke the account (exit 1).
+- `idl-verify`: on a Borsh account of `8 + size_of::<T>()` bytes with `repr(C)` padding only
+  after the last field, the same non-zero bytes after the data in each sample give the
+  missing-field hint. Before, the hint blamed the padding.
+- `idl-verify --upgrade-impact`: an account that idl-verify does not check, such as Anchor's
+  `IdlAccount`, no longer counts as broken. A run with a Shank IDL exits 2, because
+  idl-verify checks no Shank account. Before, it counted each Shank account as broken and
+  exited 0.
+- `idl-verify --rpc`: a transaction that the RPC no longer keeps (`null`) counts toward
+  `--stall`. `--stall` pages in a row of only failed transactions stop the run, and so does a
+  failed transaction at or before the last deploy. Before, such a history paged back with no
+  end.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added
