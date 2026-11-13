@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -18,7 +18,7 @@ repository = "https://github.com/senzenn/idl-drift"
 
 [workspace.dependencies]
 # No `rpc` by default: the guard crate must not pull in an HTTP client. idl-verify asks for it.
-idl-drift = { path = "crates/idl-drift", version = "0.3.1", default-features = false }
+idl-drift = { path = "crates/idl-drift", version = "0.4.0", default-features = false }
 base64 = "0.22"
 bs58 = "0.5"
 clap = { version = "4", features = ["derive"] }

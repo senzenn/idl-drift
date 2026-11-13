@@ -109,7 +109,7 @@ The GitHub Action runs either tool in one step and writes the report to the job 
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-- uses: senzenn/idl-drift@v0.3.1
+- uses: senzenn/idl-drift@v0.4.0
   with:
     idl: idls/my_program.json
 ```

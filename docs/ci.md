@@ -21,7 +21,7 @@ The smallest step compares an IDL with the same file on the base branch of the p
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-- uses: senzenn/idl-drift@v0.3.1
+- uses: senzenn/idl-drift@v0.4.0
   with:
     idl: idls/my_program.json
 ```
@@ -62,9 +62,9 @@ For stable results, pin the action to a full commit SHA, and set `version` to th
 commit. Then the action downloads the release binary:
 
 ```yaml
-- uses: senzenn/idl-drift@<full commit SHA> # v0.3.1
+- uses: senzenn/idl-drift@<full commit SHA> # v0.4.0
   with:
-    version: v0.3.1
+    version: v0.4.0
     idl: idls/my_program.json
 ```
 
