@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
-idl-drift.workspace = true
+idl-drift = { workspace = true, features = ["rpc"] }
 base64.workspace = true
 bs58.workspace = true
 clap = { workspace = true, features = ["env"] }

@@ -5,6 +5,7 @@ mod compare;
 mod events;
 mod instructions;
 mod pda;
+mod reserved;
 mod upgrade;
 
 use std::collections::BTreeMap;
@@ -50,6 +51,8 @@ struct Verifier<'a> {
     reference_summary: ReferenceSummary,
     /// The class of each account sample, only with `--upgrade-impact`.
     upgrade: Option<Vec<upgrade::TypeClasses>>,
+    /// With `--upgrade-impact` and an old IDL: the reserved bytes that new fields take.
+    reserved: Option<reserved::ReservedBytes<'a>>,
     /// Account samples that the `discriminator` check reports as errors.
     unknown_accounts: usize,
 }
@@ -71,6 +74,7 @@ impl<'a> Verifier<'a> {
             findings: Vec::new(),
             reference_summary: ReferenceSummary::default(),
             upgrade: None,
+            reserved: None,
             unknown_accounts: 0,
         }
     }
@@ -100,6 +104,7 @@ impl<'a> Verifier<'a> {
             upgrade_impact: None,
             findings: self.findings,
             unused_allows: None,
+            pruned_allows: None,
         }
     }
 }

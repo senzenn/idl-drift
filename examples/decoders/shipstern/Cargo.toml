@@ -12,15 +12,12 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 shipstern-core = "=0.12.0"
 shipstern-parser = "=0.12.0"
+# `program-events` makes the parser decode events, so that idl-verify compares them too.
 shipstern-proc-macro = { version = "=0.12.0", features = ["program-events"] }
 borsh = { version = "1", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
-bs58 = "0.5"
-tokio = { version = "1", features = ["rt"] }
+idl-verify-shipstern = { path = "../../../crates/idl-verify-shipstern" }
 
 [features]
-default = ["serde"]
-# The generated types derive serde only when the crate that holds them has this feature.
+# The generated types derive serde only with this feature. The adapter reads `Debug`, so it
+# stays off; declaring it keeps the `unexpected_cfgs` warning away.
 serde = []

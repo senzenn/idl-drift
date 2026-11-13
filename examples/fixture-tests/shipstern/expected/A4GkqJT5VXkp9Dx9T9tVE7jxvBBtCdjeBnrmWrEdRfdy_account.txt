@@ -1,0 +1,20 @@
+PumpAccount {
+    account: BondingCurve(
+        BondingCurve {
+            virtual_token_reserves: 819690409205242,
+            virtual_quote_reserves: 1199018444,
+            real_token_reserves: 539790409205242,
+            real_quote_reserves: 283059677,
+            token_total_supply: 1000000000000000,
+            complete: false,
+            creator: KeyBytes(
+                "2M4PeVPp5ocdST1voK1eWC9Qhf7HuuuFinPGw5rHcc7G",
+            ),
+            is_mayhem_mode: false,
+            is_cashback_coin: false,
+            quote_mint: KeyBytes(
+                "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB",
+            ),
+        },
+    ),
+}

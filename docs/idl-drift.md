@@ -2,29 +2,44 @@
 
 `idl-drift` compares two versions of a Solana program IDL. It puts each change in a tier,
 by its effect on a parser that was generated from the old IDL. `idl-drift source` checks
-the program id of an Anchor workspace.
+the program id of an Anchor workspace. `idl-drift stale` and `idl-drift watch` check the
+chain for a program upgrade with no IDL update, and for a new on-chain IDL.
 
 ## Commands
 
 ```text
-idl-drift diff [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <OLD> <NEW>
-idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] <PROGRAM> <NEW>
-idl-drift inspect [--layout] <IDL>
+idl-drift diff [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] [--write-allow <FILE> [--prune-allow]] [--suggest-version] <OLD> <NEW>
+idl-drift diff --onchain [--rpc <URL>] [--source <SOURCE>] [--json | --markdown] [--fail-on <TIER>] [--allow <FILE>] [--write-allow <FILE> [--prune-allow]] [--suggest-version] <PROGRAM> <NEW>
+idl-drift inspect [--layout] [--for <FRAMEWORK>]... <IDL>
 idl-drift source [--idl <PATH>]... [--onchain [--rpc <URL>]] [--json | --markdown] [--fail-on <TIER>] [<ROOT>]
+idl-drift stale [--rpc <URL>] [--source <SOURCE>] [--json | --markdown] <PROGRAM>...
+idl-drift watch --programs <FILE> [--state <FILE>] [--once | --interval <SECS>] [--webhook <URL>] [--rpc <URL>] [--json] [--save-onchain <DIR>]
 ```
 
 | Option | Command | Meaning |
 |---|---|---|
-| `--json` | `diff`, `source` | Print the report as JSON. See [JSON output](#json-output). |
-| `--markdown` | `diff`, `source` | Print the report as GitHub Markdown. It cannot be combined with `--json`. See [Markdown output](#markdown-output). |
+| `--json` | `diff`, `source`, `stale` | Print the report as JSON. See [JSON output](#json-output). |
+| `--json` | `watch` | Print each event as one line of JSON. See [watch](#watch). |
+| `--markdown` | `diff`, `source`, `stale` | Print the report as GitHub Markdown. It cannot be combined with `--json`. See [Markdown output](#markdown-output). |
 | `--fail-on <TIER>` | `diff`, `source` | The lowest tier that sets exit code 1. Values: `breaking` (default), `dangerous`, `additive`, `cosmetic`. |
 | `--allow <FILE>` | `diff` | Changes that you accept. They do not set exit code 1. See [Allow file](#allow-file). |
+| `--write-allow <FILE>` | `diff` | Write an allow file that accepts each change at or above `--fail-on`. See [Baseline](#baseline). |
+| `--prune-allow` | `diff` | With `--write-allow`: also remove the entries of the `--allow` file that match no change. See [Baseline](#baseline). |
+| `--suggest-version` | `diff` | Also print the version bump that a crate generated from OLD needs. See [Version advice](#version-advice). |
 | `--onchain` | `diff` | Read the first argument as a program id, and use the IDL that the program publishes on chain as the old IDL. See [On-chain IDL](#on-chain-idl). |
 | `--onchain` | `source` | Also check the chain. See [Chain check](#chain-check). |
-| `--rpc <URL>` | `diff`, `source` | The JSON-RPC URL for `--onchain`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
+| `--rpc <URL>` | `diff`, `source`, `stale`, `watch` | The JSON-RPC URL for `--onchain`, `stale` and `watch`. Use the `IDL_DRIFT_RPC_URL` environment variable in its place: `ps` and the shell history show a URL on the command line. |
 | `--source <SOURCE>` | `diff` | With `--onchain`, the account to read: `metadata` (the Program Metadata program) or `anchor` (the Anchor IDL account). |
+| `--source <SOURCE>` | `stale` | Count only this IDL account: `metadata` or `anchor`. See [stale](#stale). |
 | `--layout` | `inspect` | Also print each zero-copy type field by field, with its gaps and both sizes. |
+| `--for <FRAMEWORK>` | `inspect` | Also list what the code generator of the framework rejects, changes or drops: `shipstern` or `carbon`. Give it again for the other framework. See [Framework checks](#framework-checks). |
 | `--idl <PATH>` | `source` | One more IDL to check, such as a published copy outside `target/idl`. Give it again for more IDLs. |
+| `--programs <FILE>` | `watch` | The programs to watch, with the local IDL of each. See [watch](#watch). |
+| `--state <FILE>` | `watch` | The slots that the last check saw, kept between runs. |
+| `--once` | `watch` | Check one time and exit, for cron and CI. |
+| `--interval <SECS>` | `watch` | Seconds between two checks. Default: 60. |
+| `--webhook <URL>` | `watch` | POST each change event as JSON to this URL. Use the `IDL_DRIFT_WEBHOOK_URL` environment variable in its place when the URL holds a secret. |
+| `--save-onchain <DIR>` | `watch` | Write the JSON text of each on-chain IDL that a change event reads to `DIR/<program>-<source>.json`. |
 
 Colors are on only when stdout is a terminal. Set `NO_COLOR` to turn them off.
 
@@ -140,6 +155,35 @@ item, so it is Breaking also when the array is the last field. Changes that canc
 Cosmetic, for example a converter that removes `packed` from an account and from each type
 in it.
 
+### Reserved bytes
+
+Many programs add a field with the bytes of a reserved array, so that the account keeps its
+size. A parser built from the new IDL then reads the old bytes as the new field, so the
+upgrade is safe only if these bytes are zero in existing data: the accounts on chain, or
+the old instructions and events that an indexer reads again. idl-drift reports this as one
+Dangerous `reserved_bytes_used` change, with the subject of the reserved field (`Pool#1`)
+and the bytes that each new field takes, in place of the Breaking field changes. All of
+these must be true:
+
+- The old struct has a `[u8; N]` field with a reserved name: `reserved`, `padding`, `pad`,
+  `unused` or `spare`, in any ASCII case, after leading `_` and a trailing number (with or
+  without one `_`) are removed. So `_reserved`, `padding_0` and `_padding1` match, and
+  `reserves`, `reserved_fee` and `padding_before_x` do not.
+- At its position, the new struct has one or more new fields, and can have new reserved
+  `[u8; M]` arrays that keep the other bytes. A new field has a name that the old struct
+  does not use.
+- Each field in its place has a fixed Borsh size, and the sizes add up to N. So a new
+  `Option` field does not count.
+- Every other field keeps its name, its type and its position.
+- When a zero-copy account holds the struct, in either IDL, the `repr(C)` layout keeps
+  its size, its alignment and the offset of each other field, and no padding opens inside
+  the N bytes.
+
+Otherwise the struct gets the usual field changes, for example new fields that do not fit,
+that move a later field, or a struct with another change. New fields in two reserved
+arrays of one struct also get the usual field changes. To check the bytes on live accounts,
+run [`idl-verify --upgrade-impact --compare-idl`](idl-verify.md#upgrade-impact).
+
 ### Discriminator dispatch
 
 A Codama IDL can list more than one discriminator, and the Codama spec says that all of
@@ -222,6 +266,8 @@ Two rules follow Shipstern's dispatch:
   routes each instruction to itself. This changes the dispatch order.
 - `serialization` or `repr` changed, no field moves, but the zero-copy size changes
   (trailing padding).
+- New fields take the bytes of a reserved array (`reserved_bytes_used`). See
+  [Reserved bytes](#reserved-bytes).
 - An error was removed or renumbered, or a new error name took an old code. An indexer
   names the `Custom(code)` of a failed transaction from the IDL's errors.
 
@@ -263,7 +309,7 @@ which can change.
 | | `event_added` | Additive |
 | Defined types | `type_removed`, `type_undefined` | Breaking |
 | | `type_kind_changed`, `field_added`, `field_removed`, `field_changed`, `field_moved`, `variant_inserted`, `variant_removed`, `variant_moved`, `variant_tag_changed`, `variant_payload_changed`, `enum_tag_changed`, `alias_changed` | Breaking on a reachable type, else Cosmetic |
-| | `field_renamed`, `variant_renamed`, `variant_appended` | Dangerous on a reachable type, else Cosmetic |
+| | `field_renamed`, `variant_renamed`, `variant_appended`, `reserved_bytes_used` | Dangerous on a reachable type, else Cosmetic |
 | | `layout_changed` | Breaking, Dangerous or Cosmetic. See [Zero-copy types](#zero-copy-types). |
 | Errors | `error_removed`, `error_renumbered`, `error_code_reused` | Dangerous |
 
@@ -303,10 +349,102 @@ The `#` in `Pool#1` is part of the subject, because no space comes before it.
 - A line with no subject, or a rule name that idl-drift does not have, stops the run with
   exit 2. Thus a typo cannot let a change through.
 
+### Baseline
+
+`--write-allow <FILE>` writes an allow file that accepts each change at or above `--fail-on`
+that is not allowed yet. Use it to start a CI gate on a repository with many IDLs, or to
+accept the drift that a parser crate already handles.
+
+- FILE gets one `<rule> <subject>` line for each change, in report order (Breaking first),
+  with no duplicates. A new file starts with a comment of two lines.
+- If FILE exists, give the same path with `--allow` too. The run then keeps each line and
+  comment of the file, and adds the new entries at the end. An entry that matches no change
+  stays, and gets the usual warning. Any other existing file stops the run with exit 2, and
+  the file does not change. With `--allow A --write-allow B`, B starts with the lines of A.
+- `--prune-allow` also removes the entries that match no change, with their comments on the
+  same line. Their warnings end with `--prune-allow removed it`, and the JSON report lists
+  them in `pruned_allows`.
+- FILE must be in a directory that exists and that idl-drift can write to. For a symlink,
+  this is the directory of its target. The run checks this with a temp file before it reads
+  the IDLs or the chain.
+- The write goes to a new temp file in the same directory, and a rename replaces FILE. Thus
+  a reader never sees a part of the file. When FILE is a symlink, its target gets the text
+  and the link stays. The new file keeps the permissions of the old one.
+- The report, `--suggest-version` and the exit code are then the ones that `--allow FILE`
+  gives, so the run exits 0. The JSON report has `unused_allows`.
+- An allow file cannot hold a subject with a line break (`\n`, `\r`, U+000B, U+000C, U+0085,
+  U+2028 or U+2029), a `#` after a space, or a space at one end. Such a change is not written:
+  a warning names it, with hidden characters as `\u{..}`, and it still sets exit code 1.
+- Then `idl-drift diff --allow FILE` with the same inputs and the same `--fail-on` exits 0.
+  It warns only about the entries that matched no change before. A second
+  `--allow FILE --write-allow FILE` run does not change FILE.
+
+A CI gate for many IDLs, each with the IDL that its parser crate was generated from:
+
+```bash
+# One time: accept the drift that the parsers handle now, and commit the allow files.
+for idl in idls/*.json; do
+  name=$(basename "$idl" .json)
+  idl-drift diff "parsers/$name/idl.json" "$idl" --write-allow "parsers/$name/drift.allow"
+done
+
+# In CI: each new change fails the job.
+for idl in idls/*.json; do
+  name=$(basename "$idl" .json)
+  idl-drift diff "parsers/$name/idl.json" "$idl" --allow "parsers/$name/drift.allow" || fail=1
+done
+exit "${fail:-0}"
+```
+
+After a review, run `--allow FILE --write-allow FILE` to add the new changes. Add
+`--prune-allow` to remove the entries that no longer match. Do not give `--write-allow` in
+the CI gate: it accepts each change, so the gate always passes.
+
+## Version advice
+
+`--suggest-version` adds the version bump that a crate generated from OLD needs, such as a
+Shipstern parser crate or a Carbon decoder crate. The bump comes from the highest tier of
+all the changes:
+
+| Highest tier | Bump | x.y.z, x of 1 or more | 0.y.z |
+|---|---|---|---|
+| Breaking | `major` | (x+1).0.0 | 0.(y+1).0 |
+| Dangerous | `major` | (x+1).0.0 | 0.(y+1).0 |
+| Additive | `major` | (x+1).0.0 | 0.(y+1).0 |
+| Cosmetic | `patch` | x.y.(z+1) | 0.y.(z+1) |
+| No change | `none` | no new version | no new version |
+
+- Breaking changes alter the bytes that the crate decodes. Dangerous changes keep the
+  positions and tags, but the generated code must grow (a new enum variant or account) or
+  its Rust names change (a renamed field or program). Thus code that uses the crate can
+  fail to compile.
+- The Additive rules are `instruction_added`, `account_type_added` and `event_added`. Each
+  adds a variant to the instruction, account or event enum of the crate. Shipstern parsers
+  and Carbon decoders do not mark these enums `#[non_exhaustive]`, so a `match` on the enum
+  in user code fails to compile. No rule adds an item without a new variant, so idl-drift
+  gives no `minor` bump. A later version can add values.
+- A Cosmetic change alters no byte that a parser reads. It can still alter a generated type
+  that no parser reads. Check the generated code if your crate exports such types.
+- Cargo reads the first part that is not zero as the major part. For 0.y.z, y is the
+  major part. Cargo reads each 0.0.z as incompatible.
+- Allowed changes count too: an allow entry sets only the exit code, and the generated
+  crate changes all the same. Thus a baseline does not lower the bump.
+- The bump does not change the exit code.
+
+The human report adds `suggested version bump: major (a 0.y.z crate bumps y)` before the
+exit code, and the Markdown report adds a `Suggested version bump` line. In a script, read
+the JSON key:
+
+```bash
+idl-drift diff old.json new.json --json --suggest-version | jq -r .suggested_bump
+```
+
 ## Exit codes
 
 The exit codes are in the [README](../README.md#exit-codes). A reader that closes
-the pipe early, such as `head`, does not change the exit code.
+the pipe early, such as `head`, does not change the exit code. With `inspect --for`, a
+`SHIPSTERN:` or `CARBON:` line of that framework also sets exit code 1; a `CARBON NOTE:` line
+does not.
 
 ## JSON output
 
@@ -317,7 +455,9 @@ the pipe early, such as `head`, does not change the exit code.
 | `changes` | Each change, with `severity`, `kind`, `subject` and `message`. An allowed change also has `"allowed": true`. |
 | `breaking`, `dangerous`, `additive`, `cosmetic` | The messages of each tier, other than allowed changes. |
 | `counts` | The number of changes in each tier, other than allowed changes. |
-| `unused_allows` | Only with `--allow`: the entries that match no change, each with `line`, `rule` and `subject`. |
+| `unused_allows` | Only with `--allow` or `--write-allow`: the entries that match no change, each with `line`, `rule` and `subject`. |
+| `pruned_allows` | Only with `--prune-allow`: the entries that the run removed from the allow file, with the same keys. |
+| `suggested_bump` | Only with `--suggest-version`: `major`, `patch` or `none`. See [Version advice](#version-advice). |
 | `exit_code` | The same value as the process exit code. |
 
 `counts` and the tier lists do not include allowed changes, so they agree with the exit
@@ -431,7 +571,101 @@ Shipstern selects an instruction or an account type by its first discriminator o
   field discriminator that is not fixed-size bytes with a bytes default value, or a constant
   that is not an unsigned number or bytes.
 
-These lines do not change the exit code, because other parsers read these IDLs.
+These lines do not change the exit code, because other parsers read these IDLs. With
+`--for shipstern`, they set exit code 1.
+
+### Framework checks
+
+`inspect --for shipstern` and `inspect --for carbon` tell you, before you generate a parser,
+which parts of the IDL the generated parser rejects, reads wrong or drops. Without `--for`,
+the output and the exit code do not change. Each framework prints its lines once, in the
+order of the options, after the Shipstern warnings.
+
+`--for shipstern` predicts errors of Shipstern's Anchor converter (codama-from-anchor, at
+Shipstern 84ad2363). One such error stops `include_shipstern_parser!` with `compile_error!`.
+Each line names the item, the reason, and the converter error in brackets:
+
+```text
+parts that include_shipstern_parser! rejects: 6
+SHIPSTERN: type BankOperationalState: is in zero-copy memory, but its layout cannot be computed (UnknownLayout)
+...
+```
+
+The checks are `UnsupportedSpec`, a missing `discriminator` (`Json`), `NotAnchor`,
+`MissingAddress`, `LegacyUnsupported`, a missing legacy `version` (`Legacy`),
+`UnknownLayout`, `PaddedBorshType`, `TypeMissing`, `EmptyDiscriminator`, `TypeNotStruct`,
+`InvalidName`, `DiscriminatorArgument`, `UnrecognizedType`, `UndefinedType`,
+`GenericArgsMissing`, `GenericTypeMissing`, `GenericEnum`, `GenericArgMissing`,
+`InvalidArrayLength`, `RecursionLimit`, `TooLarge`, `VariableSizeCOption`,
+`FixedTypeTooLarge`, `NameCollision`, `AmbiguousDiscriminator`, `DuplicateDiscriminator` and
+`ConflictingFlattenedArguments`. `inspect` expands generic types with their arguments, as
+the converter does, and counts type nodes to find `TooLarge`. The converter counts JSON
+nodes, so its count is higher, and an IDL near the limit of 100000 nodes can pass here and
+fail there. Sizes stop at 128 levels of nesting, as in the converter.
+
+It does not predict other `Json` errors (a JSON shape that the converter cannot read), other
+`Legacy` errors (Anchor's own upgrade of a legacy IDL), or `InlineEnum`. An IDL that
+idl-drift cannot read exits 2 before the check. So exit code 0 does not prove that the macro
+compiles.
+
+Shipstern uses Codama JSON as it is, so a Codama IDL gives no converter line. For a Codama
+IDL, `--for shipstern` predicts the panics of the macro (Shipstern 0.13.0) on the tag of a
+defined enum, with the rule `EnumTag`:
+
+- a variant with an explicit discriminator that is not its position
+- a tag size in a wrapper node, such as `preOffsetTypeNode`
+- a `shortU16` tag with more than 128 variants
+- an `f32` or `f64` tag
+
+Shipstern 0.12 does not have these checks. It reads each such tag as a `u8`, so its parser
+reads wrong values.
+
+The lines come in the order that the converter checks. The converter stops at its first
+error, so it reports only the first line. A `SHIPSTERN:` line of either kind sets exit code 1
+with `--for shipstern`.
+
+`--for carbon` lists each place where carbon-cli does not follow the IDL. A Codama IDL goes
+through `carbon-cli --standard codama`; any other IDL goes through the Anchor path. There are
+two kinds of lines:
+
+- `CARBON:` the generated decoder reads bytes wrong or drops data, or carbon-cli cannot
+  generate a decoder that compiles. These lines set exit code 1.
+- `CARBON NOTE:` the generated code changes, but the decoded values stay the same, or
+  carbon-cli needs an option. These lines do not change the exit code.
+
+```text
+parts that carbon-cli misreads, drops or cannot generate: 1
+CARBON: event adminSetCreatorEvent: not a supported event-CPI shape, so carbon-cli skips every event
+carbon-cli changes that keep the decoded values: 1
+CARBON NOTE: program: no base58 program id in `address` or `metadata.address`, so carbon-cli stops unless --program-id is given
+```
+
+The `CARBON:` checks: a `COption`, or an option with another tag or a fixed size, read as a
+`u8` tag; a zero-copy account with `repr(C)` padding, read as Borsh; a legacy event whose name
+is not its Rust type name; two instruction accounts with one `snake_case` name (account groups
+add no prefix); an account, instruction or event with the same check as one that the decoder
+tries first, when that one needs no more accounts than the later instruction sends; a spec
+0.1.0 type with `{"generic": ...}` or an alias of kind `type`, which nodes-from-anchor cannot
+read; an array length that is not a number, which gives Rust that does not compile; the
+accounts of a Shank IDL, which get no discriminator; big-endian numbers; `shortU16`; a bool
+wider than one byte; strings, bytes and collections whose length is not a `u32` prefix;
+fixed-size wrappers around a type of another size; zeroable and remainder options; hidden
+prefixes and suffixes, offsets and sentinels; inline enums; an inline struct in an enum
+variant, as an instruction argument, or inside an option, a collection or a tuple (except the
+item of an array argument, which carbon-cli names); enum tags that are not `u8` or not the variant
+position; field discriminators, which get no check; no discriminator when the program has two
+items of the kind; skipped bytes that are not the removed discriminator field, when fields
+are left to read; discriminator values that carbon-cli cannot turn into bytes; and events that
+carbon-cli cannot frame, which make it skip every event.
+
+The `CARBON NOTE:` checks: no program id, an inline struct field, a fixed-size wrapper
+around a type of the same size, a tuple of one bool, no discriminator on the only item of its
+kind, and discriminators that the decoder does not check.
+
+The `CARBON` lines follow carbon-cli at commit a64db3c (2.0.0) and the Anchor converter that
+it calls, `@codama/nodes-from-anchor` 1.2.1, from their TypeScript source. They are not checked
+against carbon-cli output. Not checked: other shapes that nodes-from-anchor cannot read, and
+the legacy (pre-0.30) Anchor path past its events and Shank accounts.
 
 ### --layout
 
@@ -640,13 +874,164 @@ On exit 2, stdout holds only `{"error": "<message>", "exit_code": 2}`, as for `d
 `--markdown` prints a heading with ROOT, the counts, the exit code, a table of the ids and a
 table of the findings. `source` has no allow file.
 
+## stale
+
+`stale` tells whether the IDL that a program publishes on chain is older than the program's
+code. A program upgrade often comes with no IDL update, and a parser built from the on-chain
+IDL then reads the new data with the old layout.
+
+```bash
+export IDL_DRIFT_RPC_URL=https://api.mainnet-beta.solana.com
+idl-drift stale 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH
+```
+
+For each program, `stale` reads two slots:
+
+- The slot of the last deploy. The upgradeable loader keeps it in the ProgramData account,
+  and loader v4 at the start of the program account.
+- The slot of the last write to each IDL account (see [On-chain IDL](#on-chain-idl)): the
+  slot of the newest successful transaction among the newest 100 that
+  `getSignaturesForAddress` gives for the account. A failed transaction wrote nothing.
+
+An IDL account is stale when a deploy came after its last write. A write in the slot of the
+deploy counts as fresh.
+
+| Status | JSON `status` | Meaning |
+|---|---|---|
+| stale | `stale` | At least one IDL account that counts is stale. |
+| no on-chain IDL | `no_idl` | The program has no IDL account that counts. |
+| fresh | `fresh` | No IDL account that counts is stale. |
+| error | `error` | The program could not be checked: no account at the address, a loader that keeps no deploy slot (loader v1 or v2, or a closed upgradeable program), no successful transaction among the newest 100 of an IDL account, or a failed request. |
+
+With no `--source`, both IDL accounts count, because a reader of the old one gets the old IDL.
+A program that moved to the Program Metadata IDL can keep an old Anchor IDL account: give
+`--source metadata` to count only the account that your parser reads. The report gives the
+slot and the status of each account.
+
+```text
+no on-chain IDL  675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8  deploy slot 445763204
+stale  dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH  deploy slot 429731225; Program Metadata account 7DuBKBbixzCJEFgvAxpt7MCUuSwuY854iYJ4BLpzPEVt last written in slot 429731225 (fresh); Anchor IDL account 8BKPjRu7Hvd6Y2J67EdLx9MsrZFQwEMVwYg7NeVbAPF8 last written in slot 384474599 (stale)
+summary: 1 stale, 0 fresh, 1 no on-chain IDL, 0 errors
+exit code: 1
+```
+
+### Extend check
+
+`ExtendProgram` also sets the slot that the upgradeable loader keeps, with no new code. So
+when an IDL write is older than that slot, `stale` reads what wrote the slot. It lists the
+successful transactions that name the ProgramData account, from that slot down to the oldest
+IDL write, and reads the loader instructions in each one, also the inner ones of a multisig.
+
+| JSON `extend_check` | Meaning |
+|---|---|
+| `{"result": "upgrade"}` | An `Upgrade` or a `DeployWithMaxDataLen` wrote the slot. |
+| `{"result": "extend", "upgrade_slot": null}` | An `ExtendProgram` wrote the slot, and no upgrade came after the IDL write. The IDL is fresh. |
+| `{"result": "extend", "upgrade_slot": <SLOT>}` | An `ExtendProgram` wrote the slot. An IDL account is stale when its last write is before `<SLOT>`, the newest upgrade. |
+| `{"result": "unknown"}` | The check stopped at its limit, `getTransaction` gave no transaction (a pruned one), or the history of the ProgramData account ended above the IDL write. The slot can be an extend, and the status is stale. |
+
+Other programs can name a ProgramData account in many transactions, so the check reads at
+most 3 pages of 1000 signatures and 10 transactions, and 2 more requests to start the list
+at the slot. The human report adds `(an ExtendProgram; ...)` or `(can be an ExtendProgram)`
+after the deploy slot. Loader v4 has no extend, and `extend_check` is not in the report when
+the check did not run.
+
+On the public mainnet RPC, a stale program with one IDL account costs about 8 requests,
+130 KB and 5 to 8 s (pump.fun and voltr_vault on 2026-11-12). A fresh program needs no extend
+check, so it costs 4 requests.
+
+### Exit codes and output of stale
+
+`stale` exits 0 when each program is fresh, 1 when at least one is stale or has no on-chain
+IDL, and 2 when at least one could not be checked or an option is wrong. A program that
+fails does not stop the others. `--json` prints one object:
+
+| Key | Content |
+|---|---|
+| `programs` | One object per program, in the order given: `program`, `status`, and `deploy_slot`, `extend_check` and `idls` (each with `source`, `account`, `slot` and `status`), or `error`. |
+| `counts` | The number of programs per status: `fresh`, `stale`, `no_idl` and `error`. |
+| `exit_code` | The same value as the process exit code. |
+
+`--markdown` prints the counts, the exit code, a table with one row per IDL account, and the
+programs that could not be checked.
+
+The newest successful transaction that names an IDL account counts as its last write. A
+later transaction that only names the account, such as a lamport transfer to it, makes a
+stale IDL look fresh. A stale result means only that no transaction named the IDL account
+after the deploy. The deploy can keep the interface, so a stale IDL can still be correct:
+run `idl-verify` on live data to know.
+
+## watch
+
+`watch` checks a list of programs for a new deploy or a new on-chain IDL. On each change it
+diffs the on-chain IDL with the local IDL that your parser uses, and prints one event.
+
+```bash
+idl-drift watch --programs programs.txt --state state.json --once --json
+idl-drift watch --programs programs.txt --interval 300 --webhook "$HOOK_URL"
+```
+
+The programs file has one `<program> <local IDL path>` per line. A third field, `metadata`
+or `anchor`, picks the IDL account: it is the IDL that the line diffs, and the only account
+that its stale check counts. A program with both accounts needs it. `#` starts a comment. A
+relative path is relative to the directory of the programs file. A path cannot hold a space.
+
+```text
+# program                                      local IDL               source
+6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P    idls/pump.json
+dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH    idls/drift.json         anchor
+```
+
+Each check reads the deploy slot and the IDL write slots of each line, as [stale](#stale)
+does. When one of them is not the one in the state, `watch`:
+
+1. Runs the [extend check](#extend-check) when it applies, and reads the on-chain IDL,
+   unless the program has none.
+2. Diffs the local IDL (old) with the on-chain IDL (new), with the rules of `diff`.
+3. Prints one change event. With `--webhook`, it also POSTs the event as JSON, with a 10 s
+   limit.
+4. Keeps the new slots in the state. With `--state`, it writes the state file in one step
+   after each check.
+
+The first check of a line has no state, so it prints an event for the line. A failed RPC
+request, a local IDL that cannot be read, or a failed POST keeps the old slots for the line,
+so the next check tries again. The webhook can get the same event two times.
+
+A change event, on one line with `--json`:
+
+```json
+{"event": "change", "program": "<PROGRAM>", "idl": "idls/pump.json", "idl_path": "<DIR>/idls/pump.json",
+ "previous": {"deploy_slot": 458921440, "idls": [{"source": "anchor", "account": "<ACCOUNT>", "slot": 446492745}]},
+ "deploy_slot": 458921441, "extend_check": {"result": "upgrade"}, "status": "stale",
+ "idls": [{"source": "anchor", "account": "<ACCOUNT>", "slot": 446492745, "status": "stale"}],
+ "onchain": {"source": "anchor", "account": "<ACCOUNT>", "saved": "<DIR>/<PROGRAM>-anchor.json"},
+ "diff": {"changes": [], "counts": {"breaking": 0, "dangerous": 0, "additive": 0, "cosmetic": 0}, "highest": null}}
+```
+
+`previous` is null on the first check. `onchain` and `diff` are null when the program has no
+on-chain IDL. `diff.changes` has the shape of `changes` in [JSON output](#json-output), and
+`diff.highest` is the highest tier, or null. `deploy_slot`, `extend_check`, `status` and
+`idls` are as in the JSON output of [stale](#exit-codes-and-output-of-stale). `onchain.saved`
+is there only with `--save-onchain`. A line that fails prints `error: <program> <idl>: <message>` on stderr, and
+with `--json` also `{"event": "error", "program", "idl", "idl_path", "error"}` on stdout.
+Only change events go to the webhook.
+
+`watch --once` exits 0 when each line was checked, and 2 when a line or the webhook failed,
+or the programs file, the state file or an option is wrong. Without `--once`, it runs until
+it is stopped. The state file has `version` 1, and a list of `programs`, each with
+`program`, `idl` (as the programs file gives it), `deploy_slot` and `idls`. Lines that are
+no longer in the programs file drop out of it.
+
 ## Library
 
 The `idl_drift` crate exposes the same functions as the CLI. An example is in the
 [crate README](../crates/idl-drift/README.md). `idl_drift::model` holds the IDL model that
-both tools use. `idl_drift::layout` calculates zero-copy layouts. `idl_drift::inspect` holds
+both tools use. `idl_drift::layout` calculates zero-copy layouts.
+`idl_drift::diff::reserved_uses` lists the [reserved bytes](#reserved-bytes) that new fields
+take, with the byte range of each field. `idl_drift::inspect` holds
 the functions behind `inspect`. `idl_drift::source` holds the functions behind `source`:
-`discover`, `discover_with_idls`, `read_idl`, `check` and `check_onchain`. Use
+`discover`, `discover_with_idls`, `read_idl`, `check` and `check_onchain`.
+`idl_drift::stale` holds `check`, `observe` and `deploy_slot` behind `stale` and `watch`.
+The programs file and the state file of `watch` are CLI formats, not library API. Use
 `discover_with_idls` for IDLs outside `target/idl`, so that an IDL name finds its crate as
 the CLI does. Before a caller takes a
 report as a pass, it must check `SourceReport::nothing_to_compare`, as the CLI does.

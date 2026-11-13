@@ -1,0 +1,86 @@
+{
+  "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "accounts": [
+    {
+      "pubkey": "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "B5Wd3ZFycRukqVTh7YQjBKh7vjv5GyLwKk7Tj9cPpump",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "EG5xzfSna4WrTGpEHhqbNZgKRWqubpCpdUzUB81KGA7F",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "CsZG6dSPWHra2oqTVA28LvGhAkhHKrniJQp5b7DvZabv",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "AAKHfDvskpxdQME7ME9PPjfZwkkassHUdd5Lrh2dpnba",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "6BXQtKZBHjHA36GDthvfRQkDYyuegesX9nJ7V71JAw7V",
+      "is_signer": true,
+      "is_writable": true
+    },
+    {
+      "pubkey": "11111111111111111111111111111111",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "EXWKpGgSmoRz3XBjq9UqFXAs1UUE4hpaZPTrgNaNwL9f",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "DB7MDwpEmnE7QVFqZoi6oAbhWM9kcSEx9aH9Sj6XFEuf",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+      "is_signer": false,
+      "is_writable": true
+    }
+  ],
+  "data": "33e685a4017f83ad1dadafd5470900000000000000000000"
+}

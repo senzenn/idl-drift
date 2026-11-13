@@ -36,6 +36,9 @@ pub struct Reference {
     pub(crate) label: &'static str,
     /// A failure of the user's own parser or old IDL is an error, not a warning.
     pub(crate) failures_are_errors: bool,
+    /// From [`Self::for_upgrade`]: the old IDL, and the old account type that decoded each
+    /// account sample. The upgrade check reads reserved bytes with them.
+    pub(crate) old: Option<(Box<Idl>, Vec<Option<String>>)>,
 }
 
 /// One reference decode.
@@ -105,6 +108,7 @@ impl Reference {
             honors_padding: false,
             label: "the reference decoder",
             failures_are_errors: false,
+            old: None,
         })
     }
 
@@ -121,6 +125,7 @@ impl Reference {
             honors_padding: true,
             label: "the decoder under test",
             failures_are_errors: true,
+            old: None,
         }
     }
 
@@ -196,6 +201,27 @@ impl Reference {
         Self {
             label: "the old IDL",
             ..Self::from_decoder(accounts, instructions, events)
+        }
+    }
+
+    /// For [`crate::verify_upgrade`]: [`Self::from_idl`] on the account samples only. It keeps
+    /// `old` and the old account type of each sample, so that the upgrade check also reads the
+    /// reserved bytes that new fields of `new` take.
+    #[must_use]
+    pub fn for_upgrade(old: &Idl, new: &Idl, samples: &Samples) -> Self {
+        let accounts = Samples {
+            accounts: samples.accounts.clone(),
+            ..Samples::default()
+        };
+        let theirs = Classifier::new(old);
+        let account_types = accounts
+            .accounts
+            .iter()
+            .map(|sample| Some(old.accounts[theirs.account(&sample.data)?].name.clone()))
+            .collect();
+        Self {
+            old: Some((Box::new(old.clone()), account_types)),
+            ..Self::from_idl(old, new, &accounts)
         }
     }
 }
@@ -292,7 +318,7 @@ mod tests {
     use super::*;
     use crate::classify::EVENT_IX_TAG;
     use crate::report::Severity;
-    use crate::samples::{EventSource, InstructionSample};
+    use crate::samples::{AccountSample, EventSource, InstructionSample};
     use crate::testing::idl;
 
     fn voltr(file: &str) -> String {
@@ -335,6 +361,71 @@ mod tests {
         );
     }
 
+    /// (compared, matched) for accounts and instructions, and the error messages.
+    fn compare_idl(old: &Idl, new: &Idl, samples: &Samples) -> ((usize, usize), Vec<String>) {
+        let report = crate::verify(new, samples, Some(&Reference::from_idl(old, new, samples)));
+        let errors = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .map(|f| f.message.clone())
+            .collect();
+        let r = report.reference.unwrap_or_default();
+        (
+            (
+                r.accounts_compared + r.instructions_compared,
+                r.accounts_matched + r.instructions_matched,
+            ),
+            errors,
+        )
+    }
+
+    #[test]
+    fn an_f32_in_a_one_field_wrapper_matches_a_bare_f32() {
+        let idl = |f: &str, more: &str| {
+            idl(&format!(
+                r#""instructions":[],"accounts":[{{"name":"Acc","discriminator":[9]}}],
+                    "types":[{{"name":"Acc","type":{{"kind":"struct","fields":[{{"name":"f","type":{f}}}]}}}}{more}]"#
+            ))
+        };
+        let new = idl(r#""f32""#, "");
+        let old = idl(
+            r#"{"defined":{"name":"Price"}}"#,
+            r#",{"name":"Price","type":{"kind":"struct","fields":["f32"]}}"#,
+        );
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "A".into(),
+                data: [&[9][..], &0.5f32.to_le_bytes()].concat(),
+            }],
+            ..Samples::default()
+        };
+        assert_eq!(compare_idl(&old, &new, &samples), ((1, 1), Vec::new()));
+    }
+
+    #[test]
+    fn a_struct_argument_matches_its_fields_as_arguments() {
+        let new = idl(
+            r#""instructions":[{"name":"setParams","discriminator":[1],"accounts":[],
+                "args":[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]}]"#,
+        );
+        let old = idl(
+            r#""instructions":[{"name":"setParams","discriminator":[1],"accounts":[],
+                "args":[{"name":"params","type":{"defined":{"name":"Params"}}}]}],
+               "types":[{"name":"Params","type":{"kind":"struct",
+                "fields":[{"name":"a","type":"u8"},{"name":"b","type":"u8"}]}}]"#,
+        );
+        let samples = Samples {
+            instructions: vec![InstructionSample::new(
+                "sig".into(),
+                vec![1, 5, 6],
+                Vec::new(),
+            )],
+            ..Samples::default()
+        };
+        assert_eq!(compare_idl(&old, &new, &samples), ((1, 1), Vec::new()));
+    }
+
     #[test]
     fn old_idl_with_another_discriminator_is_a_finding() {
         let new = idl(r#""instructions":[{"name":"go","discriminator":[1]}]"#);
@@ -347,6 +438,7 @@ mod tests {
                 data: vec![1, 0],
                 accounts: Vec::new(),
                 flags: None,
+                position: None,
             }],
             ..Samples::default()
         };

@@ -13,6 +13,7 @@ mod instructions;
 mod normalize;
 mod program;
 mod report;
+mod reserved;
 mod text;
 mod types;
 mod zero_copy;
@@ -22,7 +23,8 @@ use std::collections::BTreeSet;
 use crate::model::{Field, Idl};
 
 pub use crate::reach::reachable_types;
-pub use report::{Change, ChangeKind, Report, Severity};
+pub use report::{Bump, Change, ChangeKind, Report, Severity};
+pub use reserved::{ReservedUse, TakenBytes};
 
 /// Diff two IDLs and classify every change.
 ///
@@ -40,6 +42,19 @@ pub fn diff(old: &Idl, new: &Idl) -> Report {
     program::report_generated_name_collisions(&new.instructions, &mut r);
     program::diff_program(old, new, &mut r);
     r
+}
+
+/// Each struct where new fields take the bytes of a reserved `[u8; N]` array and no other field
+/// changes, as [`diff`] reports it with `reserved_bytes_used`. Names are as [`diff`] compares
+/// them: in camelCase when the two IDLs have different formats.
+#[must_use]
+pub fn reserved_uses(old: &Idl, new: &Idl) -> Vec<ReservedUse> {
+    let (old_form, new_form, _) = if old.format == new.format {
+        normalize::same_format_form(old, new)
+    } else {
+        normalize::common_form(old, new)
+    };
+    reserved::all(&old_form, &new_form)
 }
 
 fn diff_names_as_given(old: &Idl, new: &Idl, reached: &normalize::Reached) -> Report {

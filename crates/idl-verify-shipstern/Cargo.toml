@@ -1,0 +1,22 @@
+[package]
+name = "idl-verify-shipstern"
+description = "Run a Shipstern or Vixen generated parser as the decoder under test of idl-verify --decoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solana", "idl", "shipstern", "vixen", "parser"]
+categories = ["development-tools::testing"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+# No Shipstern or Vixen dependency: `serve!` expands in the user's crate, against the user's own
+# core crate, so a git, vendored or older copy never clashes with a copy that this crate adds.
+[dependencies]
+base64.workspace = true
+bs58.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -313,6 +313,7 @@ mod tests {
                 data: data.to_vec(),
                 accounts: keys.iter().map(ToString::to_string).collect(),
                 flags: None,
+                position: None,
             }],
             ..Samples::default()
         }

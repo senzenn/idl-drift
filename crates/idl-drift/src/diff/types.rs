@@ -8,13 +8,14 @@ use super::normalize::{body_types, each_child_mut, rename_generics, Reached};
 use super::text::{
     field_change, field_str, has_unreadable, payload_str, type_change, unreadable_change,
 };
-use super::{names, zero_copy, ChangeKind, FieldEdit, Report, Severity};
+use super::{names, reserved, zero_copy, ChangeKind, FieldEdit, Report, Severity};
 use crate::model::{EnumFields, EnumVariant, Field, GenericParam, Idl, Type, TypeDef, TypeDefTy};
 
 pub(super) fn diff_types(old: &Idl, new: &Idl, (old_reached, reached): &Reached, r: &mut Report) {
     let om = old.type_map();
     let nm = new.type_map();
     let defs = Defs::new(&om, &nm);
+    let readings = reserved::Readings::new(old, new);
     // An old parser reads a type only when the old IDL reaches it too.
     let read_by_both: BTreeSet<String> = reached.intersection(old_reached).cloned().collect();
     let attrs_changed =
@@ -39,7 +40,7 @@ pub(super) fn diff_types(old: &Idl, new: &Idl, (old_reached, reached): &Reached,
         let renamed = with_old_generic_names(ot, nt);
         match (&ot.ty, renamed.as_ref().unwrap_or(&nt.ty)) {
             (TypeDefTy::Struct { fields: of }, TypeDefTy::Struct { fields: nf }) => {
-                diff_fields(name, of, nf, is_reached, &defs, r);
+                diff_fields(name, (of, nf), is_reached, (&defs, &readings), r);
             }
             (
                 TypeDefTy::Enum {
@@ -130,7 +131,7 @@ fn diff_type_kind(name: &str, reached: bool, r: &mut Report) {
 
 /// The body of `nt` with each generic param named as the old param at its position. Args
 /// bind by position, so a renamed param is no change, and a reordered one changes the fields.
-fn with_old_generic_names(ot: &TypeDef, nt: &TypeDef) -> Option<TypeDefTy> {
+pub(super) fn with_old_generic_names(ot: &TypeDef, nt: &TypeDef) -> Option<TypeDefTy> {
     if ot.generics.len() != nt.generics.len() {
         return None;
     }
@@ -182,7 +183,17 @@ fn diff_dangling(old: &Idl, new: &Idl, reached: &BTreeSet<String>, r: &mut Repor
     }
 }
 
-fn diff_fields(ty: &str, of: &[Field], nf: &[Field], reached: bool, defs: &Defs, r: &mut Report) {
+fn diff_fields(
+    ty: &str,
+    (of, nf): (&[Field], &[Field]),
+    reached: bool,
+    (defs, readings): (&Defs, &reserved::Readings),
+    r: &mut Report,
+) {
+    if let Some(used) = reserved::find(ty, of, nf, defs, readings) {
+        reserved::report(&used, reached, r);
+        return;
+    }
     let (old_names, new_names) = (names(of), names(nf));
     for pos in 0..of.len().max(nf.len()) {
         let (severity, kind, change) = match (of.get(pos), nf.get(pos)) {

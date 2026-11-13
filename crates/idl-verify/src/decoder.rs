@@ -179,6 +179,7 @@ mod tests {
                 data: vec![3],
                 accounts: vec!["K".into()],
                 flags: None,
+                position: None,
             }],
             ..Samples::default()
         }

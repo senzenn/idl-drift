@@ -1,5 +1,6 @@
 //! Samples taken from a live cluster over JSON-RPC.
 
+mod timeline;
 mod transaction;
 
 use base64::engine::general_purpose::STANDARD;
@@ -18,10 +19,18 @@ use crate::error::Error;
 use crate::samples::{AccountSample, EventSource, Samples};
 use crate::text::prefix_hex;
 
-pub use transaction::{samples_from_transaction, TransactionSamples};
+pub use timeline::{
+    deploy_history, timeline, Deploy, DeployHistory, FirstError, HistoryEnd, Progress, RangeResult,
+    Timeline, TimelineLimits,
+};
+pub use transaction::{
+    samples_from_transaction, transaction_record, InnerGroup, RecordedInstruction,
+    TransactionRecord, TransactionSamples,
+};
 
-/// How much to take from a live cluster.
+/// How much to take from a live cluster. Start from [`Limits::default`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Limits {
     /// Successful transactions to read at most; failed ones are skipped unread.
     pub max_transactions: usize,
@@ -32,6 +41,9 @@ pub struct Limits {
     pub per_instruction: usize,
     /// Accounts per IDL account type, and per unknown discriminator.
     pub per_type: usize,
+    /// Keep a [`TransactionRecord`] of each transaction that gives a kept sample, for a
+    /// fixture export. Off by default, because a record holds the whole log.
+    pub keep_transactions: bool,
 }
 
 impl Default for Limits {
@@ -41,6 +53,7 @@ impl Default for Limits {
             stall: 40,
             per_instruction: 5,
             per_type: 5,
+            keep_transactions: false,
         }
     }
 }
@@ -82,11 +95,15 @@ impl std::fmt::Display for StopReason {
 
 /// What a live sampling run took, and why it stopped.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Sampled {
     pub samples: Samples,
     /// Successful transactions read.
     pub transactions: usize,
     pub stop_reason: StopReason,
+    /// With [`Limits::keep_transactions`]: the transactions that gave a kept sample, newest
+    /// first.
+    pub records: Vec<TransactionRecord>,
 }
 
 /// Samples of `program_id` from successful transactions, newest first, and the accounts they
@@ -110,6 +127,7 @@ pub fn sample(
     let deployed = deploy_slot(&mut rpc, program_id)?;
     let mut instructions = Vec::new();
     let mut events = Vec::new();
+    let mut records = Vec::new();
     // Accounts of instructions over quota are still sampled.
     let mut keys: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
@@ -150,18 +168,14 @@ pub fn sample(
                 continue;
             }
             failed_pages = 0;
-            // The highest version this parser reads; the RPC refuses newer ones with an error.
-            let tx = rpc(
-                "getTransaction",
-                json!([info.signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
-            )?;
+            let tx = transaction(&mut rpc, &info.signature)?;
             // A node that no longer keeps the transaction returns null: a request with nothing new.
             let new = if tx.is_null() {
                 false
             } else {
                 read += 1;
                 let found = samples_from_transaction(idl, program_id, &tx)?;
-                let mut new = false;
+                let (mut new, mut kept) = (false, false);
                 for ix in found.instructions {
                     for key in &ix.accounts {
                         if seen.insert(key.clone()) {
@@ -170,6 +184,7 @@ pub fn sample(
                     }
                     let (keep, fresh) = quota.take(Group::Instruction, &ix.data);
                     new |= fresh;
+                    kept |= keep;
                     if keep {
                         instructions.push(ix);
                     }
@@ -183,9 +198,13 @@ pub fn sample(
                         ),
                     };
                     new |= fresh;
+                    kept |= keep;
                     if keep {
                         events.push(event);
                     }
+                }
+                if kept && limits.keep_transactions {
+                    records.push(transaction_record(&tx)?);
                 }
                 new
             };
@@ -217,6 +236,7 @@ pub fn sample(
         },
         transactions: read,
         stop_reason,
+        records,
     })
 }
 
@@ -430,53 +450,59 @@ fn multiple_accounts(
     Ok(values)
 }
 
-const LOADER_V3: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
-const LOADER_V4: &str = "LoaderV411111111111111111111111111111111111";
-
 /// The slot of the program's last deploy. `None` for a loader that keeps no slot, or a
 /// program the RPC does not have.
 fn deploy_slot(
     rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
     program_id: &str,
 ) -> Result<Option<u64>, Error> {
-    let mut first_bytes =
-        |address: &str, length: usize| -> Result<Option<(String, Vec<u8>)>, Error> {
-            let config =
-                json!({ "encoding": "base64", "dataSlice": { "offset": 0, "length": length } });
-            let reply = rpc("getAccountInfo", json!([address, config]))?;
-            let Some(account) = Option::<RpcAccount>::deserialize(&reply["value"])
-                .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: {e}")))?
-            else {
-                return Ok(None);
-            };
-            let data = STANDARD
-                .decode(&account.data.0)
-                .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: data: {e}")))?;
-            Ok(Some((account.owner, data)))
-        };
-    let slot_at = |data: &[u8], at: usize| {
-        data.get(at..)
-            .and_then(<[u8]>::first_chunk::<8>)
-            .map(|b| u64::from_le_bytes(*b))
-    };
-    let Some((owner, data)) = first_bytes(program_id, 36)? else {
+    Ok(idl_drift::stale::deploy_slot(rpc, program_id, Error::RpcResponse)?.slot())
+}
+
+/// The owner of the account at `address` and its first `length` bytes of data. `None` when
+/// the RPC does not have the account.
+fn first_bytes(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
+    address: &str,
+    length: usize,
+) -> Result<Option<(String, Vec<u8>)>, Error> {
+    let config = json!({ "encoding": "base64", "dataSlice": { "offset": 0, "length": length } });
+    let reply = rpc("getAccountInfo", json!([address, config]))?;
+    let Some(account) = Option::<RpcAccount>::deserialize(&reply["value"])
+        .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: {e}")))?
+    else {
         return Ok(None);
     };
-    match owner.as_str() {
-        // `LoaderV4State` starts with the slot.
-        LOADER_V4 => Ok(slot_at(&data, 0)),
-        // `UpgradeableLoaderState::Program` (tag 2) names its ProgramData account, which
-        // (tag 3) holds the slot after the tag.
-        LOADER_V3 if data.get(..4) == Some(&[2, 0, 0, 0]) => {
-            let Some(address) = data.get(4..36).map(|k| bs58::encode(k).into_string()) else {
-                return Ok(None);
-            };
-            Ok(first_bytes(&address, 12)?
-                .filter(|(_, d)| d.get(..4) == Some(&[3, 0, 0, 0]))
-                .and_then(|(_, d)| slot_at(&d, 4)))
-        }
-        _ => Ok(None),
+    let data = STANDARD
+        .decode(&account.data.0)
+        .map_err(|e| Error::RpcResponse(format!("getAccountInfo {address}: data: {e}")))?;
+    Ok(Some((account.owner, data)))
+}
+
+/// The `ProgramData` address that an upgradeable loader `Program` account (tag 2) names.
+fn program_data_address(data: &[u8]) -> Option<String> {
+    if data.get(..4) != Some(&[2, 0, 0, 0]) {
+        return None;
     }
+    data.get(4..36).map(|k| bs58::encode(k).into_string())
+}
+
+fn u64_at(data: &[u8], at: usize) -> Option<u64> {
+    data.get(at..)
+        .and_then(<[u8]>::first_chunk::<8>)
+        .map(|b| u64::from_le_bytes(*b))
+}
+
+/// One `getTransaction` result, `json` encoding; null when the RPC no longer keeps it.
+fn transaction(
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value, Error>,
+    signature: &str,
+) -> Result<Value, Error> {
+    // The highest version this parser reads; the RPC refuses newer ones with an error.
+    rpc(
+        "getTransaction",
+        json!([signature, { "encoding": "json", "maxSupportedTransactionVersion": 1 }]),
+    )
 }
 
 /// The `getSignaturesForAddress` maximum per request.
@@ -727,9 +753,9 @@ mod tests {
         let rpc = |method: &str, params: Value| {
             Ok(match method {
                 "getAccountInfo" if params[0] == "Prog" => json!({ "value":
-                    account(LOADER_V3, &[&[2, 0, 0, 0][..], &[7; 32]].concat()) }),
+                    account(idl_drift::stale::LOADER_V3, &[&[2, 0, 0, 0][..], &[7; 32]].concat()) }),
                 "getAccountInfo" if params[0] == programdata.as_str() => json!({ "value":
-                    account(LOADER_V3, &[&[3, 0, 0, 0][..], &100u64.to_le_bytes()].concat()) }),
+                    account(idl_drift::stale::LOADER_V3, &[&[3, 0, 0, 0][..], &100u64.to_le_bytes()].concat()) }),
                 "getSignaturesForAddress" => json!([
                     { "signature": "S1", "err": null, "slot": 102 },
                     { "signature": "S2", "err": null, "slot": 101 },
@@ -835,6 +861,25 @@ mod tests {
     }
 
     #[test]
+    fn keeps_records_only_of_transactions_with_a_kept_sample_and_only_when_asked() {
+        let limits = Limits {
+            per_instruction: 1,
+            keep_transactions: true,
+            ..Limits::default()
+        };
+        // S0 and S1 call `a`, S2 calls `b`: with one sample per kind, S1 adds nothing.
+        let sampled = sample(history(vec![1, 1, 2]), &idl_ab(), "Prog", &limits).unwrap();
+        let records: Vec<(&str, &[u8])> = sampled
+            .records
+            .iter()
+            .map(|r| (r.signature.as_str(), r.instructions[0].data.as_slice()))
+            .collect();
+        assert_eq!(records, [("S0", &[1][..]), ("S2", &[2][..])]);
+        let default = sample(history(vec![1, 2]), &idl_ab(), "Prog", &Limits::default()).unwrap();
+        assert!(default.records.is_empty());
+    }
+
+    #[test]
     fn samples_version_1_transactions() {
         let rpc = |method: &str, params: Value| match method {
             "getSignaturesForAddress" => Ok(json!([{ "signature": "S1", "err": null }])),
@@ -886,10 +931,12 @@ mod tests {
                 }
                 "getTransaction" => {
                     let data = bs58::encode([history[index(&params[0])]]).into_string();
-                    tx(
+                    let mut tx = tx(
                         &["Payer", "Prog"],
                         &json!([{ "programIdIndex": 1, "accounts": [0], "data": data }]),
-                    )
+                    );
+                    tx["transaction"]["signatures"] = json!([params[0]]);
+                    tx
                 }
                 "getAccountInfo" => json!({ "value": null }),
                 _ => json!({ "value": params[0].as_array().unwrap().iter()

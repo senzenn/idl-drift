@@ -30,7 +30,7 @@ This is common:
 
 | You maintain | Your risk | Use |
 |---|---|---|
-| A parser, decoder or indexer (for example with Shipstern or Carbon) | A program upgrade breaks your decoder with no error. | A nightly `idl-verify` run on live data, and `idl-drift diff --onchain`. |
+| A parser, decoder or indexer (for example with Shipstern or Carbon) | A program upgrade breaks your decoder with no error. | A nightly `idl-verify` run on live data, `idl-drift diff --onchain`, and the [runtime guard](https://github.com/senzenn/idl-drift/blob/main/docs/user-guide.md#runtime-guard) in production. |
 | A Solana program | A release breaks the clients, indexers and SDKs of your users. | `idl-drift diff` on each pull request, and `--upgrade-impact` before a deploy. |
 | A Codama IDL made from an Anchor IDL | The conversion moves a field or drops padding. | `idl-drift diff anchor.json codama.json`, then `idl-verify`. |
 
@@ -104,6 +104,9 @@ An `UNMAPPED:` line names a field that neither tool can check. An `UNDEFINED:` l
 type that the IDL uses but does not define. An `UNKNOWN LAYOUT:` line names a zero-copy
 account whose field offsets cannot be computed. A `SHIPSTERN:` line names instructions or
 account types that Shipstern's generated parser cannot use, although the IDL is valid.
+`inspect --for shipstern` or `--for carbon` also lists what that framework's code generator
+rejects, misreads or drops, on `SHIPSTERN:` and `CARBON:` lines that set exit code 1. A
+`CARBON NOTE:` line does not change the exit code ([Framework checks](docs/idl-drift.md#framework-checks)).
 
 ### 2. Compare two versions of an IDL
 
@@ -131,6 +134,9 @@ its Anchor IDL account. Keep the RPC URL out of the command line.
 export IDL_DRIFT_RPC_URL=<your RPC URL>
 idl-drift diff --onchain <PROGRAM_ID> target/idl/my_program.json
 ```
+
+`idl-drift stale <PROGRAM_ID>...` tells whether the on-chain IDL is older than the program's last deploy.
+`idl-drift watch --programs <FILE>` reports each new deploy or on-chain IDL with a diff against your local IDL, and the GitHub Action turns it into a pull request or an issue ([IDL update bot](https://github.com/senzenn/idl-drift/blob/main/docs/ci.md#idl-update-bot)).
 
 ### 4. Check the program id of an Anchor workspace
 
@@ -173,6 +179,18 @@ export IDL_VERIFY_RPC_URL=<your RPC URL>
 idl-verify --idl idl.json --save-samples samples.json
 ```
 
+To check your own parser, not only its IDL, run it as the decoder under test with
+`--decoder`. idl-verify then compares each value of the parser with its own decode of the
+same bytes. One line in a binary of your crate does this: `idl-verify-shipstern` for a
+Shipstern or Vixen parser, `idl-verify-carbon` for a Carbon decoder. See
+[Adapters](https://github.com/senzenn/idl-drift/blob/main/docs/decoder-protocol.md#adapters).
+
+```rust
+fn main() -> std::io::Result<()> {
+    idl_verify_shipstern::serve!(shipstern, my_crate::my_program::AccountParser, my_crate::my_program::InstructionParser)
+}
+```
+
 ### 6. Measure the upgrade impact before a deploy
 
 `--upgrade-impact` reads the live accounts of the program with the new IDL. It counts the
@@ -197,7 +215,7 @@ Both tools use the same exit codes:
 | Code | Meaning |
 |---|---|
 | `0` | No finding at or above `--fail-on`. |
-| `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, a padded zero-copy type that Borsh also reads, or a zero-copy account whose layout cannot be computed. |
+| `1` | At least one finding at or above `--fail-on`. For `inspect`: a field that cannot be resolved, a type that is used but not defined, a padded zero-copy type that Borsh also reads, or a zero-copy account whose layout cannot be computed; with `--for`, also a `SHIPSTERN:` or `CARBON:` line of that framework (not a `CARBON NOTE:` line). |
 | `2` | The tool could not run: a file could not be read or parsed, an option is wrong, an RPC request failed (`diff --onchain`, `source --onchain`, idl-verify), (`source`) the workspace has nothing to compare, or (idl-verify) the decoder failed or nothing was sampled. |
 
 ## Use it in CI

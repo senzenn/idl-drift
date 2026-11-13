@@ -32,6 +32,34 @@ words are its arguments. There is no shell, so quotes and pipes have no special 
 After the last reply, idl-verify stops the decoder process. It stops only that process, so a
 wrapper such as `sh -c` must start the decoder with `exec`.
 
+## Adapters
+
+For a generated parser, you do not have to write the decoder. Two crates serve this protocol
+with one line in a binary of your crate:
+
+| Crate | Parser | The line |
+|---|---|---|
+| [idl-verify-shipstern](../crates/idl-verify-shipstern/README.md) | Shipstern 0.9 to 0.12 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7 (`include_vixen_parser!`) | `idl_verify_shipstern::serve!(shipstern, my_program::AccountParser, my_program::InstructionParser)` |
+| [idl-verify-carbon](../crates/idl-verify-carbon/README.md) | Carbon 2.0 decoders, from crates.io or `carbon-cli` | `idl_verify_carbon::serve!(carbon_pumpfun_decoder::PumpfunDecoder, events = carbon_pumpfun_decoder::instructions::CpiEvent)` |
+
+```rust
+// src/bin/verify-decoder.rs
+fn main() -> std::io::Result<()> {
+    idl_verify_carbon::serve!(carbon_pumpfun_decoder::PumpfunDecoder, events = carbon_pumpfun_decoder::instructions::CpiEvent)
+}
+```
+
+```bash
+cargo build --bin verify-decoder
+idl-verify --idl idl.json --samples samples.json --decoder target/debug/verify-decoder
+```
+
+Neither crate depends on its framework. The macro expands in your crate, against the
+framework crates that you already use, so their versions do not clash. Both send the values
+in the shapes below. A sample that the parser rejects (a Shipstern parse error, a Carbon
+`None`) gets an `error` reply. Events get a `skip` reply when the macro has no event parser.
+The [examples](../examples/decoders/README.md) use both crates.
+
 ## Requests
 
 idl-verify writes one line for each sample to the decoder's stdin: first all accounts, then
@@ -79,7 +107,9 @@ compared.
 For an account, `value` is the decoded account: an object with one key for each field.
 For an instruction or an event, `value` is `{"name":"<name>","data":{...}}`. `name` is the
 instruction or event name. `data` holds the arguments or the event fields. An instruction
-with one struct argument can return the struct itself as `data`, as Shipstern does.
+with one struct argument can return the struct itself as `data`, as Shipstern does. A struct
+argument in one field, as Carbon keeps `params`, also matches an IDL that lists the fields of
+the struct as the arguments.
 
 Write values in serde's plain JSON shapes. idl-verify accepts these forms:
 
@@ -87,7 +117,7 @@ Write values in serde's plain JSON shapes. idl-verify accepts these forms:
 |---|---|
 | Integer, up to 32 bits | A JSON number. |
 | Integer, 64 bits or wider | A JSON number, a decimal string, or `{"bn":"<decimal>"}`. Use a string or `{"bn":...}` for a value that does not fit in a `u64`. |
-| Float | A JSON number, widened to `f64` for an `f32`. NaN can be `null`, as serde writes it. |
+| Float | A JSON number. An `f32` matches when the number narrows to the same `f32`, so its shortest text (`0.1`) and its `f64` widening both match. NaN and infinity can be `null`, as serde writes them. |
 | Pubkey | A base58 string, or an array of its 32 bytes, as serde writes a `Pubkey`. |
 | Bytes | An array of numbers. |
 | Option | `null` for `None`, else the inner value. |

@@ -28,6 +28,8 @@ cargo run -p idl-verify -- --idl IDL --samples SAMPLES
 |---|---|
 | `crates/idl-drift/` | The `idl-drift` crate: IDL model, layouts, diff rules, `inspect`, the program-id check of `source` (`src/source.rs`), CLI. |
 | `crates/idl-verify/` | The `idl-verify` crate: samples, live sampling, runtime decoder, checks, report, CLI. |
+| `crates/idl-verify-shipstern/`, `crates/idl-verify-carbon/` | Adapter crates: `serve!` runs a Shipstern, Vixen or Carbon parser as the decoder under test. `examples/decoders/` uses them. |
+| `crates/idl-verify-fixtures/` | Proc-macro crate: `sample_tests!` makes one test per exported fixture file. `examples/fixture-tests/` uses it. |
 | `fixtures/manual/` | Small old and new IDL pairs, one for each diff rule, and malformed files. |
 | `fixtures/real/` | Real on-chain Anchor IDLs. |
 | `fixtures/shipstern/` | Codama IDLs from Shipstern's integration tests. |
@@ -97,6 +99,29 @@ Problem, Summary of Changes and Testing. Add a line to the `[Unreleased]` sectio
 [CHANGELOG.md](CHANGELOG.md) for each change that users can see.
 
 Do not report a security problem in a public issue. See [SECURITY.md](SECURITY.md).
+
+## Release
+
+1. Set the new version in `Cargo.toml` (`[workspace.package]` and the `idl-drift`
+   dependency), then run `cargo build` to update `Cargo.lock`.
+2. Update the example lockfiles, which record the workspace crates at the workspace version.
+   Without this step, `cargo build --locked` fails in the Examples workflow:
+
+   ```bash
+   cargo update -p idl-verify-shipstern --manifest-path examples/decoders/shipstern/Cargo.toml
+   cargo update -p idl-verify-carbon --manifest-path examples/decoders/carbon/Cargo.toml
+   cargo update -p idl-drift-guard -p idl-drift --manifest-path examples/guard/shipstern/Cargo.toml
+   cargo update -p idl-drift-guard -p idl-drift --manifest-path examples/guard/carbon/Cargo.toml
+   cargo update -p idl-drift-guard -p idl-drift --manifest-path examples/guard/vixen/Cargo.toml
+   cargo update -p idl-verify-fixtures --manifest-path examples/fixture-tests/shipstern/Cargo.toml
+   cargo update -p idl-verify-fixtures --manifest-path examples/fixture-tests/carbon/Cargo.toml
+   ```
+
+3. Move the `[Unreleased]` lines of `CHANGELOG.md` under the new version, and change the
+   version in `README.md`, `docs/ci.md` and `examples/github-actions/`.
+4. After the merge, push the tag `v<version>`; `release.yml` builds the binaries. Publish
+   `idl-drift`, then `idl-verify`, `idl-verify-shipstern`, `idl-verify-carbon` and
+   `idl-drift-guard` and `idl-verify-fixtures`.
 
 ## Add a diff rule
 

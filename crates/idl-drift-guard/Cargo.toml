@@ -1,0 +1,21 @@
+[package]
+name = "idl-drift-guard"
+description = "Count the decode misses of a Shipstern parser or a Carbon decoder per program, and alert at the first bad data after a program upgrade."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solana", "idl", "shipstern", "carbon", "monitoring"]
+categories = ["development-tools::debugging"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+# No Shipstern, Vixen, Carbon or Solana dependency: `guard!` expands in the user's crate, against
+# the user's own framework crates, so their versions never clash with a copy that this crate adds.
+[dependencies]
+idl-drift.workspace = true
+bs58.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,91 @@
+[
+    Instructions {
+        instruction: SellV2 {
+            accounts: SellV2Accounts {
+                global: KeyBytes(
+                    "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+                ),
+                base_mint: KeyBytes(
+                    "DcxyS7wBxdmFecWkd8Y4mi7ZocLPuJjrQ6sxJxxnpump",
+                ),
+                quote_mint: KeyBytes(
+                    "So11111111111111111111111111111111111111112",
+                ),
+                base_token_program: KeyBytes(
+                    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+                ),
+                quote_token_program: KeyBytes(
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                ),
+                associated_token_program: KeyBytes(
+                    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+                ),
+                fee_recipient: KeyBytes(
+                    "AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY",
+                ),
+                associated_quote_fee_recipient: KeyBytes(
+                    "FGptqdxjahafaCzpZ1T6EDtCzYMv7Dyn5MgBLyB3VUFW",
+                ),
+                buyback_fee_recipient: KeyBytes(
+                    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+                ),
+                associated_quote_buyback_fee_recipient: KeyBytes(
+                    "6rVkF4HSgy1jrnC3HogfRgPHrq4CtLg5f11URpsC4i9D",
+                ),
+                bonding_curve: KeyBytes(
+                    "E98AtWDa8whooJTw8nbbfz4oifvTcK7VxfaLb2uV2uEG",
+                ),
+                associated_base_bonding_curve: KeyBytes(
+                    "BubvFxVQHBvWY2d8MBUJmWEgDvyHQMAQnDxW8cfJihup",
+                ),
+                associated_quote_bonding_curve: KeyBytes(
+                    "6HQdxLf78g1qNZsoQNoNcuw5XwFGTPFg5xEyDFYqU5Pb",
+                ),
+                user: KeyBytes(
+                    "HL9rRBGSQRaeCqCXtFcraHBkx2mLBHnGEQpNqiPpuk3b",
+                ),
+                associated_base_user: KeyBytes(
+                    "E2n4jP4dWgpnQcdL19FCvwaavyCnzmt85mPr66fxNxqU",
+                ),
+                associated_quote_user: KeyBytes(
+                    "J44mtcjtPkELYNvm1ywN8V1MGN8G7MpbxurfMsMSyuvA",
+                ),
+                creator_vault: KeyBytes(
+                    "5aTnzXxsDDWndT5JkcGXR9PYd8hMmssXhgpAQfk7Hkja",
+                ),
+                associated_creator_vault: KeyBytes(
+                    "2fEwAwFxMimeRjN7d2uv9UhRVxMgjtpHYygjXrumd2pH",
+                ),
+                sharing_config: KeyBytes(
+                    "2Mxdua7QpRbrZN2rA7w8bRAYM6bhXnYbPv5SpVSF625C",
+                ),
+                user_volume_accumulator: KeyBytes(
+                    "AXpwrQRAs5ZxLDr7dvv1p6PDGkuDN8daMkfCammV6jjT",
+                ),
+                associated_user_volume_accumulator: KeyBytes(
+                    "GeeK8SSS136ZAWEC3d19f37od5BJKbin7tRXU8n7FG6k",
+                ),
+                fee_config: KeyBytes(
+                    "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+                ),
+                fee_program: KeyBytes(
+                    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+                ),
+                system_program: KeyBytes(
+                    "11111111111111111111111111111111",
+                ),
+                event_authority: KeyBytes(
+                    "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+                ),
+                program: KeyBytes(
+                    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+                ),
+                remaining_accounts: [],
+            },
+            args: SellV2Args {
+                amount: 14440104664399,
+                min_sol_output: 0,
+            },
+        },
+    },
+]

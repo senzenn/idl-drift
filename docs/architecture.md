@@ -2,14 +2,21 @@
 
 ## Crates
 
-The repository is a Cargo workspace with two crates. Each crate is a library and a binary.
+The repository is a Cargo workspace with six crates. `idl-drift` and `idl-verify` are each a
+library and a binary. The two adapter crates and the guard crate are libraries only, and
+`idl-verify-fixtures` is a proc-macro crate.
 
 | Crate | Main dependencies | Responsibility |
 |---|---|---|
 | `idl-drift` | `codama-nodes`, `serde`, `sha2`, `flate2`, `curve25519-dalek`, `clap`, `ureq` | The IDL model, layouts, the diff rules, `inspect`, the on-chain IDL reader and the program-id check (`source`). |
 | `idl-verify` | `idl-drift`, `ureq`, `serde`, `clap` | Samples, live sampling, the runtime decoder, the checks and value comparison. |
+| `idl-drift-guard` | `idl-drift` (without `rpc`), `bs58` | Counters of decode outcomes per program, the alert window and Prometheus text. `guard!` wraps a Shipstern or Vixen parser, or a Carbon decoder, in the user's crate. |
+| `idl-verify-shipstern` | `serde_json` | `serve!`: a Shipstern or Vixen parser as the decoder under test, read through `Debug`. |
+| `idl-verify-carbon` | `serde`, `serde_json` | `serve!`: a Carbon decoder as the decoder under test, read through serde. |
+| `idl-verify-fixtures` | `syn`, `quote` | `sample_tests!`: one `#[test]` per exported fixture file, for a Shipstern parser or a Carbon decoder. |
 
-Neither crate depends on the Solana SDK or on Anchor. Both tools read IDLs as JSON.
+No crate depends on the Solana SDK, on Anchor, on Shipstern or on Carbon: each adapter macro
+expands in the user's crate, against the user's framework crates. Both tools read IDLs as JSON.
 idl-verify, and idl-drift with `--onchain`, talk to a cluster over plain JSON-RPC. Without the
 `rpc` feature, the `idl_drift` library has no network code. The feature adds `idl_drift::rpc`,
 the HTTP transport and retry rules that both CLIs use.

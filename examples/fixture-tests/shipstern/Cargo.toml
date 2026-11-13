@@ -1,0 +1,25 @@
+[package]
+name = "shipstern-fixture-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "One test per exported fixture file for a Shipstern parser, with idl-verify-fixtures"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the parser crates stay out of its build and MSRV.
+[workspace]
+
+[dependencies]
+shipstern-core = "=0.12.0"
+shipstern-parser = "=0.12.0"
+shipstern-proc-macro = "=0.12.0"
+borsh = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+shipstern-mock = "=0.12.0"
+idl-verify-fixtures = { path = "../../../crates/idl-verify-fixtures" }
+
+[features]
+# The generated types derive serde only with this feature. Declaring it keeps the
+# `unexpected_cfgs` warning away.
+serde = []

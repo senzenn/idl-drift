@@ -105,6 +105,10 @@ fn shape_rule(ours: &Json, theirs: &Json, path: &mut Vec<String>) -> Shape {
         (Json::Object(a), _) | (_, Json::Object(a)) if is_big_int(a) => (big_int_text(peel(ours))
             != big_int_text(peel(theirs)))
         .then(|| difference(path, ours, theirs)),
+        // An f32 is one value however it is written or wrapped, so both sides compare as f32.
+        (Json::Object(a), _) | (_, Json::Object(a)) if is_f32(a) => {
+            (as_f32(peel(ours)) != as_f32(peel(theirs))).then(|| difference(path, ours, theirs))
+        }
         // serde writes NaN as null.
         (Json::Object(a), Json::Null)
             if a.len() == 1 && a.get("nan") == Some(&Json::Bool(true)) =>
@@ -285,6 +289,16 @@ fn is_big_int(obj: &Map<String, Json>) -> bool {
     obj.len() == 1 && obj.get("bn").is_some_and(Json::is_string)
 }
 
+fn is_f32(obj: &Map<String, Json>) -> bool {
+    obj.len() == 1 && obj.get("f32").is_some_and(Json::is_number)
+}
+
+/// The f32 of a number. `peel` takes a marked f32 out of its marker first.
+#[allow(clippy::cast_possible_truncation)] // The narrowing to f32 is the comparison.
+fn as_f32(value: &Json) -> Option<f32> {
+    value.as_f64().map(|n| n as f32)
+}
+
 /// The decimal text of a big integer in any of its three spellings.
 fn big_int_text(value: &Json) -> Option<String> {
     match value {
@@ -325,6 +339,7 @@ fn short(value: &Json) -> String {
     const MAX: usize = 60;
     let s = match value {
         Json::Object(obj) if is_big_int(obj) => obj["bn"].as_str().unwrap_or_default().to_string(),
+        Json::Object(obj) if is_f32(obj) => obj["f32"].to_string(),
         other => other.to_string(),
     };
     if s.chars().count() <= MAX {
@@ -459,6 +474,24 @@ mod tests {
             None
         );
         assert!(first_difference(&json!({"n": 1.0}), &json!({"n": null})).is_some());
+    }
+
+    #[test]
+    fn an_f32_matches_its_shortest_text_and_its_f64() {
+        let ours = super::super::to_json(&crate::decode::Value::F32(0.1));
+        // `Debug` and serde write 0.1f32 as `0.1`; JavaScript widens it to f64.
+        for theirs in [
+            json!(0.1),
+            json!(f64::from(0.1f32)),
+            json!({"0": 0.1}),
+            ours.clone(),
+        ] {
+            assert_eq!(first_difference(&ours, &theirs), None, "{theirs}");
+        }
+        assert!(first_difference(&ours, &json!(0.2)).is_some());
+        assert!(first_difference(&ours, &json!("0.1")).is_some());
+        // A report shows the number, not the marker.
+        assert_eq!(short(&json!({"f32": 0.5})), "0.5");
     }
 
     #[test]

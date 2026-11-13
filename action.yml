@@ -1,9 +1,9 @@
 name: idl-drift
-description: Diff a Solana program IDL with its old version, check it against real data, or check the program id of an Anchor workspace, and fail the job on drift.
+description: Diff a Solana program IDL with its old version, check it against real data, check the program id of an Anchor workspace, or watch programs for a new on-chain IDL, and fail the job on drift.
 
 inputs:
   command:
-    description: "`diff` compares the IDL with its old version (idl-drift). `source` checks that the Anchor workspace gives one program id (idl-drift source; give the workspace directory in `args` when it is not the current directory). `verify` checks the IDL against real data (idl-verify)."
+    description: "`diff` compares the IDL with its old version (idl-drift). `source` checks that the Anchor workspace gives one program id (idl-drift source; give the workspace directory in `args` when it is not the current directory). `verify` checks the IDL against real data (idl-verify). `watch` checks the programs in `programs` for a new deploy or a new on-chain IDL, then opens a pull request that updates the local IDL for an additive or cosmetic change, or an issue for a breaking or dangerous one (idl-drift watch --once)."
     default: diff
   idl:
     description: "diff and verify: path of the new IDL. Required for them. source: one more IDL to check, such as a published copy outside target/idl."
@@ -14,8 +14,17 @@ inputs:
   program:
     description: "diff: compare with the IDL that this program publishes on chain, in place of `old`. verify: the program to sample. Default: the IDL's address."
     default: ""
+  programs:
+    description: "watch: path of the programs file, one `<program> <local IDL path> [metadata|anchor]` per line. Required for watch."
+    default: ""
+  state:
+    description: "watch: path of the state file that keeps the slots of the last run. Keep it between runs, for example with actions/cache."
+    default: ""
+  token:
+    description: "watch: the token that gh uses to open pull requests and issues. Other commands get no token. In watch, the environment of the run step holds it, and only gh uses it."
+    default: ${{ github.token }}
   rpc-url:
-    description: "JSON-RPC URL for `program` with diff, for live sampling with verify, and for the chain check (`--onchain`) with source. Give a secret. The action masks it and gives it to the tool only in an environment variable."
+    description: "JSON-RPC URL for `program` with diff, for live sampling with verify, for the chain check (`--onchain`) with source, and for watch. Give a secret. The action masks it and gives it to the tool only in an environment variable."
     default: ""
   fail-on:
     description: "The lowest tier (diff and source: breaking, dangerous, additive, cosmetic) or severity (verify: error, warning) that fails the step. Default: breaking for diff and source, error for verify."
@@ -38,7 +47,7 @@ outputs:
     description: 'The `counts` object of the JSON report, such as {"breaking":0,"dangerous":1,"additive":1,"cosmetic":0}. Allowed items are not counted.'
     value: ${{ steps.run.outputs.counts }}
   report:
-    description: Path of the JSON report.
+    description: Path of the JSON report. watch: path of the events, one JSON object per line.
     value: ${{ steps.run.outputs.report }}
   samples:
     description: "verify with live sampling: path of the samples that the run read, to run the check again with `--samples`."
@@ -70,5 +79,9 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_ALLOW: ${{ inputs.allow }}
         INPUT_ARGS: ${{ inputs.args }}
+        INPUT_PROGRAMS: ${{ inputs.programs }}
+        INPUT_STATE: ${{ inputs.state }}
+        # Only watch needs the token, so the other commands never get it.
+        INPUT_TOKEN: ${{ inputs.command == 'watch' && inputs.token || '' }}
         BASE_REF: ${{ github.base_ref }}
       run: bash "$GITHUB_ACTION_PATH/scripts/action.sh" run

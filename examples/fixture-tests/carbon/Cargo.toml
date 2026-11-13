@@ -1,0 +1,17 @@
+[package]
+name = "carbon-fixture-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "One test per exported fixture file for a Carbon decoder, with idl-verify-fixtures"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the decoder crates stay out of its build and MSRV.
+[workspace]
+
+[dev-dependencies]
+carbon-core = "=2.0.0"
+carbon-pumpfun-decoder = "=2.0.0"
+carbon-test-utils = "=2.0.0"
+serde_json = "1"
+idl-verify-fixtures = { path = "../../../crates/idl-verify-fixtures" }

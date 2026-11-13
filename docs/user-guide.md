@@ -9,6 +9,7 @@ and follow its steps. The [README](../README.md#install) tells how to install bo
 | An SDK or a client that bundles an IDL | [Check a bundled IDL](#check-a-bundled-idl) |
 | A Solana program | [Release a program without breaking users](#release-a-program-without-breaking-users) |
 | A Codama IDL made from an Anchor IDL | [Check a converted IDL](#check-a-converted-idl) |
+| An indexer in production, with Shipstern or Carbon | [Runtime guard](#runtime-guard) |
 
 ## Keep your IDL copy correct
 
@@ -67,6 +68,58 @@ decoder.
 2. Regenerate your parser.
 3. For a finding that you accept, such as a field you do not read, add a line to an allow
    file (see [idl-verify](idl-verify.md#allow-file)).
+
+## Runtime guard
+
+**The problem.** The nightly check runs once a day. Between two runs, a program upgrade can
+change the data, and the indexer does not tell you:
+
+- A Carbon decoder returns `None` for data that it cannot decode, and the pipeline drops it
+  with no count and no log. It also accepts bytes at the end of an account that grew.
+- Shipstern counts parse errors for all programs together, so the count does not show which
+  program changed.
+
+**Step 1. Wrap the parser or decoder.** The `idl-drift-guard` crate counts each update by
+program, kind and outcome. It reads the IDL, so it also counts the extra bytes that a decoder
+accepts in silence.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use idl_drift_guard::{guard, Guard, Window};
+
+let pump = Arc::new(
+    Guard::from_idl(include_str!("../idls/pump.json"))?
+        .alert_after(5, Window::Time(Duration::from_secs(60)), |alert| eprintln!("{alert}")),
+);
+// Shipstern 0.12 (`vixen` for Vixen 0.7):
+Pipeline::new(guard!(shipstern, pump::AccountParser, pump.clone()), handlers);
+// Carbon 2.0:
+pipeline.account(guard!(carbon, PumpfunDecoder, pump.clone()), processor);
+```
+
+The wrapper returns each value unchanged. Use one guard per program. For an IDL with no
+address, or a deploy at another address, use `Guard::from_idl_for(program_id, json)`. The
+alert callback runs inside the decode call, so it must not panic or block: send the alert to
+a channel.
+
+**Step 2. Export the counters.** Serve `idl_drift_guard::prometheus([&*pump])` on your
+metrics endpoint. Alert on `idl_drift_guard_updates_total` with an outcome other than
+`decoded` and `filtered`, or use the `alert_after` callback.
+
+**What it finds.** The live pump_fun samples of 2026-10-16, through a Shipstern parser and a
+Carbon decoder that are both built from `fixtures/live/pump_fun/idl.json`
+([examples/guard](../examples/guard)):
+
+| Kind | Count | Outcome |
+|---|---|---|
+| account | 12 of 12 | `extra_bytes`: each account is longer than its IDL type, for example `BondingCurve` has 166 bytes, the IDL reads 115. Both decoders return a value. |
+| instruction | 14 of 41 | `unknown_discriminator`: 3 instructions that the IDL does not have. |
+| instruction | 2 of 41 | `extra_bytes`: a `buy` with 1 byte after the arguments. |
+
+The first alert names the first miss: its type, length, slot and address (Carbon decoders
+do not see the slot or the address). The outcomes and limits are in the
+[crate README](../crates/idl-drift-guard/README.md).
 
 ## Check a bundled IDL
 

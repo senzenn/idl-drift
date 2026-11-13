@@ -1,18 +1,24 @@
 name: Examples
 
-# The decoder examples pin Shipstern and Carbon. The weekly run finds a release that breaks them.
+# The examples pin Shipstern and Carbon. The weekly run finds a release that breaks them.
 on:
   push:
     branches: [main]
     paths:
+      - "Cargo.toml"
       - "crates/**"
       - "examples/decoders/**"
+      - "examples/guard/**"
+      - "examples/fixture-tests/**"
       - "fixtures/live/pump_fun/**"
       - ".github/workflows/examples.yml"
   pull_request:
     paths:
+      - "Cargo.toml"
       - "crates/**"
       - "examples/decoders/**"
+      - "examples/guard/**"
+      - "examples/fixture-tests/**"
       - "fixtures/live/pump_fun/**"
       - ".github/workflows/examples.yml"
   schedule:
@@ -56,3 +62,62 @@ jobs:
           test "$status" -le 1
           jq -e '.reference.instructions_compared > 0
             and ([.findings[] | select(.check == "reference")] | length) == 0' report.json
+
+  guard:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [shipstern, carbon, vixen]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/guard/${{ matrix.example }}
+      # Shipstern and Carbon get the live pump_fun samples; Vixen is a compile test.
+      - run: cargo test --locked --manifest-path examples/guard/${{ matrix.example }}/Cargo.toml
+
+  fixture-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - example: shipstern
+            fixtures: fixtures
+          - example: carbon
+            fixtures: tests/fixtures
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            .
+            examples/fixture-tests/${{ matrix.example }}
+      - run: cargo build --release --locked -p idl-verify
+      # Each checked-in file must be the file that idl-verify writes today. Exit 1 is expected:
+      # the IDL is older than the program. A samples export writes no tx file, so the
+      # hand-made tx file of the Shipstern example is not compared.
+      - name: Compare the fixtures with a new export
+        run: |
+          status=0
+          target/release/idl-verify --idl fixtures/live/pump_fun/idl.json \
+            --samples fixtures/live/pump_fun/samples-2026-10-16.json \
+            --export-fixtures "$RUNNER_TEMP/export" --fixture-format ${{ matrix.example }} || status=$?
+          test "$status" -le 1
+          for file in examples/fixture-tests/${{ matrix.example }}/${{ matrix.fixtures }}/*.json; do
+            case $file in *_tx.json) continue ;; esac
+            cmp "$file" "$RUNNER_TEMP/export/$(basename "$file")"
+          done
+      # The generated tests never call load_fixture, so they cannot fetch. The closed port is
+      # only a guard.
+      - name: One test per fixture file
+        env:
+          RPC_ENDPOINT: http://127.0.0.1:9
+        run: cargo test --locked --manifest-path examples/fixture-tests/${{ matrix.example }}/Cargo.toml

@@ -484,6 +484,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "idl-verify-shipstern"
+version = "0.3.1"
+dependencies = [
+ "base64",
+ "bs58",
+ "serde_json",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,12 +613,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
 ]
-
-[[package]]
-name = "pin-project-lite"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "prettyplease"
@@ -946,15 +949,11 @@ dependencies = [
 name = "shipstern-decoder"
 version = "0.0.0"
 dependencies = [
- "base64",
  "borsh",
- "bs58",
- "serde",
- "serde_json",
+ "idl-verify-shipstern",
  "shipstern-core",
  "shipstern-parser",
  "shipstern-proc-macro",
- "tokio",
 ]
 
 [[package]]
@@ -1151,15 +1150,6 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
-
-[[package]]
-name = "tokio"
-version = "1.53.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
-dependencies = [
- "pin-project-lite",
-]
 
 [[package]]
 name = "toml"

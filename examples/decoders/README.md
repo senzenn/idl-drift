@@ -3,11 +3,12 @@
 Two small programs that run a generated parser as the decoder under test of
 `idl-verify --decoder` (see [decoder-protocol.md](../../docs/decoder-protocol.md)). idl-verify
 sends each sample to the parser and compares each value with its own decode of the same bytes.
+Each program is one `serve!` line of an adapter crate.
 
-| Directory | Parser | Versions |
-|---|---|---|
-| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.12.0` |
-| `carbon/` | `carbon-pumpfun-decoder` | Carbon `=2.0.0` |
+| Directory | Parser | Versions | Adapter |
+|---|---|---|---|
+| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.12.0` | [idl-verify-shipstern](../../crates/idl-verify-shipstern/README.md) |
+| `carbon/` | `carbon-pumpfun-decoder` | Carbon `=2.0.0` | [idl-verify-carbon](../../crates/idl-verify-carbon/README.md) |
 
 Both decode pump_fun (`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`) with
 `fixtures/live/pump_fun/idl.json`. Each is a separate Cargo project, outside the idl-drift
@@ -56,17 +57,12 @@ Shipstern:
 
 Carbon:
 
-1. In `Cargo.toml`, replace `carbon-pumpfun-decoder` with the Carbon decoder of your program.
+1. In `Cargo.toml`, replace `carbon-pumpfun-decoder` with the Carbon decoder of your program,
+   with its `serde` feature.
 2. In `src/main.rs`, replace `PumpfunDecoder` and `CpiEvent` with the types of that crate.
 
-## Value shapes
-
-- Shipstern: the generated types implement serde only when the crate that holds them has a
-  `serde` feature. This example turns it on by default. The parser writes a value as
-  `{"<kind>": {"<Variant>": ...}}`, and instruction and event arguments are under `args`.
-- Carbon: an event has no accounts, so the example decodes events with `CpiEvent::decode`,
-  after Anchor's event tag. Carbon keeps an Anchor struct argument, such as `params`, as one
-  field. The example removes that wrapper.
+The adapter READMEs give the other forms of `serve!`, for example Vixen, or a decoder with no
+events.
 
 ## CI
 

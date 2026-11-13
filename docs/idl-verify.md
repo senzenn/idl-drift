@@ -9,7 +9,10 @@ the data that does not fit.
 
 ```text
 idl-verify [OPTIONS] --idl <PATH>
+idl-verify timeline [OPTIONS] --idl <PATH>...
 ```
+
+The second form lists the deploys of a program (see [Timeline](#timeline)).
 
 The Codama conversion of voltr_vault, run from the repository root:
 
@@ -73,6 +76,8 @@ In the tables:
 | `--max-tx <N>` | With `--rpc`: read at most N successful transactions. Default: 40. |
 | `--stall <N>` | With `--rpc`: stop after N successful transactions in a row bring no new instruction or event kind (a transaction that the RPC no longer keeps counts too), or after N pages of signatures in a row hold only failed transactions. Default: 40. A transaction that is read counts toward both limits, so with the defaults `--max-tx` usually stops first. A transaction that the RPC answers with `null` counts only toward N, so N such answers in a row stop the run before `--max-tx` does. |
 | `--save-samples <PATH>` | With `--rpc`: write the live samples to this file, in the samples format. |
+| `--export-fixtures <DIR>` | Write the samples to this directory as test fixtures of a parser framework. Needs `--fixture-format`. See [fixture export](#fixture-export). |
+| `--fixture-format <FORMAT>` | The format of `--export-fixtures`: `shipstern` (`shipstern-mock` files) or `carbon` (`carbon-test-utils` files). |
 | `--reference <PATH>` | Compare values with the output of the reference decoder. See [reference decoder](#reference-decoder). |
 | `--decoder <CMD>` | Compare values with a decoder under test. See [decoder-protocol.md](decoder-protocol.md). |
 | `--compare-idl <PATH>` | Compare values with a second IDL of the same program. See [compare two IDLs](#compare-two-idls). |
@@ -80,6 +85,8 @@ In the tables:
 | `--min-coverage <PERCENT>` | Fail when less than this percent of the IDL's account types, instructions or events have a sample. |
 | `--fail-on <SEVERITY>` | The lowest severity that sets exit code 1: `error` (default) or `warning`. |
 | `--allow <FILE>` | Findings that you accept. They do not set exit code 1. See [Allow file](#allow-file). |
+| `--write-allow <FILE>` | Write an allow file that accepts each finding at or above `--fail-on`. See [Baseline](#baseline). |
+| `--prune-allow` | With `--write-allow`: also remove the entries of the `--allow` file that match no finding. The JSON report lists them in `pruned_allows`. |
 | `--json` | Print the report as JSON. See [JSON output](#json-output). |
 | `--markdown` | Print the report as GitHub Markdown. See [Markdown output](#markdown-output). |
 
@@ -89,6 +96,8 @@ Rules for the options:
   wins, and idl-verify does not sample the cluster. `--max-tx` or `--stall` with `--samples`
   is a usage error (exit 2). Their default values do not count.
 - `--save-samples` saves only live samples. With `--samples` it is a usage error (exit 2).
+- `--export-fixtures` and `--fixture-format` go together. They work with `--samples` and
+  with `--rpc`.
 - `--reference`, `--decoder` and `--compare-idl` cannot be combined. `--upgrade-impact`
   cannot be combined with `--reference` or `--decoder`.
 - `--json` and `--markdown` cannot be combined.
@@ -121,6 +130,24 @@ program_id program                     # We sample a devnet deployment.
   report lists it in `unused_allows`. It does not change the exit code.
 - A line with no subject, or a check name that idl-verify does not have, stops the run with
   exit 2. Thus a typo cannot let a finding through.
+
+### Baseline
+
+`--write-allow <FILE>` writes an allow file with one `<check> <subject>` line for each
+finding at or above `--fail-on` that is not allowed yet, in the order of the JSON report.
+The rules are the same as for
+[`idl-drift diff --write-allow`](idl-drift.md#baseline): FILE must be new, or the `--allow`
+file, which keeps each line and comment. `--prune-allow` removes the entries that match no
+finding. The write is atomic, and the report and the exit code are then the ones that
+`--allow FILE` gives.
+
+```bash
+idl-verify --idl idl.json --samples samples.json --write-allow verify.allow
+idl-verify --idl idl.json --samples samples.json --allow verify.allow   # exit 0
+```
+
+Use it with `--samples`: a live run can sample other transactions, and then find other
+findings.
 
 ## Checks
 
@@ -199,7 +226,7 @@ with SBF alignment rules:
   ],
   "instructions": [
     { "signature": "5uXzA4qK...", "data": "9lI54oPe/fk...", "accounts": ["ST999VUT...", "4sycXz9X..."],
-      "signer": [false, true], "writable": [true, false], "cpi": false }
+      "signer": [false, true], "writable": [true, false], "cpi": false, "position": [2, 0] }
   ],
   "events": [
     { "signature": "5uXzA4qK...", "source": "log", "data": "eKpmsOmLc5I..." }
@@ -213,6 +240,7 @@ with SBF alignment rules:
 | `instructions[].data` | The data of one instruction, base64. `getTransaction` returns it in base58, so encode it again. |
 | `instructions[].accounts` | The instruction's account keys, in order. Resolve them through the transaction's account keys and, for v0 transactions, its loaded addresses. |
 | `instructions[].signer`, `instructions[].writable`, `instructions[].cpi` | Optional. One `signer` and one `writable` flag for each key in `accounts`. `signer` is true when the key signs the transaction. `writable` is true when the message header (or the writable list of loaded addresses) makes the key writable. `cpi` is true for an inner instruction. Give all three or none. Without them, the `account_flags` check skips the sample. |
+| `instructions[].position` | Optional. `[top-level index, inner index]` in the transaction. The inner index is 0 for a top-level instruction, else the place of the CPI in that instruction's list, from 1. Live sampling writes it. [Fixture export](#fixture-export) names Carbon files with it. A value of another shape is ignored, with one warning. |
 | `events[]` | Optional. What the program emitted. `"source": "log"` is a `Program data:` line, base64-decoded, from the program's own invoke frame. `"source": "cpi"` is the data of a self-CPI event instruction, with the envelope. |
 | `programId`, `address`, `signature` | Optional, but they make the report useful. |
 
@@ -334,6 +362,155 @@ Equal values do not prove equal layouts. voltr's Codama IDL drops 7 bytes of pad
 fails on the `bytes_used` error of the new IDL. Run idl-verify on the old IDL alone to see
 its unused bytes.
 
+## Fixture export
+
+`--export-fixtures <DIR> --fixture-format <FORMAT>` writes the samples to DIR as the test
+fixtures of a parser framework. Then the tests of a Shipstern parser or a Carbon decoder run
+on real chain data with no network. The run still checks the samples, and the findings set
+the exit code as before. The export itself exits 2 when it writes no file, when the program
+id is not a base58 key, or when a file cannot be written. On stderr, idl-verify gives the
+number of files and each sample that got no file, also when a write error stops the run.
+It serializes each file straight to disk, so the export adds no copy of a file in memory.
+Only a Carbon account file holds its base64 data in memory while it is written.
+
+| Format | Files |
+|---|---|
+| `shipstern` | `<address>_account.json` for each account sample. With `--rpc`, also `<signature>_tx.json` for each transaction that gave a kept sample. The format of `shipstern-mock` 0.12, for `account_fixture!` and `tx_fixture!`. |
+| `carbon` | `<address>_account.json` (`TestAccount`) for each account sample, and `<signature>_<outer>_<inner>_instruction.json` (`TestInstruction`) for each instruction sample. `<outer>` is the top-level index in the transaction. `<inner>` is 0 for a top-level instruction, else the place of the CPI in that instruction's list, from 1. The format of `carbon-test-utils` 2.0, for `read_account` and `read_instruction`. |
+
+- **Fixed values.** A sample keeps no lamports, rent epoch or executable flag. Each account
+  file gets lamports 0, rent epoch 0 and `executable: false`. The owner is the program
+  (`--program`, else the samples' `programId`, else the IDL's `address`), because both
+  frameworks skip an account of another owner.
+- **Shipstern from `--samples`: account files only.** A tx file holds each call to the
+  program in the transaction, with its position, its CPIs and the log. A samples file does
+  not keep them, and the mock reads a file that exists and does not fetch it, so a part of a
+  transaction would change what a test sees. A live run keeps each transaction that gave a
+  kept sample.
+- **Shipstern tx files are correct where the mock's own fetch is not.** The calls are in
+  the order of `shipstern-mock` 0.12: the top-level calls first, then the CPIs. Each call
+  gets the log lines of its top-level instruction. A log frame goes only to the
+  instruction whose program opened it, because a precompile (for example Ed25519) writes no
+  line. This is the rule of Shipstern after #377; the 0.12 mock gives frame `i` to
+  instruction `i`, so after a precompile each call gets the lines of another instruction.
+  The `inner` list of each call holds the CPIs that it makes, nested by stack height as the
+  Shipstern runtime nests them. The 0.12 mock writes it empty, so an event that only
+  `emit_cpi!` writes, with no `Program data:` line, is lost. An instruction with no stack
+  height (older transactions) gets no CPIs. A self-CPI event is also a call of its own. A
+  parser from `include_shipstern_parser!` returns `Filtered` for it, and with the
+  `program-events` feature reads the event from the `inner` list of its caller and from the
+  log lines.
+- **Carbon instruction keys** get the `signer` and `writable` flags of the sample. A sample
+  with no flags gets `false` for each key. Events get no file, because an event sample
+  keeps no accounts.
+- **Same bytes each time.** Shipstern files are compact JSON, as the mock writes them.
+  Carbon files are pretty JSON. One name always holds the same bytes, so a second export
+  into the same DIR never changes a file to another instruction. A samples file from an
+  older idl-verify has no `position`, and a `position` of another shape is ignored with
+  one warning. Such Carbon instruction files are named
+  `<signature>_<digest>_instruction.json`, where `<digest>` is the first 16 hex digits of
+  the SHA-256 of the file. A file of the same name is replaced. Other files in DIR stay.
+- **Names.** Each file is named after a base58 key or signature, so a hostile samples file
+  cannot write outside DIR. A sample whose address, signature or account key is not base58
+  gets no file, with a warning. A transaction whose CPIs nest deeper than the runtime
+  allows gets no file either.
+
+Shipstern, from the pump_fun samples:
+
+```bash
+idl-verify --idl fixtures/live/pump_fun/idl.json \
+           --samples fixtures/live/pump_fun/samples-2026-10-16.json \
+           --export-fixtures my-parser/fixtures --fixture-format shipstern
+```
+
+```rust
+// my-parser/tests/pump.rs. The mock reads ./fixtures, from the crate root.
+// Dependencies: those of examples/decoders/shipstern, shipstern-mock, tokio "macros".
+use shipstern_core::Parser;
+
+shipstern_proc_macro::include_shipstern_parser!("idl.json");
+
+#[tokio::test]
+async fn a_real_bonding_curve_decodes() {
+    // account_fixture! panics when the parser cannot decode the account.
+    let _curve = shipstern_mock::account_fixture!(
+        "E98AtWDa8whooJTw8nbbfz4oifvTcK7VxfaLb2uV2uEG",
+        &pump::AccountParser
+    );
+}
+```
+
+The mock fetches a missing file from `RPC_ENDPOINT` (devnet by default) and writes it. In CI,
+set `RPC_ENDPOINT=http://127.0.0.1:9`, so that a missing file fails the test.
+
+Carbon, from the same samples:
+
+```bash
+idl-verify --idl fixtures/live/pump_fun/idl.json \
+           --samples fixtures/live/pump_fun/samples-2026-10-16.json \
+           --export-fixtures tests/fixtures --fixture-format carbon
+```
+
+```rust
+use carbon_core::account::AccountDecoder;
+use carbon_pumpfun_decoder::PumpfunDecoder;
+
+#[test]
+fn a_real_bonding_curve_decodes() {
+    let path = "tests/fixtures/E98AtWDa8whooJTw8nbbfz4oifvTcK7VxfaLb2uV2uEG_account.json";
+    let account = carbon_test_utils::read_account(path).unwrap();
+    assert!(PumpfunDecoder.decode_account(&account).is_some());
+}
+```
+
+With these samples, `carbon-pumpfun-decoder` 2.0.0 decodes all 12 accounts and 27 of the 41
+instructions. The other 14 have the 3 discriminators that the `discriminator` check reports:
+neither the IDL nor the decoder has them.
+
+### One test per file
+
+The [idl-verify-fixtures](../crates/idl-verify-fixtures/README.md) crate writes these tests
+for you. Its `sample_tests!` macro reads the export directory at compile time and makes one
+`#[test]` per file, named after the file. A sample that the parser cannot decode then fails
+by name in `cargo test`:
+
+```rust
+// tests/samples.rs. Dev-dependencies: shipstern-core, shipstern-mock, idl-verify-fixtures.
+idl_verify_fixtures::sample_tests! {
+    shipstern,
+    dir: "fixtures",
+    accounts: my_parser::pump::AccountParser,
+    instructions: my_parser::pump::InstructionParser,
+}
+```
+
+```rust
+// tests/samples.rs. Dev-dependencies: carbon-core, carbon-test-utils, serde_json,
+// idl-verify-fixtures.
+idl_verify_fixtures::sample_tests! {
+    carbon,
+    dir: "tests/fixtures",
+    accounts: carbon_pumpfun_decoder::PumpfunDecoder,
+    instructions: carbon_pumpfun_decoder::PumpfunDecoder,
+}
+```
+
+- **Pass rule.** An account test passes when the parser returns `Ok` or the decoder returns
+  `Some`. A Carbon instruction test passes on `Some`. A Shipstern tx test passes when no
+  instruction gives an error other than `Filtered`, and at least one gives `Ok`.
+- **No network.** Each test embeds its file. A Shipstern test reads it with `shipstern-mock`
+  and never calls `load_fixture`, so the mock never fetches. A Carbon test reads it as a
+  `carbon-test-utils` `TestAccount` or `TestInstruction`.
+- **Pinned values.** With `expected: "<dir>"`, each test also compares the `{:#?}` output of
+  the decoded value with `<dir>/<file stem>.txt`, from the run-time `CARGO_MANIFEST_DIR`.
+  `IDL_VERIFY_FIXTURES_BLESS=1` writes the files.
+- **New files need a build.** Each test embeds its file with `include_bytes!`, so a changed
+  file builds the tests again. A proc macro cannot watch a directory on stable Rust: after a
+  new export, touch the test file, or add a `build.rs` that prints
+  `cargo:rerun-if-changed=fixtures`.
+
+`examples/fixture-tests/` runs both forms on the pump_fun export.
+
 ## Upgrade impact
 
 Before you deploy a program upgrade, `--upgrade-impact` shows how the new IDL reads the
@@ -345,15 +522,34 @@ account with it and puts the account in one class:
 | ok | The account decodes, and the new IDL reads each byte. |
 | shorter | The account decodes, and bytes are left over. The new type can be smaller, or the account has spare room. The account is not broken. |
 | realloc | A read goes past the end of the data, and the account decodes when zero bytes are added at the end. A field or a fixed array of the new layout can start or end past the data. The realloc size is the smallest number of zero bytes that makes it decode. For a fixed-size or zero-copy type, this is the new size minus the account size. For a variable-size type, it is the bytes that the new trailing fields need. |
-| broken | The discriminator matches no account type of the new IDL. Or the data does not decode, and zero bytes do not fix it, such as an invalid enum tag or bool. Or a length prefix that the new IDL reads from the existing bytes points past the data: a live account holds complete data, so the new IDL reads those bytes another way. (The prefix of a new trailing field comes from the zero bytes, so it is 0.) Or, with `--compare-idl`, a field that both IDLs name decodes to another value. |
+| broken | The discriminator matches no account type of the new IDL. Or the data does not decode, and zero bytes do not fix it, such as an invalid enum tag or bool. Or a length prefix that the new IDL reads from the existing bytes points past the data: a live account holds complete data, so the new IDL reads those bytes another way. (The prefix of a new trailing field comes from the zero bytes, so it is 0.) Or, with `--compare-idl`, a field that both IDLs name decodes to another value, or a new field takes bytes of an old reserved array that are not zero. |
 
 Give the current IDL with `--compare-idl`. idl-verify then decodes each account with both
 IDLs and compares the fields that both IDLs name, with the same comparison as
 [compare two IDLs](#compare-two-idls). A field that only one IDL has is not a difference,
 also in a struct inside an option, an enum variant, a tuple or a map.
-Lists compare on the items that both IDLs read, so a reserved array that gives bytes to a
-new field is not a difference when the values stay the same. Without `--compare-idl`, a
-field that changes its type, or that moves, can show as ok, shorter or realloc.
+Lists compare on the items that both IDLs read. Without `--compare-idl`, a field that
+changes its type, or that moves, can show as ok, shorter or realloc.
+
+With `--compare-idl`, idl-verify also checks the
+[reserved bytes](idl-drift.md#reserved-bytes) that new fields take: the cases where
+`idl-drift diff` reports `reserved_bytes_used`. idl-verify reads the reserved array in the
+old decode of each account, from the old account type that matched its discriminator, so a
+renamed account type is checked too. It finds the array also in a struct inside a field, a
+list, an option, a map, a tuple, an enum variant or a generic argument. When a byte that a
+new field takes is not zero, the account is broken, and the error names the field, the
+bytes and the sample count:
+
+```text
+error: account Pool: breaks under the new IDL in 2 of 5 samples: `Pool.b` takes bytes 0..8 of the old `reserved`, and `reserved[0]` is 5, not 0
+```
+
+When idl-verify cannot find the reserved array in the old decode, the account is broken
+too, because its bytes are not checked. The reserved array is not compared with the new,
+shorter array of the same name, because the two hold other bytes. Bytes that stay reserved
+can hold any value. Without
+`--compare-idl`, idl-verify does not know which bytes were reserved, so it does not check
+them.
 
 The extra rent of an account that needs a realloc is the rent-exempt minimum of the new
 size minus the minimum of the current size. A live run gets the minimums from the cluster
@@ -418,6 +614,99 @@ Limits:
 - **A type that idl-verify cannot decode has no row.** It gets its usual `missing_type` or
   `layout` finding.
 
+## Timeline
+
+`idl-verify timeline` lists the deploys of a program and tells which of your IDL files
+decodes the transactions of each slot range between two deploys. A backfill (for example
+with Jetstreamer) then decodes each range with the IDL of the code that ran in it.
+
+```text
+idl-verify timeline --idl <PATH> [--idl <PATH>]... [--program <ID>] [--rpc <URL>]
+                    [--per-range <N>] [--max-tx <N>] [--max-scan <N>] [--json]
+```
+
+- **Deploys.** The scan lists the signatures of the upgrade authority, which signs each
+  deploy. It reads (at most `--max-scan`) only the ones that the `ProgramData` account lists
+  too, because the authority also signs each buffer write. A deploy is a
+  `DeployWithMaxDataLen` or `Upgrade` of this program, also as a CPI (Squads).
+- **Other cases.** An extend or a set-authority keeps the code. After a set-authority to the
+  listed key, the scan goes on with the key before it. When one page of the authority needs
+  more than 5 pages of `ProgramData` signatures, the scan reads each authority transaction
+  from then on.
+  An immutable program: the scan lists `ProgramData`. Loader v4: a `Deploy` of the program
+  account. Another loader cannot change the code: one range.
+- **End of the scan.** At the deploy that made the program, the list is complete from
+  there. A close and a new deploy at the same address (SIMD-0432) hides the life before it.
+  The scan also stops when the RPC has no older signatures, after `--max-scan` transactions,
+  or after 10 pages of 1000 signatures. Then the range from `?` can span several deploys,
+  and the report says so. A public RPC can keep less history than the chain.
+- **Ranges.** Agave runs new code from the slot after its deploy. So a range runs from the
+  slot after one deploy to the slot of the next one. For each range, idl-verify reads the
+  successful program transactions, newest first (`before` and `until` are the two deploy
+  signatures), until `--per-range` of them call the program or log its events (default 10),
+  or after `--max-tx` reads (default 40) or 10 pages.
+- **Fit.** Each IDL decodes the samples of each transaction, as a check does. An IDL fits a
+  transaction when the check finds no error. It fits a range when it fits every sampled
+  transaction. A range with samples that no IDL fits is a finding. A range with no sample
+  is not.
+
+The table gives, for each range, the samples that each IDL decodes, and the IDLs that decode
+all of them (`fits`). Under each range that no IDL fits, a line per IDL gives its first error
+finding and the transaction, so you can tell an IDL to correct from the wrong IDL. stderr
+gets one line when the scan ends and one per range. `--json` gives the same as one object:
+`deploys`, then `ranges` with `first_slot`, `last_slot` (`null` for now),
+`deploy_signature`, `samples`, `unreadable`, `best` (the IDLs that decode the most) and a
+`results` entry per IDL (`fit`: `all`, `some`, `none` or `no_sample`; `first_error`), and
+`deploy_scan` with the listed accounts and why the scan stopped (`first_deploy`,
+`no_older_signatures`, `scan_limit`, `fixed_code`).
+
+Exit codes: 0 when each range with samples has an IDL that decodes all of them, 1 when a
+range has samples that no single IDL decodes, 2 when the run cannot run or no range has a
+sample.
+
+pump.fun on the public mainnet RPC on 2026-11-12, with the IDL of `fixtures/live` and the
+older Shipstern test IDL:
+
+```bash
+idl-verify timeline --program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P \
+  --idl fixtures/live/pump_fun/idl.json --idl fixtures/shipstern/pump_fun.json \
+  --max-scan 4 --per-range 5
+```
+
+```text
+program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+3 deploys found in 4 transactions of 7gZufwwAo17y5kg8FMyJy2phgpvv9RSdzWtdXiWHjFr8
+the scan stopped at --max-scan transactions before the first deploy, so the range from ? can span several deploys
+IDL 1  fixtures/live/pump_fun/idl.json
+IDL 2  fixtures/shipstern/pump_fun.json
+
+from slot  to slot    samples  IDL 1  IDL 2  fits  deploy
+?          456494698  5        1/5    0/5    none  -
+456494699  458888140  5        1/5    0/5    none  2fAUGTBfLUViHGAq2hZKXHsvVXC6Lv1km3Pf6SLMrouyteWBSJifxwqoA7Srfs4seXh6c7kSsKuN7dmfJrRE9FFG
+458888141  458921440  5        3/5    2/5    none  23sYjeCDLtM9MHe45mZZGeZuqh7fvzhGimND36T3uU7TT1D6xEXLt7QmwALNk91WVXTk9aTHAhzv5QNDe8m6qyez
+458921441  now        5        2/5    0/5    none  5HtoG6baGa55zvKasGqp4yYLS6RDuKH17Vrz5QJPmQnwQ5xEfdfeTwLfVZHK15zUvXihBejEi2WwQXXos3YrfnDW
+
+error: slots ? to 456494698: no IDL decodes all 5 samples; IDL 1 decodes the most, 1; the range can span several deploys
+  IDL 1: discriminator instructions: 0x07051dc4f5176550 matches no instruction discriminator in the IDL, in 1 sample; transaction 4uGdzdByUaMzA2rtsGdG7MAZkorjorABQdoQpmwRHhfFznmEx54Z8wYTzG3t3YbFJrTy54McNH378UquWBfjZQ2w
+  IDL 2: discriminator instructions: 0x07051dc4f5176550 matches no instruction discriminator in the IDL, in 1 sample; transaction 4uGdzdByUaMzA2rtsGdG7MAZkorjorABQdoQpmwRHhfFznmEx54Z8wYTzG3t3YbFJrTy54McNH378UquWBfjZQ2w
+error: slots 456494699 to 458888140: no IDL decodes all 5 samples; IDL 1 decodes the most, 1
+  IDL 1: bytes_used event TradeEvent: 24 bytes after the payload in 2 of 2 samples; transaction 5YoNGammBXRU3vbrmSU49Ho2vasWdfZSUY1vbT3NHMbtn9GUJkyVAxnt9L7W9cVy44Rqiee1CSt2Eh7jatQL3faW
+  IDL 2: bytes_used event tradeEvent: 100 bytes after the payload in 2 of 2 samples; transaction 5YoNGammBXRU3vbrmSU49Ho2vasWdfZSUY1vbT3NHMbtn9GUJkyVAxnt9L7W9cVy44Rqiee1CSt2Eh7jatQL3faW
+error: slots 458888141 to 458921440: no IDL decodes all 5 samples; IDL 1 decodes the most, 3
+  IDL 1: bytes_used event TradeEvent: 32 bytes after the payload in 2 of 2 samples; transaction 5rgMsiqtT42zLa9oKAWqhBKqAyLF3CLvzStnjQTjRtANW8uJ87WwqRNpqSDTmDQ2CcEEhmuPYfnVomqGZJVQXV6G
+  IDL 2: bytes_used instruction createV2: 1 byte after the arguments in 1 of 1 sample; transaction cf9DPygfQ1NyDcBc1SiqnwhthL5y2PM7LM676KnDpSM4yFpYEnrX2zDuBLEYejhaHgdqPDthiHpNxkHRBLdKF3g
+error: slots 458921441 to now: no IDL decodes all 5 samples; IDL 1 decodes the most, 2
+  IDL 1: bytes_used event TradeEvent: 32 bytes after the payload in 2 of 2 samples; transaction 25HfYCCTToo3TmqMC5hyapyv4eS9mFitu7g8FMcezE6uK24WpvE69hmwiXss94b9sfmXeL4ansohZyFNBnUqoqJX
+  IDL 2: bytes_used instruction buy: 1 byte after the arguments in 1 of 1 sample; transaction 4cudtUDJNDEGRhn4L5qjzZuDvtg8Mo7poNsU7M2quT4szDndvNcpQgzvwWbQX1fsVycV8GkWYRW5iHVykiGYRd66
+summary: 4 ranges; 4 with samples that no single IDL decodes
+```
+
+The 4 transactions read are the newest of the authority that the `ProgramData` account
+lists too. The newest upgrade is in slot 458921440, the last write slot of the `ProgramData`
+account. Neither IDL fits a range: the `fixtures/live` IDL is 24 to 32 bytes short on
+`TradeEvent` and does not know an instruction of the oldest range, so other IDL versions are needed. With
+`--max-scan 30`, an earlier build found 5 upgrades from slot 452654932 on.
+
 ## Events
 
 A `log` event is `[discriminator][payload]`. A `cpi` event first loses its envelope: the
@@ -455,7 +744,8 @@ error: event TradeEvent: 24 bytes after the payload in 10 of 10 samples
 | `sampling` | Only after a live run: `transactions` (successful transactions read) and `stop_reason`. |
 | `upgrade_impact` | Only with `--upgrade-impact`. `rent_source` (`rpc` or `formula`), `lamports_per_byte` (the offline rate, or `null` for `rpc`), `types`, `unknown` (accounts that the `discriminator` check reports as errors, counted as broken) and `totals`. Each entry of `types` has `name`, `sampled`, `ok`, `shorter` (`count`, `bytes`), `realloc` (`count`, `bytes`, `rent_each`, `rent_total`) and `broken` (`count`, and `reasons`, each with `reason`, `count`, `detail` and `example`). `bytes` and `rent_each` are `min` and `max`, or `null` when `count` is 0. `totals` has `sampled`, `ok`, `shorter`, `realloc`, `broken` and `rent_total`. The counts are of the sample. Rent is in lamports. In this mode, `instructions` and `events` are empty. |
 | `findings` | Each finding: `severity`, `check`, `subject`, `message`, and when present `hint` and `example`. An allowed finding also has `"allowed": true`. |
-| `unused_allows` | Only with `--allow`: the entries that match no finding, each with `line`, `rule` and `subject`. |
+| `unused_allows` | Only with `--allow` or `--write-allow`: the entries that match no finding, each with `line`, `rule` and `subject`. |
+| `pruned_allows` | Only with `--prune-allow`: the entries that the run removed from the allow file, with the same keys. |
 | `counts` | `errors`, `warnings`, `notes`, other than allowed findings, so that they agree with the exit code. |
 | `exit_code` | The same value as the process exit code. |
 
@@ -493,6 +783,10 @@ a runtime decoder over the IDL model. `idl_verify::rpc` takes samples from a clu
   events that the sampled transactions do not use. The report lists them under "not
   sampled". Increase `--max-tx` and `--stall` to look further back. Set `--min-coverage` to
   fail a run that samples too little.
+- **The timeline samples a few transactions per range.** An IDL that fits each sample can
+  still miss an instruction that the samples do not use, and the samples come from the end
+  of each range. A deploy that the scan cannot read (`null`) or that a migrated program made
+  under its old loader is not listed; the report counts the unread transactions.
 - **A narrowed last field can hide.** When the bytes that a narrower type does not read are
   zero, such as the high half of a small timestamp, they look like spare room: a note, not
   an error.

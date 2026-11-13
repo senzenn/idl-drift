@@ -109,6 +109,36 @@ fn rpc_failure_exits_2_without_printing_the_url() {
 }
 
 #[test]
+fn timeline_errors_exit_2_with_one_json_error_and_no_url() {
+    let idl = live("pump_fun/idl.json");
+    let cases: [(&[&str], &str); 3] = [
+        (&["timeline", "--idl", &idl], "the RPC URL is empty"),
+        (&["timeline", "--json"], "--idl <PATH>"),
+        (
+            &[
+                "timeline",
+                "--idl",
+                &idl,
+                "--rpc",
+                "http://127.0.0.1:9/secret-token",
+            ],
+            "getAccountInfo",
+        ),
+    ];
+    for (args, expected) in cases {
+        let mut all = args.to_vec();
+        all.push("--json");
+        let out = idl_verify(&all);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains(expected), "{args:?}: {json}");
+        assert!(!error.contains("secret-token") && !stderr.contains("secret-token"));
+    }
+}
+
+#[test]
 fn reads_the_rpc_url_from_the_environment() {
     let out = Command::new(env!("CARGO_BIN_EXE_idl-verify"))
         .args(["--idl", &live("voltr_vault/idl.json")])
@@ -474,4 +504,116 @@ fn markdown_report_lists_findings_with_hints() {
         ),
         "{md}"
     );
+}
+
+/// Each file in `dir` and its bytes, by name.
+fn files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read(&path).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn fixture_export_writes_the_same_files_each_time() {
+    let idl = live("pump_fun/idl.json");
+    let samples = live("pump_fun/samples-2026-10-16.json");
+    // 12 accounts and 41 instructions, captured with --save-samples on 2026-10-16.
+    for (format, instructions, summary) in [
+        (
+            "shipstern",
+            0,
+            "exported 12 account and 0 transaction files",
+        ),
+        ("carbon", 41, "exported 12 account and 41 instruction files"),
+    ] {
+        let dir = std::env::temp_dir().join(format!("idl-verify-export-{format}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let export = || {
+            let dir = dir.to_str().unwrap();
+            let args = ["--export-fixtures", dir, "--fixture-format", format];
+            idl_verify(&[&["--idl", &idl, "--samples", &samples][..], &args].concat())
+        };
+        let out = export();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        // The TradeEvent error sets exit 1; the export does not change the exit code.
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(summary), "{stderr}");
+        let first = files(&dir);
+        let count = |suffix: &str| first.iter().filter(|(n, _)| n.ends_with(suffix)).count();
+        assert_eq!(count("_account.json"), 12);
+        assert_eq!(count("_instruction.json"), instructions);
+        assert_eq!(first.len(), 12 + instructions);
+        export();
+        assert!(files(&dir) == first, "a second export changed the files");
+    }
+
+    // Only events: no account and no whole transaction gives a Shipstern file.
+    let dir = std::env::temp_dir().join("idl-verify-export-none");
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_arg = dir.to_str().unwrap();
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &[
+                "--samples",
+                &live("pump_fun/samples.json"),
+                "--export-fixtures",
+                dir_arg,
+                "--fixture-format",
+                "shipstern",
+            ],
+            "no sample gives a shipstern fixture file",
+        ),
+        (
+            &["--samples", &samples, "--fixture-format", "carbon"],
+            "--export-fixtures <DIR>",
+        ),
+        (
+            &["--samples", &samples, "--export-fixtures", dir_arg],
+            "--fixture-format <FORMAT>",
+        ),
+    ];
+    for (args, message) in cases {
+        let out = idl_verify(&[&["--idl", idl.as_str()][..], args].concat());
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_write_error_still_prints_the_skipped_samples() {
+    let dir = std::env::temp_dir().join("idl-verify-export-write-error");
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = "11111111111111111111111111111112";
+    // The target of the second account's file is a directory, so it cannot be written.
+    std::fs::create_dir_all(dir.join(format!("{key}_account.json"))).unwrap();
+    let samples = dir.join("samples.json");
+    let accounts =
+        format!(r#"[{{"address":"../evil","data":"AQ=="}},{{"address":"{key}","data":"AQ=="}}]"#);
+    std::fs::write(&samples, format!(r#"{{"accounts":{accounts}}}"#)).unwrap();
+    let out = idl_verify(&[
+        "--idl",
+        &live("pump_fun/idl.json"),
+        "--samples",
+        samples.to_str().unwrap(),
+        "--export-fixtures",
+        dir.to_str().unwrap(),
+        "--fixture-format",
+        "carbon",
+    ]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("warning: fixture export: accounts[0]"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("error: cannot write"), "{stderr}");
 }

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 /// Errors that stop a run before any check can report (exit code 2).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("cannot read {path}: {source}")]
     Read {
