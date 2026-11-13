@@ -1,0 +1,23 @@
+[package]
+name = "idl-verify-carbon"
+description = "Run a Carbon decoder as the decoder under test of idl-verify --decoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["solana", "idl", "carbon", "decoder", "indexer"]
+categories = ["development-tools::testing"]
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+# No Carbon or Solana dependency: `serve!` expands in the user's crate, against the user's own
+# carbon-core and solana crates, so their versions never clash with a copy that this crate adds.
+[dependencies]
+base64.workspace = true
+bs58.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -14,6 +14,7 @@
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
 pub mod allow;
+pub mod carbon;
 pub mod codama_convert;
 pub mod diff;
 pub mod inspect;
@@ -26,6 +27,7 @@ mod reach;
 pub mod rpc;
 pub mod shipstern;
 pub mod source;
+pub mod stale;
 
 pub use diff::{diff, Change, ChangeKind, Report, Severity};
 pub use inspect::{coverage, layouts, CoverageReport, TypeLayout, UnmappedField};

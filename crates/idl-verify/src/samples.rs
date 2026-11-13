@@ -5,14 +5,15 @@
 //!   "programId": "vVoLTRjQmtFpiYoegx285Ze4gsLJ8ZxgFKVcuvmG1a8",
 //!   "accounts": [{ "address": "...", "data": "<base64>" }],
 //!   "instructions": [{ "signature": "...", "data": "<base64>", "accounts": ["<base58>"],
-//!                      "signer": [true], "writable": [false], "cpi": false }],
+//!                      "signer": [true], "writable": [false], "cpi": false,
+//!                      "position": [0, 0] }],
 //!   "events": [{ "signature": "...", "source": "log", "data": "<base64>" }]
 //! }
 //! ```
 //!
 //! Any other keys, such as an account's `type` label, are ignored: samples are classified
-//! by discriminator, never by a label. `signer`, `writable` and `cpi` are optional, so older
-//! files still load.
+//! by discriminator, never by a label. `signer`, `writable`, `cpi` and `position` are optional,
+//! so older files still load.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -38,12 +39,31 @@ pub struct AccountSample {
 
 /// One instruction addressed to the program: its data and account keys in order.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct InstructionSample {
     pub signature: String,
     pub data: Vec<u8>,
     pub accounts: Vec<String>,
     /// What the transaction message says about each key; `None` when the sample has no flags.
     pub flags: Option<KeyFlags>,
+    /// `[top-level index, inner index]` in the transaction. The inner index is 0 for a
+    /// top-level instruction, else the place of the CPI in that instruction's list, from 1.
+    /// `None` when the samples file does not give it.
+    pub position: Option<[usize; 2]>,
+}
+
+impl InstructionSample {
+    /// A sample with no flags and no position. Set them after, when they are known.
+    #[must_use]
+    pub fn new(signature: String, data: Vec<u8>, accounts: Vec<String>) -> Self {
+        Self {
+            signature,
+            data,
+            accounts,
+            flags: None,
+            position: None,
+        }
+    }
 }
 
 /// Message-level privileges of an instruction's keys, one entry per key in `accounts`.
@@ -126,6 +146,8 @@ struct InstructionJson {
     writable: Option<Vec<bool>>,
     #[serde(default)]
     cpi: Option<bool>,
+    #[serde(default)]
+    position: Option<serde_json::Value>,
 }
 
 impl Samples {
@@ -135,6 +157,17 @@ impl Samples {
     ///
     /// When the text is not samples JSON, or a `data` field is not base64.
     pub fn from_json(src: &str) -> Result<Self, Error> {
+        Self::from_json_with_warnings(src).map(|(samples, _)| samples)
+    }
+
+    /// [`Samples::from_json`], and a warning for each kind of key that it ignores: today a
+    /// `position` that is not two numbers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Samples::from_json`].
+    pub fn from_json_with_warnings(src: &str) -> Result<(Self, Vec<String>), Error> {
+        let mut bad_positions = Vec::new();
         let raw: SamplesJson = serde_json::from_str(src).map_err(Error::SamplesJson)?;
         let accounts = raw
             .accounts
@@ -171,6 +204,13 @@ impl Samples {
                     signature: ix.signature,
                     accounts: ix.accounts,
                     flags,
+                    position: ix.position.and_then(|value| {
+                        let position = <[usize; 2]>::deserialize(&value).ok();
+                        if position.is_none() {
+                            bad_positions.push(index);
+                        }
+                        position
+                    }),
                 })
             })
             .collect::<Result<_, Error>>()?;
@@ -186,12 +226,24 @@ impl Samples {
                 })
             })
             .collect::<Result<_, Error>>()?;
-        Ok(Self {
+        // An older idl-verify ignored this key, so a bad one must not stop the run.
+        let warnings = match bad_positions.as_slice() {
+            [] => Vec::new(),
+            [first] => vec![format!(
+                "instructions[{first}].position is not [top-level index, inner index]; it is ignored"
+            )],
+            [first, rest @ ..] => vec![format!(
+                "instructions[{first}].position is not [top-level index, inner index], and {} more; they are ignored",
+                rest.len()
+            )],
+        };
+        let samples = Self {
             program_id: raw.program_id.filter(|id| !id.is_empty()),
             accounts,
             instructions,
             events,
-        })
+        };
+        Ok((samples, warnings))
     }
 
     /// The samples as `samples.json` text, so a live run can be saved and rerun offline.
@@ -213,6 +265,9 @@ impl Samples {
                     v["signer"] = serde_json::json!(flags.signer);
                     v["writable"] = serde_json::json!(flags.writable);
                     v["cpi"] = serde_json::json!(flags.cpi);
+                }
+                if let Some(position) = ix.position {
+                    v["position"] = serde_json::json!(position);
                 }
                 v
             })
@@ -276,7 +331,7 @@ mod tests {
     fn saved_samples_load_back_unchanged() {
         let src = r#"{"programId":"P","accounts":[{"address":"A","data":"AQID"}],
             "instructions":[{"signature":"S","data":"BA==","accounts":["X"]},
-                {"signature":"S","data":"BA==","accounts":["X"],"signer":[true],"writable":[false],"cpi":true}],
+                {"signature":"S","data":"BA==","accounts":["X"],"signer":[true],"writable":[false],"cpi":true,"position":[2,3]}],
             "events":[{"signature":"S","source":"log","data":"BQY="}]}"#;
         let samples = Samples::from_json(src).unwrap();
         let again = Samples::from_json(&samples.to_json()).unwrap();
@@ -290,6 +345,8 @@ mod tests {
             cpi: true,
         };
         assert_eq!(again.instructions[1].flags, Some(flags));
+        assert_eq!(again.instructions[1].position, Some([2, 3]));
+        assert_eq!(again.instructions[0].position, None);
     }
 
     #[test]
@@ -303,6 +360,22 @@ mod tests {
                 .to_string();
             assert!(err.starts_with("instructions[0]: give `signer`"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_position_of_another_shape_is_ignored_with_one_warning() {
+        let src = r#"{"instructions":[
+            {"signature":"S","data":"BA==","position":[1]},
+            {"signature":"S","data":"BA==","position":[0,"x"]},
+            {"signature":"S","data":"BA==","position":[3,1]}]}"#;
+        let (samples, warnings) = Samples::from_json_with_warnings(src).unwrap();
+        let positions: Vec<_> = samples.instructions.iter().map(|ix| ix.position).collect();
+        assert_eq!(positions, [None, None, Some([3, 1])]);
+        assert_eq!(
+            warnings,
+            ["instructions[0].position is not [top-level index, inner index], and 1 more; they are ignored"]
+        );
+        assert_eq!(Samples::from_json(src).unwrap().instructions.len(), 3);
     }
 
     #[test]

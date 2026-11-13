@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "idl-drift"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -619,8 +619,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "idl-drift-guard"
+version = "0.4.0"
+dependencies = [
+ "bs58",
+ "idl-drift",
+]
+
+[[package]]
 name = "idl-verify"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -633,6 +641,34 @@ dependencies = [
  "sha2",
  "thiserror",
  "ureq",
+]
+
+[[package]]
+name = "idl-verify-carbon"
+version = "0.4.0"
+dependencies = [
+ "base64 0.22.1",
+ "bs58",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "idl-verify-fixtures"
+version = "0.4.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "idl-verify-shipstern"
+version = "0.4.0"
+dependencies = [
+ "base64 0.22.1",
+ "bs58",
+ "serde_json",
 ]
 
 [[package]]

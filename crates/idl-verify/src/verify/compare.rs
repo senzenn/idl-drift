@@ -1,5 +1,7 @@
 //! Compare decoded values with the reference decoder, the decoder under test or the old IDL.
 
+use serde_json::Value as Json;
+
 use super::{Outcomes, Verifier};
 use crate::decode::Value;
 use crate::reference::{first_difference, normalize, to_json, Outcome};
@@ -130,7 +132,11 @@ impl Verifier<'_> {
                                 data = serde_json::json!({ arg: data });
                             }
                         }
-                        entries.push((*i, Some(Outcome::Ok(data)), value));
+                        entries.push((
+                            *i,
+                            Some(Outcome::Ok(unknown_wrapper_off(data, value))),
+                            value,
+                        ));
                     } else {
                         wrong_name.push((*i, their_name.to_string()));
                     }
@@ -160,4 +166,21 @@ impl Verifier<'_> {
         let (compared, matched) = self.compare(subject, &borrowed, &id);
         (compared + wrong_name.len(), matched)
     }
+}
+
+/// Carbon keeps a struct argument such as `params` as one field, where a Codama IDL lists the
+/// fields of the struct as the arguments. Remove the field when the IDL has no field of its name.
+fn unknown_wrapper_off(data: Json, value: &Value) -> Json {
+    let Value::Struct(fields) = value else {
+        return data;
+    };
+    let inner = data
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.iter().next())
+        .filter(|(key, inner)| {
+            inner.is_object() && !fields.iter().any(|(f, _)| normalize(f) == normalize(key))
+        })
+        .map(|(_, inner)| inner.clone());
+    inner.unwrap_or(data)
 }

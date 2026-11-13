@@ -1,0 +1,22 @@
+[package]
+name = "carbon-guard"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "A Carbon decoder wrapped in an idl-drift-guard Guard"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the decoder crates stay out of its build and MSRV.
+[workspace]
+
+[dependencies]
+carbon-core = "=2.0.0"
+carbon-pumpfun-decoder = "=2.0.0"
+solana-account = "4.3.2"
+solana-instruction = { version = "3.4.1", default-features = false }
+idl-drift-guard = { path = "../../../crates/idl-drift-guard" }
+
+[dev-dependencies]
+base64 = "0.22"
+bs58 = "0.5"
+serde_json = "1"

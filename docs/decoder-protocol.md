@@ -1,20 +1,10 @@
 # Decoder protocol
 
-`idl-verify --decoder "<command>"` compares the IDL with a **decoder under test**: a program
-that you supply, such as a binary built from a generated parser. idl-verify sends each
-sample to the decoder, and compares each reply with its own decode of the same bytes from
-the IDL. Use this mode to find the bugs that a generated parser adds on top of the IDL, and
-the bugs in the IDL that the parser copies.
-
-```mermaid
-sequenceDiagram
-    participant V as idl-verify
-    participant D as decoder under test
-    loop each sample
-        V->>D: one JSON line on stdin
-        D->>V: one JSON reply on stdout
-    end
-```
+`idl-verify --decoder "<command>"` compares the IDL with a decoder under test. The decoder is a
+program that you supply, such as a binary built from a generated parser. idl-verify sends each
+sample to the decoder as one JSON line on stdin, and reads one JSON reply on stdout. It compares
+each reply with its own decode of the same bytes from the IDL. This finds the bugs that a
+generated parser adds, and the IDL bugs that the parser copies.
 
 ## Run
 
@@ -22,15 +12,36 @@ sequenceDiagram
 idl-verify --idl idl.json --samples samples.json --decoder "./target/release/my-decoder spl_governance"
 ```
 
-[examples/decoders](../examples/decoders/README.md) has a working decoder for Shipstern and one
-for Carbon.
+- idl-verify splits the command on whitespace. The first word is the program, and the other
+  words are its arguments. There is no shell, so quotes and pipes have no special meaning.
+- `--decoder` works with `--samples` and with live sampling.
+- After the last reply, idl-verify stops the decoder process, and only that process. So a
+  wrapper such as `sh -c` must start the decoder with `exec`.
 
-idl-verify splits the command on whitespace. The first word is the program, and the other
-words are its arguments. There is no shell, so quotes and pipes have no special meaning.
-`--decoder` works with `--samples` and with live sampling.
+## Adapters
 
-After the last reply, idl-verify stops the decoder process. It stops only that process, so a
-wrapper such as `sh -c` must start the decoder with `exec`.
+For a generated parser, you do not have to write the decoder. Two crates serve this protocol
+with one line in a binary of your crate. [examples/decoders](../examples/decoders/README.md)
+uses both.
+
+| Crate | Parser | The line |
+|---|---|---|
+| [idl-verify-shipstern](../crates/idl-verify-shipstern/README.md) | Shipstern 0.9 to 0.12 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7 (`include_vixen_parser!`) | `idl_verify_shipstern::serve!(shipstern, my_program::AccountParser, my_program::InstructionParser)` |
+| [idl-verify-carbon](../crates/idl-verify-carbon/README.md) | Carbon 2.0 decoders, from crates.io or `carbon-cli` | `idl_verify_carbon::serve!(carbon_pumpfun_decoder::PumpfunDecoder, events = carbon_pumpfun_decoder::instructions::CpiEvent)` |
+
+```rust
+// src/bin/verify-decoder.rs
+fn main() -> std::io::Result<()> {
+    idl_verify_carbon::serve!(carbon_pumpfun_decoder::PumpfunDecoder, events = carbon_pumpfun_decoder::instructions::CpiEvent)
+}
+```
+
+Build it with `cargo build --bin verify-decoder`, and give `--decoder target/debug/verify-decoder`.
+
+Neither crate depends on its framework. The macro expands in your crate, against the framework
+crates that you use, so their versions do not clash. Both crates send values in the shapes
+below. A sample that the parser rejects (a Shipstern parse error, a Carbon `None`) gets an
+`error` reply. Events get a `skip` reply when the macro has no event parser.
 
 ## Requests
 
@@ -47,16 +58,16 @@ all instructions, then all events. Then it closes stdin.
 |---|---|
 | `kind` | `account`, `instruction` or `event`. |
 | `program` | The program id: `--program`, else the samples' `programId`, else the IDL's `address`. |
-| `address` | The account address. Can be empty when the samples file has none. |
-| `signature` | The transaction signature. Can be empty when the samples file has none. |
-| `data` | The raw bytes, base64. For an account: the full account data. For an instruction: the instruction data. For an event: `[discriminator][payload]`. idl-verify removes a self-CPI envelope first. |
+| `address` | The account address. It is empty when the samples file has none. |
+| `signature` | The transaction signature. It is empty when the samples file has none. |
+| `data` | The raw bytes, base64. Account: the full account data. Instruction: the instruction data. Event: `[discriminator][payload]`, after idl-verify removes a self-CPI envelope. |
 | `accounts` | The instruction's account keys, in order. |
 | `source` | `log` for a `Program data:` line, `cpi` for a self-CPI event. |
 
 ## Replies
 
-The decoder writes one line to stdout for each request, in the same order. Empty lines are
-ignored. Each reply is one of these:
+The decoder writes one line to stdout for each request, in the same order. idl-verify ignores
+empty lines. Each reply is one of these:
 
 ```json
 {"status":"ok","value":<decoded value>}
@@ -70,49 +81,48 @@ ignored. Each reply is one of these:
 | `error` | The decoder rejected the sample. | An error when the IDL decodes the same bytes. |
 | `skip` | The decoder does not decode this kind of sample, such as a parser built without events. | A note. |
 
-A decoder that answers `skip` to each request passes with exit 0 and only notes. Look at
-the notes, or the `reference` counts in the JSON report, to make sure that values were
-compared.
+A decoder that replies `skip` to each request passes with exit 0 and only notes. To make sure
+that idl-verify compared values, look at the notes or the `reference` counts in the JSON report.
 
 ### Value shapes
 
-For an account, `value` is the decoded account: an object with one key for each field.
-For an instruction or an event, `value` is `{"name":"<name>","data":{...}}`. `name` is the
-instruction or event name. `data` holds the arguments or the event fields. An instruction
-with one struct argument can return the struct itself as `data`, as Shipstern does.
-
-Write values in serde's plain JSON shapes. idl-verify accepts these forms:
+For an account, `value` is the decoded account: an object with one key for each field. For an
+instruction or an event, `value` is `{"name":"<name>","data":{...}}`. `name` is the instruction
+or event name, and `data` holds the arguments or the event fields. An instruction with one
+struct argument can return the struct itself as `data`, as Shipstern does. A struct argument in
+one field, as Carbon keeps `params`, also matches an IDL that lists the struct fields as the
+arguments. Write values in the plain JSON shapes of serde. idl-verify accepts these forms:
 
 | Value | Accepted forms |
 |---|---|
 | Integer, up to 32 bits | A JSON number. |
 | Integer, 64 bits or wider | A JSON number, a decimal string, or `{"bn":"<decimal>"}`. Use a string or `{"bn":...}` for a value that does not fit in a `u64`. |
-| Float | A JSON number, widened to `f64` for an `f32`. NaN can be `null`, as serde writes it. |
+| Float | A JSON number. An `f32` matches when the number narrows to the same `f32`, so its shortest text (`0.1`) and its `f64` widening both match. NaN and infinity can be `null`, as serde writes them. |
 | Pubkey | A base58 string, or an array of its 32 bytes, as serde writes a `Pubkey`. |
 | Bytes | An array of numbers. |
 | Option | `null` for `None`, else the inner value. |
 | Struct | An object. Field names compare without case and without underscores, so `last_updated_epoch` matches `lastUpdatedEpoch`. A Shipstern tuple field `item_0` matches `0`. |
 | Tuple | An array, or an object with keys `"0"`, `"1"`, ... |
-| Enum | `{"<Variant>": <payload>}`. A unit variant can also be a bare string, `"<Variant>"`. Shipstern's `{"kind": ...}` wrapper is accepted. |
+| Enum | `{"<Variant>": <payload>}`. A unit variant can also be a bare string, `"<Variant>"`. idl-verify also accepts the `{"kind": ...}` wrapper of Shipstern. |
 | Map | An array of `[key, value]` pairs. |
-| Wrappers | A one-field wrapper around a value, and a type-name wrapper such as `{"Pool": {...}}`, are accepted. |
+| Wrappers | idl-verify accepts a one-field wrapper around a value, and a type-name wrapper such as `{"Pool": {...}}`. |
 
 ## Errors and timeouts
 
-The run exits 2 in these cases:
+The run exits 2 when:
 
 - The command cannot start.
 - The decoder writes a line that is not JSON, or a reply with no `status`.
-- The decoder closes stdout before it answers each request. The message gives the exit
+- The decoder closes stdout before it replies to each request. The message gives the exit
   status and the number of replies.
-- The decoder gives no reply within 60 seconds. idl-verify stops the decoder.
+- The decoder gives no reply within 60 seconds. Then idl-verify stops the decoder.
 
-idl-verify writes requests on one thread and reads replies on another. A decoder can answer
-each line as soon as it reads it.
+idl-verify writes requests on one thread and reads replies on another. So a decoder can reply
+to each line as soon as it reads it.
 
 ## A minimal decoder
 
-This Python decoder, `skip_decoder.py`, shows the framing. It skips each sample:
+This Python decoder, `skip_decoder.py`, shows the framing. It replies `skip` to each sample:
 
 ```python
 import json, sys
@@ -123,23 +133,5 @@ for line in sys.stdin:
     print(json.dumps(reply), flush=True)
 ```
 
-```bash
-idl-verify --idl fixtures/live/jupiter_vaults/idl.json \
-           --samples fixtures/live/jupiter_vaults/samples.json \
-           --decoder "python3 skip_decoder.py"
-```
-
-```text
-note: instruction operate: not compared: the decoder under test skipped 12 of 12 samples: instruction not decoded
-...
-summary: 0 errors, 0 warnings, 13 notes
-```
-
-A decoder that returns wrong values gets an error for each type:
-
-```text
-error: account Branch: values differ from the decoder under test in 1 of 1 sample: idl-verify read {"branch_id":1,"connected_branch_id":0,"connected_minima_tic..., the decoder under test {"bump":0}
-  hint: one of the two decoders misreads these bytes; check the field's type and offset
-```
-
-To run this check each night, see [ci.md](ci.md#example-workflows).
+Give it as `--decoder "python3 skip_decoder.py"`. To run this check each night, see
+[ci.md](ci.md#example-workflows).

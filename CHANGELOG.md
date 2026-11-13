@@ -5,6 +5,39 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
+### Added
+
+- `idl-drift inspect --for shipstern` and `--for carbon` list what the code generator of
+  that framework rejects, changes or drops. A `SHIPSTERN:` or `CARBON:` line sets exit code 1.
+  For a Codama IDL, `--for shipstern` predicts the enum tag panics of the Shipstern 0.13
+  macro (rule `EnumTag`).
+- `idl-drift stale` tells if the on-chain IDL of a program is older than its last deploy.
+- `idl-drift watch` checks programs for a new deploy or a new on-chain IDL, and reports the
+  diff against the local IDL. Options: `--once`, `--interval`, `--state`, `--webhook` and
+  `--save-onchain`. The GitHub Action can turn its report into a pull request or an issue.
+- The diff rule `reserved_bytes_used` (Dangerous): new fields take the bytes of a reserved
+  array. `idl-verify --upgrade-impact --compare-idl` checks that these bytes are zero.
+- `idl-drift diff --suggest-version` prints the version bump that a crate generated from the
+  old IDL needs: major, patch or none.
+- Baseline: `--write-allow FILE` writes an allow file that accepts each current finding, and
+  `--prune-allow` removes the entries that match nothing. Both tools have them.
+- `idl-verify --export-fixtures DIR --fixture-format shipstern|carbon` writes the samples as
+  test fixtures for a Shipstern or Carbon parser.
+- `idl-verify timeline` lists the deploys of a program, and tells which IDL decodes each slot
+  range between two deploys.
+- New crates:
+  - `idl-drift-guard` wraps a Shipstern, Vixen or Carbon parser in production. It counts the
+    decode misses per program and alerts at the first bad data after an upgrade.
+  - `idl-verify-shipstern` and `idl-verify-carbon` make a Shipstern or Vixen parser, or a
+    Carbon decoder, into an `idl-verify --decoder` with one macro line.
+  - `idl-verify-fixtures` makes one test for each fixture file with `sample_tests!`.
+
+### Changed
+
+- The docs are shorter. Each command, flag, exit code, rule name and JSON key stays.
+
 ## [0.3.1] - 2026-11-06
 
 ### Added

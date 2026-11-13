@@ -1,0 +1,51 @@
+# Check each hour whether a program has a new deploy or a new on-chain IDL, with idl-drift watch.
+# An additive or cosmetic change opens a pull request that writes the on-chain IDL to your local
+# file. A breaking or dangerous change opens an issue with the diff.
+# Copy to .github/workflows/ in your repository. Setup and results: docs/ci.md in idl-drift.
+name: idl-drift watch
+
+on:
+  schedule:
+    - cron: "23 * * * *" # each hour at minute 23
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the branch of a pull request
+  pull-requests: write
+  issues: write
+
+# Two runs at the same time could open the same pull request.
+concurrency:
+  group: idl-drift-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The action pushes the branch of a pull request with these credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The state file keeps the slots of the last run, so that a run reports only new changes.
+      # Without it, each run reports each program again, but opens no pull request or issue twice.
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .idl-watch/state.json
+          key: idl-watch-${{ github.run_id }}
+          restore-keys: idl-watch-
+
+      # The watch command is not in a release yet. When it is, pin the full commit SHA of
+      # that release here and set `version` to its tag.
+      - uses: senzenn/idl-drift@main
+        with:
+          command: watch
+          # One `<program> <local IDL path> [metadata|anchor]` per line. A relative IDL path
+          # is relative to the directory of the programs file.
+          programs: idls/programs.txt
+          state: .idl-watch/state.json
+          # The action gives the URL to idl-drift only in IDL_DRIFT_RPC_URL.
+          rpc-url: ${{ secrets.IDL_DRIFT_RPC_URL }}
+          # gh uses github.token by default. GitHub runs no workflow on a pull request that
+          # github.token opens; for CI on them, give a GitHub App token here.
+          # token: ${{ steps.app-token.outputs.token }}

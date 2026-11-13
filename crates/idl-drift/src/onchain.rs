@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use flate2::read::{GzDecoder, ZlibDecoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -35,10 +35,11 @@ const METADATA_HEADER_LEN: usize = 96;
 /// An initialized metadata account. An empty account is 0 and a buffer is 1.
 const METADATA_DISCRIMINATOR: u8 = 2;
 
-type Key = [u8; 32];
+pub(crate) type Key = [u8; 32];
 
-/// The account that holds a program's IDL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The account that holds a program's IDL. The serde names are those of [`Source::key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Source {
     /// The canonical `idl` account of the Program Metadata program. Anchor 1.0 and later
     /// write only this one.
@@ -244,6 +245,20 @@ pub fn fetch(
     program: &str,
     source: Option<Source>,
 ) -> Result<OnchainIdl, Error> {
+    fetch_with_text(rpc, program, source).map(|(found, _)| found)
+}
+
+/// As [`fetch`], and also the JSON text of the IDL as the account holds it, for a caller that
+/// saves the IDL.
+///
+/// # Errors
+///
+/// As [`fetch`].
+pub fn fetch_with_text(
+    rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    program: &str,
+    source: Option<Source>,
+) -> Result<(OnchainIdl, String), Error> {
     let found = fetch_text(rpc, program, source)?;
     let mut idl = Idl::from_json(&found.text).map_err(|error| Error::Idl {
         source: found.source,
@@ -254,11 +269,12 @@ pub fn fetch(
     if idl.address.is_empty() {
         idl.address = found.program;
     }
-    Ok(OnchainIdl {
+    let found_idl = OnchainIdl {
         idl,
         source: found.source,
         account: found.account,
-    })
+    };
+    Ok((found_idl, found.text))
 }
 
 /// The JSON text of an on-chain IDL, before the IDL model reads it.
@@ -279,14 +295,10 @@ pub(crate) fn fetch_text(
 ) -> Result<OnchainText, Error> {
     let key = parse_key(program).ok_or_else(|| Error::Program(program.to_string()))?;
     let program = bs58::encode(key).into_string();
-    let candidates: Vec<(Source, String, &str)> = [
-        (Source::Metadata, metadata_address(&key), METADATA_PROGRAM),
-        (Source::Anchor, anchor_idl_address(&key), program.as_str()),
-    ]
-    .into_iter()
-    .filter(|(s, _, _)| source.is_none_or(|asked| asked == *s))
-    .filter_map(|(s, address, owner)| Some((s, bs58::encode(address?).into_string(), owner)))
-    .collect();
+    let candidates: Vec<(Source, String, String)> = candidates(&key)
+        .into_iter()
+        .filter(|(s, _, _)| source.is_none_or(|asked| asked == *s))
+        .collect();
 
     let keys: Vec<&str> = candidates.iter().map(|(_, a, _)| a.as_str()).collect();
     let result = rpc(
@@ -361,6 +373,50 @@ pub(crate) fn fetch_text(
         account,
         program,
     })
+}
+
+/// The IDL accounts that the program `key` can have: the source, the address, and the owner
+/// that the account must have. Anyone can send lamports to the address, which makes a system
+/// account with no data, so only the owner shows an IDL account.
+fn candidates(key: &Key) -> Vec<(Source, String, String)> {
+    let program = bs58::encode(key).into_string();
+    [
+        (
+            Source::Metadata,
+            metadata_address(key),
+            METADATA_PROGRAM.to_string(),
+        ),
+        (Source::Anchor, anchor_idl_address(key), program),
+    ]
+    .into_iter()
+    .filter_map(|(s, address, owner)| Some((s, bs58::encode(address?).into_string(), owner)))
+    .collect()
+}
+
+/// The IDL accounts that the program `key` has, by source and address, with no data read.
+pub(crate) fn idl_accounts(
+    mut rpc: impl FnMut(&str, Value) -> Result<Value, Error>,
+    key: &Key,
+) -> Result<Vec<(Source, String)>, Error> {
+    let candidates = candidates(key);
+    let keys: Vec<&str> = candidates.iter().map(|(_, a, _)| a.as_str()).collect();
+    let config = json!({ "encoding": "base64", "dataSlice": { "offset": 0, "length": 0 } });
+    let result = rpc("getMultipleAccounts", json!([keys, config]))?;
+    let page = AccountsPage::deserialize(&result)
+        .map_err(|e| Error::RpcResponse(format!("getMultipleAccounts: {e}")))?;
+    if page.value.len() != candidates.len() {
+        return Err(Error::RpcResponse(format!(
+            "getMultipleAccounts: {} accounts for {} keys",
+            page.value.len(),
+            candidates.len()
+        )));
+    }
+    Ok(candidates
+        .into_iter()
+        .zip(page.value)
+        .filter(|((_, _, owner), value)| value.as_ref().is_some_and(|a| a.owner == *owner))
+        .map(|((source, address, _), _)| (source, address))
+        .collect())
 }
 
 /// Whether a key or string holds a control character. `docs` are skipped: the model drops
@@ -499,7 +555,7 @@ fn text(reader: impl Read) -> Result<String, DecodeError> {
     String::from_utf8(out).map_err(|_| DecodeError::NotUtf8)
 }
 
-fn parse_key(key: &str) -> Option<Key> {
+pub(crate) fn parse_key(key: &str) -> Option<Key> {
     bs58::decode(key).into_vec().ok()?.try_into().ok()
 }
 

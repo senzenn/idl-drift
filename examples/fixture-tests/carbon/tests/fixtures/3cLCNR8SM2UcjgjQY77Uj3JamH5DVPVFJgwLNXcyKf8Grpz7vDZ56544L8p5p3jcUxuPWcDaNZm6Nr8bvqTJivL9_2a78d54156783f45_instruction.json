@@ -1,0 +1,36 @@
+{
+  "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "accounts": [
+    {
+      "pubkey": "AzBM9wruk2SwJNRHkpapDXzVk2bGJzQWNC97i4vgDbST",
+      "is_signer": true,
+      "is_writable": true
+    },
+    {
+      "pubkey": "AzBM9wruk2SwJNRHkpapDXzVk2bGJzQWNC97i4vgDbST",
+      "is_signer": true,
+      "is_writable": true
+    },
+    {
+      "pubkey": "9GPmfTwAFqo41sfqYqM9kwALtS333FtjwzpdjLzeize1",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "11111111111111111111111111111111",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      "is_signer": false,
+      "is_writable": false
+    }
+  ],
+  "data": "5e06ca73ff60e8b7"
+}

@@ -1,0 +1,17 @@
+PumpAccount {
+    account: UserVolumeAccumulator(
+        UserVolumeAccumulator {
+            user: KeyBytes(
+                "yFB49r3wkHGhC5dDhGFJvz3eCZ7hZR3Ex4em4uStiub",
+            ),
+            needs_claim: false,
+            total_unclaimed_tokens: 0,
+            total_claimed_tokens: 0,
+            current_sol_volume: 0,
+            last_update_timestamp: 0,
+            has_total_claimed_tokens: false,
+            cashback_earned: 2317792311,
+            total_cashback_claimed: 2318290511,
+        },
+    ),
+}

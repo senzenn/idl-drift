@@ -1,10 +1,12 @@
 //! Upgrade impact: how a new IDL reads the sampled accounts, and the rent of a realloc.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use idl_drift::model::{Idl, TypeDef};
 use serde_json::{json, Map, Value as Json};
 
+use super::reserved::{Fault, ReservedBytes};
 use super::{Outcomes, Verifier};
 use crate::decode::{DecodeError, DecodeErrorKind, Decoded, Value};
 use crate::error::Error;
@@ -48,8 +50,9 @@ pub fn offline_rent_minimum(data_len: usize) -> Result<u64, Error> {
 /// Decode each account sample with `new`, the IDL of a program upgrade, and put it in a
 /// class: ok, shorter, needs a realloc, or broken. Instructions and events are not checked.
 ///
-/// `old` holds the decodes of the current IDL ([`Reference::from_idl`]): a field that both
-/// IDLs name and that decodes to another value breaks the account. `cluster_rent` gives the
+/// `old` holds the decodes of the current IDL ([`Reference::for_upgrade`]): a field that both
+/// IDLs name and that decodes to another value breaks the account, and so does a new field
+/// that takes reserved bytes that are not zero. [`Reference::from_idl`] gives no reserved check. `cluster_rent` gives the
 /// rent-exempt minimum of a data size, such as from [`crate::rpc::rent_exempt_minimum`];
 /// without it, [`offline_rent_minimum`] estimates it.
 ///
@@ -64,6 +67,9 @@ pub fn verify_upgrade(
 ) -> Result<Report, Error> {
     let mut v = Verifier::new(new, samples, old);
     v.upgrade = Some(Vec::new());
+    v.reserved = old
+        .and_then(|r| r.old.as_ref())
+        .and_then(|(old_idl, _)| ReservedBytes::new(old_idl, new));
     v.check_program_id();
     let accounts = v.check_accounts();
     let types = v.upgrade.take().unwrap_or_default();
@@ -174,7 +180,18 @@ impl Verifier<'_> {
             }
         };
         if let Some(Outcome::Ok(theirs)) = self.reference.and_then(|r| r.accounts.get(i)) {
-            let (ours, theirs) = shared_fields(value, theirs);
+            let account = self
+                .reference
+                .and_then(|r| r.old.as_ref()?.1.get(i)?.as_deref());
+            let theirs = match self.reserved.as_ref().zip(account) {
+                Some((check, account)) => match check.check(account, theirs) {
+                    Ok(Some(without_reserved)) => Cow::Owned(without_reserved),
+                    Ok(None) => Cow::Borrowed(theirs),
+                    Err(Fault { reason, detail }) => return Class::Broken { reason, detail },
+                },
+                None => Cow::Borrowed(theirs),
+            };
+            let (ours, theirs) = shared_fields(value, &theirs);
             if let Some(d) = first_difference(&ours, &theirs) {
                 let field = if d.path.is_empty() {
                     "the value".to_string()
@@ -396,8 +413,7 @@ fn broken(e: &DecodeError) -> Class {
 
 /// `ours` and `theirs` cut down to the struct fields that both IDLs name and the list, tuple
 /// and map items that both read, also inside a present option or the same enum variant. So a
-/// new field, or a reserved array that gives bytes to one, is not a difference. Other values
-/// compare whole.
+/// new field is not a difference. Other values compare whole.
 fn shared_fields(ours: &Value, theirs: &Json) -> (Json, Json) {
     match (ours, theirs) {
         (Value::Struct(fields), Json::Object(map)) => {
@@ -544,7 +560,7 @@ mod tests {
 
     /// The impact of `new` on `samples`, offline, compared with `old` when given.
     fn impact(new: &Idl, old: Option<&Idl>, samples: &Samples) -> Report {
-        let old = old.map(|old| Reference::from_idl(old, new, samples));
+        let old = old.map(|old| Reference::for_upgrade(old, new, samples));
         verify_upgrade(new, samples, old.as_ref(), None).unwrap()
     }
 
@@ -699,6 +715,162 @@ mod tests {
         assert!(first_difference(&a, &b).is_some(), "{a} vs {b}");
         let (a, b) = shared_fields(&map, &json!([[2, {"a": 5}]]));
         assert!(first_difference(&a, &b).is_some(), "{a} vs {b}");
+    }
+
+    #[test]
+    fn reserved_bytes_that_a_new_field_takes_must_be_zero() {
+        let old = account_idl(
+            r#"[{"name":"a","type":"u32"},{"name":"reserved","type":{"array":["u8",8]}}]"#,
+        );
+        let new = account_idl(
+            r#"[{"name":"a","type":"u32"},{"name":"b","type":"u32"},{"name":"reserved","type":{"array":["u8",4]}}]"#,
+        );
+        // `b` takes bytes 0..4 of `reserved`. Bytes 4..8 stay reserved, so they can hold anything.
+        let zero = accounts(&[&[1, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9]]);
+        let report = impact(&new, Some(&old), &zero);
+        assert_eq!(row(&report).ok, 1);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+
+        let samples = accounts(&[
+            &[1, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9],
+            &[1, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5],
+            &[1, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0],
+        ]);
+        let report = impact(&new, Some(&old), &samples);
+        assert_eq!((row(&report).ok, row(&report).broken.count), (1, 2));
+        let f = crate::testing::only(&report);
+        assert_eq!(
+            (f.severity, f.check, f.message.as_str()),
+            (
+                Severity::Error,
+                Check::UpgradeImpact,
+                "breaks under the new IDL in 2 of 3 samples: `A.b` takes bytes 0..4 of the old `reserved`, and `reserved[0]` is 5, not 0"
+            )
+        );
+        assert_eq!(report.exit_code(), 1);
+        // Without the old IDL, no bytes are known to be reserved.
+        assert_eq!(row(&impact(&new, None, &samples)).ok, 3);
+        // A plain --compare-idl run keeps no copy of the old IDL.
+        assert!(Reference::from_idl(&old, &new, &samples).old.is_none());
+    }
+
+    #[test]
+    fn a_reserved_bytes_error_names_the_field_as_the_new_idl_writes_it() {
+        // A legacy IDL against a 0.30 one: the diff compares `new_fee` as `newFee`.
+        let old = Idl::from_json(
+            r#"{"version":"0.1.0","name":"t","instructions":[],"accounts":[{"name":"A","type":{"kind":"struct",
+                "fields":[{"name":"a","type":"u32"},{"name":"_reserved","type":{"array":["u8",8]}}]}}]}"#,
+        )
+        .unwrap();
+        let new = idl(
+            r#""accounts":[{"name":"A","discriminator":[220,250,253,102,246,28,104,176]}],"instructions":[],
+            "types":[{"name":"A","type":{"kind":"struct","fields":[{"name":"a","type":"u32"},
+                {"name":"new_fee","type":"u32"},{"name":"_reserved","type":{"array":["u8",4]}}]}}]"#,
+        );
+        let samples = Samples {
+            accounts: vec![AccountSample {
+                address: "addr0".into(),
+                data: [
+                    &[220, 250, 253, 102, 246, 28, 104, 176][..],
+                    &[1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0],
+                ]
+                .concat(),
+            }],
+            ..Samples::default()
+        };
+        let report = impact(&new, Some(&old), &samples);
+        assert_eq!(
+            row(&report).broken.reasons[0].detail,
+            "`A.new_fee` takes bytes 0..4 of the old `_reserved`, and `_reserved[0]` is 5, not 0"
+        );
+    }
+
+    #[test]
+    fn reserved_bytes_of_a_nested_struct_are_checked_in_each_item() {
+        let with_item = |item: &str| {
+            idl(&format!(
+                r#""accounts":[{{"name":"A","discriminator":[7,7]}}],"instructions":[],
+                "types":[{{"name":"A","type":{{"kind":"struct","fields":[{{"name":"items","type":{{"vec":{{"defined":{{"name":"Item"}}}}}}}}]}}}},
+                    {{"name":"Item","type":{{"kind":"struct","fields":{item}}}}}]"#
+            ))
+        };
+        let old = with_item(
+            r#"[{"name":"x","type":"u8"},{"name":"_padding","type":{"array":["u8",3]}}]"#,
+        );
+        let new = with_item(
+            r#"[{"name":"x","type":"u8"},{"name":"y","type":"u16"},{"name":"_padding","type":{"array":["u8",1]}}]"#,
+        );
+        // Two items. The second holds 1 in a byte that `y` takes.
+        let samples = accounts(&[&[2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 1, 0]]);
+        let report = impact(&new, Some(&old), &samples);
+        assert_eq!(
+            row(&report).broken.reasons[0].detail,
+            "`Item.y` takes bytes 0..2 of the old `_padding`, and `_padding[1]` is 1, not 0"
+        );
+    }
+
+    /// An account `name` with discriminator [7, 7] and `fields`, beside `Item` with `item` and
+    /// the generic `W<T> { inner: T }`.
+    fn item_idl(name: &str, fields: &str, item: &str) -> Idl {
+        idl(&format!(
+            r#""accounts":[{{"name":"{name}","discriminator":[7,7]}}],"instructions":[],
+            "types":[{{"name":"{name}","type":{{"kind":"struct","fields":{fields}}}}},
+                {{"name":"Item","type":{{"kind":"struct","fields":{item}}}}},
+                {{"name":"W","generics":[{{"kind":"type","name":"T"}}],
+                  "type":{{"kind":"struct","fields":[{{"name":"inner","type":{{"generic":"T"}}}}]}}}}]"#
+        ))
+    }
+
+    const OLD_ITEM: &str =
+        r#"[{"name":"x","type":"u8"},{"name":"_padding","type":{"array":["u8",3]}}]"#;
+    const NEW_ITEM: &str = r#"[{"name":"x","type":"u8"},{"name":"y","type":"u16"},{"name":"_padding","type":{"array":["u8",1]}}]"#;
+    const INNER: &str = r#"[{"name":"inner","type":{"defined":{"name":"Item"}}}]"#;
+    /// `y` reads 256.
+    const Y_SET: &[u8] = &[0, 0, 1, 0];
+    const Y_SET_DETAIL: &str =
+        "`Item.y` takes bytes 0..2 of the old `_padding`, and `_padding[1]` is 1, not 0";
+
+    #[test]
+    fn reserved_bytes_are_checked_under_a_renamed_account_type() {
+        // `A` is `B` in the new IDL, with the same discriminator.
+        let (old, new) = (
+            item_idl("A", INNER, OLD_ITEM),
+            item_idl("B", INNER, NEW_ITEM),
+        );
+        let report = impact(&new, Some(&old), &accounts(&[Y_SET]));
+        assert_eq!(row(&report).broken.reasons[0].detail, Y_SET_DETAIL);
+        // The byte that stays reserved can hold anything, and is not compared by position.
+        let report = impact(&new, Some(&old), &accounts(&[&[0, 0, 0, 9]]));
+        assert_eq!(row(&report).ok, 1);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+    }
+
+    #[test]
+    fn reserved_bytes_are_checked_inside_a_generic_argument() {
+        let wrapped = r#"[{"name":"w","type":{"defined":{"name":"W","generics":[{"kind":"type","type":{"defined":{"name":"Item"}}}]}}}]"#;
+        let (old, new) = (
+            item_idl("A", wrapped, OLD_ITEM),
+            item_idl("A", wrapped, NEW_ITEM),
+        );
+        let report = impact(&new, Some(&old), &accounts(&[Y_SET, &[0, 0, 0, 9]]));
+        assert_eq!((row(&report).ok, row(&report).broken.count), (1, 1));
+        assert_eq!(row(&report).broken.reasons[0].detail, Y_SET_DETAIL);
+    }
+
+    #[test]
+    fn an_old_decode_that_the_reserved_check_cannot_follow_is_broken() {
+        let (old, new) = (
+            item_idl("A", INNER, OLD_ITEM),
+            item_idl("A", INNER, NEW_ITEM),
+        );
+        let check = super::super::reserved::ReservedBytes::new(&old, &new).unwrap();
+        let fault = check.check("A", &json!({"inner": {"x": 0}})).unwrap_err();
+        assert_eq!(
+            fault.detail,
+            "the old decode of `Item` has no `_padding` array, so the bytes that new fields take are not checked"
+        );
+        // A type that holds no reserved use is not walked.
+        assert_eq!(check.check("W", &json!({"inner": 1})), Ok(None));
     }
 
     #[test]

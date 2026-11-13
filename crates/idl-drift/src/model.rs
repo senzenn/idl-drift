@@ -1091,7 +1091,7 @@ fn add_legacy_discriminators(obj: &mut serde_json::Map<String, serde_json::Value
 
 /// Anchor hashes the Rust type name. Hand-made IDLs such as Pyth's lowercase its first letter
 /// (`priceUpdateV2`), or write it in snake case. Shipstern reads an ASCII name the same way.
-fn rust_type_name(name: &str) -> String {
+pub(crate) fn rust_type_name(name: &str) -> String {
     use heck::ToUpperCamelCase;
 
     if name.contains('_') && !name.bytes().any(|b| b.is_ascii_uppercase()) {

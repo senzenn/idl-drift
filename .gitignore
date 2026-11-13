@@ -1,6 +1,7 @@
 # Build output.
 /target/
 /examples/decoders/*/target/
+/examples/fixture-tests/*/target/
 *-output.txt
 node_modules/
 

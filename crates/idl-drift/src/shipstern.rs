@@ -1,11 +1,19 @@
-//! IDLs that are valid Codama, but that Shipstern's generated parser cannot use.
+//! IDLs that are valid, but that Shipstern's generated parser cannot use.
 //!
 //! Shipstern selects an instruction or an account type by its first discriminator only.
+//! [`rejections`] predicts where its Anchor converter, codama-from-anchor, stops
+//! `include_shipstern_parser!` with `compile_error!`, and where the macro panics on an enum tag.
 
 use codama_nodes::{AccountNode, DiscriminatorNode, NestedTypeNode, Number, TypeNode, ValueNode};
 
 use crate::diff::collisions::collision_classes;
 use crate::model::Idl;
+
+mod converter;
+mod enum_tags;
+
+pub(crate) use converter::snake_case;
+pub use converter::{rejections, Rejection};
 
 /// Instructions that Shipstern cannot tell apart: the same first discriminator and the same
 /// account count. Shipstern rejects each of them as ambiguous at run time.

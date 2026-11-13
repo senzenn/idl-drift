@@ -17,6 +17,7 @@
 //! ```
 
 pub mod decode;
+pub mod export;
 pub mod report;
 pub mod rpc;
 

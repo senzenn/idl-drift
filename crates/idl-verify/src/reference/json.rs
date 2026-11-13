@@ -22,7 +22,7 @@ pub(crate) fn to_json(value: &Value) -> Json {
         Value::I128(n) => json!({ "bn": n.to_string() }),
         Value::U256(le) => json!({ "bn": decimal_256(le, false) }),
         Value::I256(le) => json!({ "bn": decimal_256(le, true) }),
-        Value::F32(n) => float(f64::from(*n)),
+        Value::F32(n) => f32_json(*n),
         Value::F64(n) => float(*n),
         Value::Pubkey(key) => json!(bs58::encode(key).into_string()),
         Value::Bytes(bytes) => json!(bytes),
@@ -100,6 +100,16 @@ fn decimal_256(le: &[u8; 32], signed: bool) -> String {
         }
     }
     out
+}
+
+/// A finite f32 under a marker, so the comparator can match a decoder's shortest f32 text
+/// (`0.1`) as well as the widened f64 (`0.10000000149011612`).
+fn f32_json(n: f32) -> Json {
+    if n.is_finite() {
+        json!({ "f32": f64::from(n) })
+    } else {
+        float(f64::from(n))
+    }
 }
 
 fn float(n: f64) -> Json {

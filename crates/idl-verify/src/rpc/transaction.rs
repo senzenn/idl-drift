@@ -77,6 +77,8 @@ struct CompiledInstruction {
     program_id_index: usize,
     accounts: Vec<usize>,
     data: String,
+    #[serde(default)]
+    stack_height: Option<u32>,
 }
 
 /// What one transaction holds for a program.
@@ -84,6 +86,176 @@ struct CompiledInstruction {
 pub struct TransactionSamples {
     pub instructions: Vec<InstructionSample>,
     pub events: Vec<EventSample>,
+}
+
+/// One instruction of a recorded transaction, with its keys resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordedInstruction {
+    pub program: String,
+    pub accounts: Vec<String>,
+    pub data: Vec<u8>,
+    /// 1 for a top-level instruction, 2 for a CPI that it makes, and so on. Older
+    /// transactions do not give it.
+    pub stack_height: Option<u32>,
+}
+
+/// The CPIs of the top-level instruction at `index`, in the order that the meta lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InnerGroup {
+    pub index: usize,
+    pub instructions: Vec<RecordedInstruction>,
+}
+
+/// One whole transaction with its keys resolved, for a fixture of the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TransactionRecord {
+    pub signature: String,
+    pub instructions: Vec<RecordedInstruction>,
+    pub inner: Vec<InnerGroup>,
+    pub log_messages: Vec<String>,
+}
+
+impl RecordedInstruction {
+    #[must_use]
+    pub fn new(
+        program: String,
+        accounts: Vec<String>,
+        data: Vec<u8>,
+        stack_height: Option<u32>,
+    ) -> Self {
+        Self {
+            program,
+            accounts,
+            data,
+            stack_height,
+        }
+    }
+}
+
+impl InnerGroup {
+    #[must_use]
+    pub fn new(index: usize, instructions: Vec<RecordedInstruction>) -> Self {
+        Self {
+            index,
+            instructions,
+        }
+    }
+}
+
+impl TransactionRecord {
+    /// A record from another source than [`transaction_record`], for an export.
+    #[must_use]
+    pub fn new(
+        signature: String,
+        instructions: Vec<RecordedInstruction>,
+        inner: Vec<InnerGroup>,
+        log_messages: Vec<String>,
+    ) -> Self {
+        Self {
+            signature,
+            instructions,
+            inner,
+            log_messages,
+        }
+    }
+}
+
+/// Every instruction of one `getTransaction` result (`json` encoding), with its keys
+/// resolved, and the transaction's log.
+///
+/// # Errors
+///
+/// When the transaction JSON does not have the shape the RPC documents.
+pub fn transaction_record(tx: &Value) -> Result<TransactionRecord, Error> {
+    let tx = Transaction::deserialize(tx).map_err(|e| Error::RpcResponse(e.to_string()))?;
+    let (signature, keys) = tx.signature_and_keys()?;
+    let record = |ix: &CompiledInstruction| -> Result<RecordedInstruction, Error> {
+        let accounts = ix.accounts.iter().map(|&i| key_at(&signature, &keys, i));
+        Ok(RecordedInstruction {
+            program: key_at(&signature, &keys, ix.program_id_index)?,
+            accounts: accounts.collect::<Result<_, _>>()?,
+            data: instruction_data(&signature, &ix.data)?,
+            stack_height: ix.stack_height,
+        })
+    };
+    let meta = tx.meta.as_ref();
+    let groups = meta.and_then(|m| m.inner_instructions.as_deref());
+    let inner = groups
+        .unwrap_or_default()
+        .iter()
+        .map(|g| {
+            Ok(InnerGroup {
+                index: g.index,
+                instructions: g
+                    .instructions
+                    .iter()
+                    .map(record)
+                    .collect::<Result<_, _>>()?,
+            })
+        })
+        .collect::<Result<_, Error>>()?;
+    let instructions = tx.transaction.message.instructions.iter().map(record);
+    Ok(TransactionRecord {
+        instructions: instructions.collect::<Result<_, _>>()?,
+        inner,
+        log_messages: meta
+            .and_then(|m| m.log_messages.clone())
+            .unwrap_or_default(),
+        signature,
+    })
+}
+
+impl Transaction {
+    /// The first signature, and the keys that instruction indices point to: the static keys,
+    /// then the loaded writable keys, then the loaded read-only keys.
+    fn signature_and_keys(&self) -> Result<(String, Vec<&String>), Error> {
+        let signature = self
+            .transaction
+            .signatures
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::RpcResponse("transaction has no signature".into()))?;
+        let loaded = self.meta.as_ref().and_then(|m| m.loaded_addresses.as_ref());
+        let keys: Vec<&String> = self
+            .transaction
+            .message
+            .account_keys
+            .iter()
+            .chain(
+                loaded
+                    .into_iter()
+                    .flat_map(|l| l.writable.iter().chain(&l.readonly)),
+            )
+            .collect();
+        // The report prints keys and signatures, so a hostile RPC must not reach the terminal.
+        if std::iter::once(&signature)
+            .chain(keys.iter().copied())
+            .any(|s| s.chars().any(char::is_control))
+        {
+            return Err(Error::RpcResponse(
+                "a key or signature holds control characters".into(),
+            ));
+        }
+        Ok((signature, keys))
+    }
+}
+
+fn key_at(signature: &str, keys: &[&String], index: usize) -> Result<String, Error> {
+    keys.get(index).map(|&k| k.clone()).ok_or_else(|| {
+        Error::RpcResponse(format!(
+            "{signature}: account index {index} is past the {} keys",
+            keys.len()
+        ))
+    })
+}
+
+fn instruction_data(signature: &str, data: &str) -> Result<Vec<u8>, Error> {
+    bs58::decode(data)
+        .into_vec()
+        .map_err(|e| Error::RpcResponse(format!("{signature}: instruction data: {e}")))
 }
 
 /// `(signer, writable)` per key, static keys then loaded ones, by the header rule that
@@ -143,41 +315,9 @@ pub fn samples_from_transaction(
 ) -> Result<TransactionSamples, Error> {
     let version = tx.get("version");
     let tx = Transaction::deserialize(tx).map_err(|e| Error::RpcResponse(e.to_string()))?;
-    let signature = tx
-        .transaction
-        .signatures
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::RpcResponse("transaction has no signature".into()))?;
+    let (signature, keys) = tx.signature_and_keys()?;
     let loaded = tx.meta.as_ref().and_then(|m| m.loaded_addresses.as_ref());
-    let keys: Vec<&String> = tx
-        .transaction
-        .message
-        .account_keys
-        .iter()
-        .chain(
-            loaded
-                .into_iter()
-                .flat_map(|l| l.writable.iter().chain(&l.readonly)),
-        )
-        .collect();
-    // The report prints keys and signatures, so a hostile RPC must not reach the terminal.
-    if std::iter::once(&signature)
-        .chain(keys.iter().copied())
-        .any(|s| s.chars().any(char::is_control))
-    {
-        return Err(Error::RpcResponse(
-            "a key or signature holds control characters".into(),
-        ));
-    }
-    let key = |index: usize| {
-        keys.get(index).map(|&k| k.clone()).ok_or_else(|| {
-            Error::RpcResponse(format!(
-                "{signature}: account index {index} is past the {} keys",
-                keys.len()
-            ))
-        })
-    };
+    let key = |index: usize| key_at(&signature, &keys, index);
 
     let inner = tx
         .meta
@@ -191,21 +331,19 @@ pub fn samples_from_transaction(
         .iter()
         .enumerate()
         .flat_map(|(i, top)| {
-            let cpis = inner.iter().filter(move |g| g.index == i);
-            std::iter::once((false, top))
-                .chain(cpis.flat_map(|g| g.instructions.iter().map(|ix| (true, ix))))
+            let cpis = (inner.iter().filter(move |g| g.index == i)).flat_map(|g| &g.instructions);
+            let cpis = cpis.enumerate().map(move |(j, ix)| ([i, j + 1], ix));
+            std::iter::once(([i, 0], top)).chain(cpis)
         });
     let privileges = key_privileges(version, &tx.transaction.message, loaded);
 
     let cpi = cpi_envelopes(idl);
     let mut out = TransactionSamples::default();
-    for (nested, ix) in executed {
+    for (position, ix) in executed {
         if key(ix.program_id_index)? != program_id {
             continue;
         }
-        let data = bs58::decode(&ix.data)
-            .into_vec()
-            .map_err(|e| Error::RpcResponse(format!("{signature}: instruction data: {e}")))?;
+        let data = instruction_data(&signature, &ix.data)?;
         if cpi.iter().any(|e| e.wraps(&data)) {
             out.events.push(EventSample {
                 signature: signature.clone(),
@@ -224,7 +362,8 @@ pub fn samples_from_transaction(
                 .collect::<Result<_, _>>()?,
             flags: privileges
                 .as_deref()
-                .map(|p| key_flags(p, &ix.accounts, nested)),
+                .map(|p| key_flags(p, &ix.accounts, position[1] > 0)),
+            position: Some(position),
         });
     }
 
@@ -373,6 +512,9 @@ mod tests {
                 (vec![2], vec!["Payer".to_string()])
             ]
         );
+        // The first is the first CPI of instruction 0; the second is top level.
+        let positions: Vec<_> = ixs.iter().map(|ix| ix.position).collect();
+        assert_eq!(positions, [Some([0, 1]), Some([1, 0])]);
     }
 
     #[test]
@@ -482,6 +624,48 @@ mod tests {
         let tx = with_logs(&["Program Prog invoke [1]", "Program data: %%%%"]);
         let err = samples_from_transaction(&idl(), "Prog", &tx).unwrap_err();
         assert!(matches!(err, Error::RpcResponse(_)), "{err}");
+    }
+
+    #[test]
+    fn a_record_keeps_every_instruction_with_its_keys_and_stack_height() {
+        let mut tx = tx(
+            &["Payer", "Other", "Prog"],
+            &json!([
+                { "programIdIndex": 1, "accounts": [0], "data": "2" },
+                { "programIdIndex": 2, "accounts": [0, 1], "data": "3", "stackHeight": 1 }
+            ]),
+        );
+        tx["meta"]["innerInstructions"] = json!([{ "index": 1, "instructions": [
+            { "programIdIndex": 1, "accounts": [], "data": "4", "stackHeight": 2 },
+            { "programIdIndex": 2, "accounts": [3], "data": "5", "stackHeight": 3 }
+        ]}]);
+        tx["meta"]["loadedAddresses"] = json!({ "writable": [], "readonly": ["L1"] });
+        tx["meta"]["logMessages"] = json!(["Program Prog invoke [1]"]);
+        let record = transaction_record(&tx).unwrap();
+        let ix = |program: &str, accounts: &[&str], data: u8, stack_height: Option<u32>| {
+            RecordedInstruction {
+                program: program.into(),
+                accounts: accounts.iter().map(ToString::to_string).collect(),
+                data: vec![data],
+                stack_height,
+            }
+        };
+        let expected = TransactionRecord {
+            signature: "Sig1".into(),
+            instructions: vec![
+                ix("Other", &["Payer"], 1, None),
+                ix("Prog", &["Payer", "Other"], 2, Some(1)),
+            ],
+            inner: vec![InnerGroup {
+                index: 1,
+                instructions: vec![
+                    ix("Other", &[], 3, Some(2)),
+                    ix("Prog", &["L1"], 4, Some(3)),
+                ],
+            }],
+            log_messages: vec!["Program Prog invoke [1]".into()],
+        };
+        assert_eq!(record, expected);
     }
 
     #[test]

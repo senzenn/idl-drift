@@ -224,31 +224,48 @@ pub(crate) fn zero_copy_and_borsh<'a>(
         .filter_map(|a| index.get(&a.name))
         .filter(|t| t.generics.is_empty())
         .collect();
-    let names = |serialization: &str| -> Vec<&str> {
-        accounts
-            .iter()
-            .filter(|t| t.serialization == serialization)
-            .map(|t| t.name.as_str())
-            .collect()
-    };
-    // A `bytemuck` derive checks only its own fields, so an unsafe struct inside it is a root.
-    let in_bytemuck = reachable(index, names("bytemuck"));
-    let roots = names("bytemuckunsafe")
-        .into_iter()
-        .chain(in_bytemuck.into_iter().filter(|name| {
-            index
-                .get(name)
-                .is_some_and(|t| t.serialization == "bytemuckunsafe" && t.generics.is_empty())
-        }))
-        .collect();
-    let in_zero_copy = reachable(index, roots);
+    let (_, roots) = zero_copy_roots(idl, index, &accounts);
+    let in_zero_copy = reachable(index, roots.iter().map(|t| t.name.as_str()).collect());
 
-    let mut borsh_roots = names("borsh");
+    let mut borsh_roots: Vec<&str> = accounts
+        .iter()
+        .filter(|t| t.serialization == "borsh")
+        .map(|t| t.name.as_str())
+        .collect();
     for arg in idl.instructions.iter().flat_map(|ix| &ix.args) {
         push_defined(&arg.ty, &mut borsh_roots);
     }
     borsh_roots.extend(idl.events.iter().map(|e| e.name.as_str()));
     (in_zero_copy, reachable(index, borsh_roots))
+}
+
+/// The types that `bytemuck` accounts reach, and the `bytemuckunsafe` roots in the order that
+/// Shipstern's converter checks them: the accounts, then those reached types.
+pub(crate) fn zero_copy_roots<'a>(
+    idl: &'a Idl,
+    index: &TypeIndex<'a>,
+    accounts: &[&'a TypeDef],
+) -> (BTreeSet<&'a str>, Vec<&'a TypeDef>) {
+    let bytemuck = accounts
+        .iter()
+        .filter(|t| t.serialization == "bytemuck")
+        .map(|t| t.name.as_str())
+        .collect();
+    // A `bytemuck` derive checks only its own fields, so an unsafe struct inside it is a root.
+    let in_bytemuck = reachable(index, bytemuck);
+    let reached = idl
+        .types
+        .iter()
+        .filter(|t| in_bytemuck.contains(t.name.as_str()));
+    let mut seen = BTreeSet::new();
+    let roots = accounts
+        .iter()
+        .copied()
+        .chain(reached)
+        .filter(|t| t.serialization == "bytemuckunsafe" && t.generics.is_empty())
+        .filter(|t| seen.insert(t.name.as_str()))
+        .collect();
+    (in_bytemuck, roots)
 }
 
 #[cfg(test)]

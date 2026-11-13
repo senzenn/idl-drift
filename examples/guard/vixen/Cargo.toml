@@ -1,0 +1,16 @@
+[package]
+name = "vixen-guard"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Compile test of guard!(vixen, ..) against Vixen 0.7"
+license = "MIT OR Apache-2.0"
+
+# Not part of the idl-drift workspace: the parser crates stay out of its build and MSRV.
+[workspace]
+
+# Cargo.lock pins yellowstone-grpc-proto 12.5.0: vixen-core 0.7.0 does not build with 12.6 or
+# later.
+[dependencies]
+yellowstone-vixen-core = "=0.7.0"
+idl-drift-guard = { path = "../../../crates/idl-drift-guard" }

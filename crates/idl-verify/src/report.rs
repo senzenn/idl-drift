@@ -194,6 +194,9 @@ pub struct Report {
     /// With an allow file: the entries that match no finding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unused_allows: Option<Vec<AllowEntry<Check>>>,
+    /// With `--prune-allow`: the entries that the run removed from the allow file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pruned_allows: Option<Vec<AllowEntry<Check>>>,
 }
 
 /// What a live `--rpc` run read before it stopped.
@@ -940,6 +943,7 @@ mod tests {
                 data: vec![1],
                 accounts: Vec::new(),
                 flags: None,
+                position: None,
             }],
             ..Samples::default()
         };

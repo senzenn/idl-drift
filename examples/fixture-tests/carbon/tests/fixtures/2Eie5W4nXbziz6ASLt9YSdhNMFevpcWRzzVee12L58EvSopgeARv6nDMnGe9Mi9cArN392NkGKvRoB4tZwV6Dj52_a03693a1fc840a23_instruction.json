@@ -1,0 +1,26 @@
+{
+  "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "accounts": [
+    {
+      "pubkey": "A2pDhjFtUPWDBD5REZt56UoVj1KeDePwuXrtN7qCUEp7",
+      "is_signer": true,
+      "is_writable": true
+    },
+    {
+      "pubkey": "5gBFNDdGCcTZnaWgjssAqABJpBx6D58SNz7fh3cvWavu",
+      "is_signer": false,
+      "is_writable": true
+    },
+    {
+      "pubkey": "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+      "is_signer": false,
+      "is_writable": false
+    },
+    {
+      "pubkey": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      "is_signer": false,
+      "is_writable": false
+    }
+  ],
+  "data": "f945a4da9667548a"
+}

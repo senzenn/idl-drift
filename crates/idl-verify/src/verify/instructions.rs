@@ -488,10 +488,33 @@ mod tests {
                     data: data.to_vec(),
                     accounts: keys.iter().map(ToString::to_string).collect(),
                     flags: None,
+                    position: None,
                 })
                 .collect(),
             ..Samples::default()
         }
+    }
+
+    #[test]
+    fn a_struct_argument_in_one_field_matches_the_fields_that_the_idl_lists() {
+        // Carbon keeps `params` as one field; a Codama IDL lists its fields as the arguments.
+        let idl = ix_idl(
+            r#"[{"name":"swap","discriminator":[1],"accounts":[],
+                "args":[{"name":"amountIn","type":"u8"},{"name":"minOut","type":"u8"}]}]"#,
+        );
+        let reply = |min_out: u8| {
+            crate::reference::Outcome::Ok(serde_json::json!({ "name": "swap",
+                "data": { "params": { "amount_in": 5, "min_out": min_out } } }))
+        };
+        let reference = crate::reference::Reference::from_decoder(
+            Vec::new(),
+            vec![reply(6), reply(7)],
+            Vec::new(),
+        );
+        let samples = instructions(&[(&[1, 5, 6], &[]), (&[1, 5, 6], &[])]);
+        let report = verify(&idl, &samples, Some(&reference));
+        let r = report.reference.unwrap();
+        assert_eq!((r.instructions_compared, r.instructions_matched), (2, 1));
     }
 
     #[test]
