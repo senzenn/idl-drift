@@ -5,7 +5,7 @@
 You need:
 
 - Rust 1.91 or newer to build. This is the `rust-version` in `Cargo.toml`.
-- Rust 1.97.0 with `clippy` and `rustfmt` to run the checks, as CI does.
+- Rust 1.97.1 with `clippy` and `rustfmt` to run the checks, as CI does.
   `rust-toolchain.toml` pins this version, so rustup uses it in the repository.
 - Node.js and npm, only to run the reference decoder in `tools/reference`. No test needs it.
 

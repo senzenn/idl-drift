@@ -2,6 +2,7 @@
 /target/
 /examples/decoders/*/target/
 /examples/fixture-tests/*/target/
+/examples/guard/*/target/
 *-output.txt
 node_modules/
 

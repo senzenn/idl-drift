@@ -1,7 +1,7 @@
 /// Wrap a parser or decoder so that a [`Guard`](crate::Guard) counts each result. The wrapper
 /// returns each value and each error unchanged.
 ///
-/// - `guard!(shipstern, parser, guard)`: a Shipstern 0.12 `Parser` of accounts or
+/// - `guard!(shipstern, parser, guard)`: a Shipstern 0.12 to 0.13 `Parser` of accounts or
 ///   instructions. The wrapper keeps the parser's `id()` and prefilter, and is a
 ///   `ProgramParser` when the parser is one. The guard checks that program id at once.
 /// - `guard!(vixen, parser, guard)`: the same for Vixen 0.7. Not Vixen 0.6: its parsers with

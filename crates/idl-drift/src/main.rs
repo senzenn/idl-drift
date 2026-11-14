@@ -33,8 +33,9 @@ mod cli {
      each program was checked
   1  diff: at least one change at or above --fail-on; source: at least one finding at or
      above --fail-on; inspect: unmapped fields, an undefined type, a padded zero-copy
-     type that Borsh also reads, or a zero-copy account with an unknown layout; stale:
-     at least one program has a stale IDL or no on-chain IDL
+     type that Borsh also reads, a zero-copy account with an unknown layout, or (with
+     --for) a SHIPSTERN: or CARBON: line; stale: at least one program has a stale IDL
+     or no on-chain IDL
   2  idl-drift could not run: a file could not be read or parsed, an option is
      wrong, or the on-chain IDL or program account could not be fetched or read;
      stale: a program could not be checked; watch --once: a program could not be

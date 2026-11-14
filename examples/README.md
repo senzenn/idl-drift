@@ -12,3 +12,6 @@ tests that feed the live pump_fun samples, and a compile test for Vixen 0.7. See
 
 `fixture-tests/` runs the same parser and decoder on exported fixture files, one test per
 file. See [fixture-tests/README.md](fixture-tests/README.md).
+
+The Shipstern examples use Shipstern 0.13.0. Its Agave 4.3.2 crates need Rust 1.97.1, and
+`rust-toolchain.toml` pins this version in the repository.
