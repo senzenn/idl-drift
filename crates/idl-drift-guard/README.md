@@ -24,7 +24,7 @@ Then wrap each parser or decoder of the program with the same guard, in place of
 
 | Framework | One line |
 |---|---|
-| Shipstern 0.12 | `Pipeline::new(guard!(shipstern, pump::AccountParser, pump.clone()), handlers)` |
+| Shipstern 0.12 to 0.13 | `Pipeline::new(guard!(shipstern, pump::AccountParser, pump.clone()), handlers)` |
 | Vixen 0.7 | `Pipeline::new(guard!(vixen, pump::InstructionParser, pump.clone()), handlers)` |
 | Carbon 2.0 | `.account(guard!(carbon, PumpfunDecoder, pump.clone()), processor)` |
 

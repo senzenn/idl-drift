@@ -18,7 +18,7 @@
 //!             eprintln!("{alert}");
 //!         }),
 //! );
-//! // Shipstern 0.12 (`vixen` for Vixen 0.7), in place of the parser:
+//! // Shipstern 0.12 to 0.13 (`vixen` for Vixen 0.7), in place of the parser:
 //! let parser = guard!(shipstern, pump::AccountParser, pump.clone());
 //! // Carbon 2.0, in place of the decoder:
 //! let decoder = guard!(carbon, PumpfunDecoder, pump.clone());

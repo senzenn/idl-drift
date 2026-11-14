@@ -9,7 +9,7 @@ parser cannot decode fails by its file name in `cargo test`. The tests read no n
 
 | Framework | Export with | Dev-dependencies, plus `idl-verify-fixtures = "0.4"` |
 |---|---|---|
-| Shipstern | `--fixture-format shipstern` | `shipstern-core = "0.12"`, `shipstern-mock = "0.12"` |
+| Shipstern | `--fixture-format shipstern` | `shipstern-core = "0.13"`, `shipstern-mock = "0.13"` |
 | Carbon | `--fixture-format carbon` | `carbon-core = "2"`, `carbon-test-utils = "2"`, `serde_json = "1"`, and the decoder crate, for example `carbon-pumpfun-decoder = "2"` |
 
 ```bash
