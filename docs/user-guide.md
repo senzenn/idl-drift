@@ -59,7 +59,7 @@ does not show which program changed.
        Guard::from_idl(include_str!("../idls/pump.json"))?
            .alert_after(5, Window::Time(Duration::from_secs(60)), |alert| eprintln!("{alert}")),
    );
-   // Shipstern 0.12 (`vixen` for Vixen 0.7):
+   // Shipstern 0.12 to 0.13 (`vixen` for Vixen 0.7):
    Pipeline::new(guard!(shipstern, pump::AccountParser, pump.clone()), handlers);
    // Carbon 2.0:
    pipeline.account(guard!(carbon, PumpfunDecoder, pump.clone()), processor);

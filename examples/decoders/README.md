@@ -7,7 +7,7 @@ adapter crate. Both decode pump_fun (`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6
 
 | Directory | Parser | Versions | Adapter |
 |---|---|---|---|
-| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.12.0` | [idl-verify-shipstern](../../crates/idl-verify-shipstern/README.md) |
+| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.13.0` | [idl-verify-shipstern](../../crates/idl-verify-shipstern/README.md) |
 | `carbon/` | `carbon-pumpfun-decoder` | Carbon `=2.0.0` | [idl-verify-carbon](../../crates/idl-verify-carbon/README.md) |
 
 ## Run

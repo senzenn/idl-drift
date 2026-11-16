@@ -16,7 +16,7 @@ jobs:
       # Pinned so a new release's pedantic lints don't fail unrelated changes.
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.97.1"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check

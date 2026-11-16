@@ -5,6 +5,27 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The Shipstern examples use Shipstern 0.13.0. The docs give Shipstern 0.9 to 0.13 for
+  `idl-verify-shipstern`, and 0.12 to 0.13 for `idl-drift-guard`.
+- CI and `rust-toolchain.toml` use Rust 1.97.1, because Agave 4.3.2 needs it. The minimum
+  supported Rust version stays 1.91.
+
+### Fixed
+
+- The exit codes in `idl-drift --help` say that `inspect --for` exits with 1 on a
+  `SHIPSTERN:` or `CARBON:` line.
+
+### Security
+
+- `Cargo.lock` updates the TLS crates of the RPC client: `rustls-webpki` 0.103.17
+  (RUSTSEC-2026-0382) and `webpki-roots` 1.0.12 (RUSTSEC-2026-0381). It also updates
+  `rustix` to 1.1.6, which fixes an unsound function. `cargo install --locked` and the
+  release binaries use this lock file.
+- The example lock files update `zstd`, `zstd-safe` and `zstd-sys` (RUSTSEC-2026-0391,
+  -0398, -0403, -0410) and `pulldown-cmark` (RUSTSEC-2026-0414, -0433).
+
 ## [0.4.0] - 2026-11-13
 
 ### Added

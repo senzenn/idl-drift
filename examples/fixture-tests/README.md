@@ -9,7 +9,7 @@ the idl-drift workspace.
 
 | Directory | Parser | Versions | Files |
 |---|---|---|---|
-| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.12.0` | 13 in `fixtures/`, with their `Debug` output in `expected/` |
+| `shipstern/` | Built with `include_shipstern_parser!` from the IDL | Shipstern `=0.13.0` | 13 in `fixtures/`, with their `Debug` output in `expected/` |
 | `carbon/` | `carbon-pumpfun-decoder` | Carbon `=2.0.0` | 39 in `tests/fixtures/` |
 
 ## Run

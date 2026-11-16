@@ -34,7 +34,7 @@ mod scan;
 ///
 /// | Framework | Files | Test passes when |
 /// |---|---|---|
-/// | `shipstern` | `*_account.json`, `*_tx.json` (`shipstern-mock` 0.12) | the account parser returns `Ok`; for a tx file, no instruction gives an error other than `Filtered`, and at least one gives `Ok` |
+/// | `shipstern` | `*_account.json`, `*_tx.json` (`shipstern-mock` 0.12 or 0.13) | the account parser returns `Ok`; for a tx file, no instruction gives an error other than `Filtered`, and at least one gives `Ok` |
 /// | `carbon` | `*_account.json`, `*_instruction.json` (`carbon-test-utils` 2.0) | `decode_account` or `decode_instruction` returns `Some` |
 ///
 /// Keys:

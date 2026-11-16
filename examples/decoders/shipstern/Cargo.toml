@@ -10,10 +10,10 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
-shipstern-core = "=0.12.0"
-shipstern-parser = "=0.12.0"
+shipstern-core = "=0.13.0"
+shipstern-parser = "=0.13.0"
 # `program-events` makes the parser decode events, so that idl-verify compares them too.
-shipstern-proc-macro = { version = "=0.12.0", features = ["program-events"] }
+shipstern-proc-macro = { version = "=0.13.0", features = ["program-events"] }
 borsh = { version = "1", features = ["derive"] }
 idl-verify-shipstern = { path = "../../../crates/idl-verify-shipstern" }
 

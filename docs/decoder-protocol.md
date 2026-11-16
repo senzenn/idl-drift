@@ -26,7 +26,7 @@ uses both.
 
 | Crate | Parser | The line |
 |---|---|---|
-| [idl-verify-shipstern](../crates/idl-verify-shipstern/README.md) | Shipstern 0.9 to 0.12 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7 (`include_vixen_parser!`) | `idl_verify_shipstern::serve!(shipstern, my_program::AccountParser, my_program::InstructionParser)` |
+| [idl-verify-shipstern](../crates/idl-verify-shipstern/README.md) | Shipstern 0.9 to 0.13 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7 (`include_vixen_parser!`) | `idl_verify_shipstern::serve!(shipstern, my_program::AccountParser, my_program::InstructionParser)` |
 | [idl-verify-carbon](../crates/idl-verify-carbon/README.md) | Carbon 2.0 decoders, from crates.io or `carbon-cli` | `idl_verify_carbon::serve!(carbon_pumpfun_decoder::PumpfunDecoder, events = carbon_pumpfun_decoder::instructions::CpiEvent)` |
 
 ```rust

@@ -2,7 +2,7 @@
 
 Run a generated Shipstern or Vixen parser as the decoder under test of
 [`idl-verify --decoder`](https://github.com/senzenn/idl-drift/blob/main/docs/decoder-protocol.md).
-It supports Shipstern 0.9 to 0.12 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7
+It supports Shipstern 0.9 to 0.13 (`include_shipstern_parser!`) and Vixen 0.6 to 0.7
 (`include_vixen_parser!`). idl-verify decodes each sample from the IDL, and compares the value with
 the value of your parser.
 

@@ -213,7 +213,7 @@ idl-verify --idl path/to/idl.json --samples path/to/samples.json --reference ref
 
 | Format | Files |
 |---|---|
-| `shipstern` | `<address>_account.json` for each account sample. With `--rpc`, also `<signature>_tx.json` for each transaction that gave a kept sample. The format of `shipstern-mock` 0.12, for `account_fixture!` and `tx_fixture!`. |
+| `shipstern` | `<address>_account.json` for each account sample. With `--rpc`, also `<signature>_tx.json` for each transaction that gave a kept sample. The format of `shipstern-mock` 0.12 and 0.13, for `account_fixture!` and `tx_fixture!`. |
 | `carbon` | `<address>_account.json` (`TestAccount`) for each account sample. `<signature>_<outer>_<inner>_instruction.json` (`TestInstruction`) for each instruction sample, from [`position`](#the-samples-file). The format of `carbon-test-utils` 2.0, for `read_account` and `read_instruction`. |
 
 - The run still checks the samples, and the findings set the exit code. The export exits 2 when it writes no file, the program id is not base58, or a write fails.

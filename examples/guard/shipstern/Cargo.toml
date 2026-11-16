@@ -10,9 +10,9 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
-shipstern-core = "=0.12.0"
-shipstern-parser = "=0.12.0"
-shipstern-proc-macro = "=0.12.0"
+shipstern-core = "=0.13.0"
+shipstern-parser = "=0.13.0"
+shipstern-proc-macro = "=0.13.0"
 borsh = { version = "1", features = ["derive"] }
 idl-drift-guard = { path = "../../../crates/idl-drift-guard" }
 
